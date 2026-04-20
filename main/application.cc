@@ -5,6 +5,7 @@
 #include "board.h"
 #include "cjson_utils.h"
 #include "display.h"
+#include "hermes_protocol.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -552,6 +553,8 @@ void Application::InitializeProtocol() {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
+    } else if (Settings("hermes").GetString("llm_url") != "") {
+        protocol_ = std::make_unique<HermesProtocol>();
     } else {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         protocol_ = std::make_unique<MqttProtocol>();
