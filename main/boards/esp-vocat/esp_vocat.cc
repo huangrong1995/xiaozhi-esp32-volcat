@@ -451,6 +451,15 @@ private:
     touch_slider_handle_t touch_slider_handle_ = nullptr;
     touch_button_handle_t touch_button_handle_ = nullptr;
 
+    // Gesture detection state
+    int64_t touch_press_time_ = 0;
+    int64_t touch_last_release_time_ = 0;
+    bool touch_is_pressed_ = false;
+
+    // Gesture timing thresholds (ms)
+    static constexpr int64_t kDoubleTapThresholdMs = 350;
+    static constexpr int64_t kLongPressThresholdMs = 1200;
+
     static void emotion_reset_timer_callback(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
@@ -698,6 +707,29 @@ private:
         self->ShowHappyTouchFeedback();
     }
 
+    void ShowSingleTapFeedback()
+    {
+        ShowTemporaryEmotion("happy", 2000);
+    }
+
+    void ShowDoubleTapFeedback()
+    {
+        ShowTemporaryEmotion("shocked", 2500);
+    }
+
+    void ShowLongPressFeedback()
+    {
+        // Toggle mute mode on long press
+        static bool is_muted = false;
+        is_muted = !is_muted;
+        if (is_muted) {
+            ShowTemporaryEmotion("angry", 2000);
+        } else {
+            ShowTemporaryEmotion("happy", 2000);
+        }
+        ESP_LOGI(TAG, "Long press: device %s", is_muted ? "MUTED" : "UNMUTED");
+    }
+
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
     {
         (void)handle;
@@ -705,9 +737,38 @@ private:
         if (self == nullptr || self->display_ == nullptr) {
             return;
         }
+
+        int64_t now = esp_timer_get_time() / 1000;
+
         if (state == TOUCH_STATE_ACTIVE) {
-            ESP_LOGI(TAG, "Touch button ACTIVE ch=%" PRIu32, channel);
-            self->ShowHappyTouchFeedback();
+            self->touch_press_time_ = now;
+            self->touch_is_pressed_ = true;
+            ESP_LOGD(TAG, "Touch PRESS ch=%" PRIu32, channel);
+        } else if (state == TOUCH_STATE_INACTIVE) {
+            // Detect release by state change from ACTIVE to INACTIVE
+            if (!self->touch_is_pressed_) {
+                return;
+            }
+            self->touch_is_pressed_ = false;
+            int64_t press_duration = now - self->touch_press_time_;
+
+            // Long press detection (release after holding > threshold)
+            if (press_duration >= kLongPressThresholdMs) {
+                ESP_LOGI(TAG, "Gesture: LONG PRESS (%" PRId64 " ms)", press_duration);
+                self->ShowLongPressFeedback();
+            }
+            // Double tap detection (current release preceded by recent release)
+            else if ((now - self->touch_last_release_time_) <= kDoubleTapThresholdMs) {
+                ESP_LOGI(TAG, "Gesture: DOUBLE TAP (interval %" PRId64 " ms)", now - self->touch_last_release_time_);
+                self->ShowDoubleTapFeedback();
+            }
+            // Single tap
+            else {
+                ESP_LOGI(TAG, "Gesture: SINGLE TAP");
+                self->ShowSingleTapFeedback();
+            }
+
+            self->touch_last_release_time_ = now;
         }
     }
 
