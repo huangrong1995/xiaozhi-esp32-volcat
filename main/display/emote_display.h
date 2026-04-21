@@ -3,8 +3,10 @@
 #include "display.h"
 #include <memory>
 #include <string>
+#include <vector>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
+#include <esp_timer.h>
 #include "expression_emote.h"
 
 namespace emote {
@@ -35,8 +37,16 @@ private:
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 
-    emote_handle_t emote_handle_ = nullptr;
+    // Idle animation methods
+    void StartIdleAnimation();
+    void StopIdleAnimation();
+    static void IdleAnimTimerCallback(void* arg);
 
+    emote_handle_t emote_handle_ = nullptr;
+    esp_timer_handle_t idle_anim_timer_ = nullptr;
+    bool is_idle_ = false;
+    size_t current_idle_index_ = 0;
+    std::vector<std::string> idle_emotions_;
 };
 
 } // namespace emote
