@@ -8,35 +8,48 @@ XiaoZhi is an open-source voice AI assistant built on ESP32, using large languag
 
 ## Build Commands
 
-**Setup ESP-IDF environment:**
+**Setup ESP-IDF environment (use esp-idf-5.5 for this project):**
 ```bash
-source $IDF_PATH/export.sh
+source /home/hrong/workspace/code/esp-idf-5.5/export.sh
 ```
 
 **List all board variants:**
 ```bash
-python scripts/release.py --list-boards
+python3 scripts/release.py --list-boards
 ```
 
 **Build a specific board:**
 ```bash
-python scripts/release.py <board_type> --name <variant_name>
-# Example: python scripts/release.py esp32-s3-box3 --name esp32-s3-box3-lcd
+source /home/hrong/workspace/code/esp-idf-5.5/export.sh
+python3 scripts/release.py <board_type> --name <variant_name>
+# Example: python3 scripts/release.py esp-vocat
 ```
 
 **Build all variants of a board:**
 ```bash
-python scripts/release.py <board_type>
+python3 scripts/release.py <board_type>
 ```
 
 **Build all boards:**
 ```bash
-python scripts/release.py all
+python3 scripts/release.py all
 ```
 
 **Package current build (after `idf.py build`):**
 ```bash
-python scripts/release.py
+python3 scripts/release.py
+```
+
+**Flash to device:**
+```bash
+source /home/hrong/workspace/code/esp-idf-5.5/export.sh
+idf.py -p /dev/ttyACM0 flash
+```
+
+**Monitor serial output:**
+```bash
+source /home/hrong/workspace/code/esp-idf-5.5/export.sh
+idf.py -p /dev/ttyACM0 monitor
 ```
 
 **Format code (required before commit):**
@@ -47,6 +60,38 @@ find main -iname '*.h' -o -iname '*.cc' | xargs clang-format -i
 **Check formatting:**
 ```bash
 clang-format --dry-run -Werror path/to/file.cpp
+```
+
+## WSL2 USB Device Connection (ESP32)
+
+ESP32 devices connected to Windows can be accessed from WSL2 via USBIPD.
+
+**In Windows PowerShell (Administrator):**
+```powershell
+# List USB devices
+usbipd list
+
+# Bind and attach ESP32 device (e.g., busid 3-4)
+usbipd bind --busid 3-4
+usbipd attach --wsl --busid 3-4
+```
+
+**In WSL2:**
+```bash
+# Verify device is available
+ls /dev/ttyACM*
+
+# Flash firmware
+source /home/hrong/workspace/code/esp-idf-5.5/export.sh
+idf.py -p /dev/ttyACM0 flash
+
+# Monitor serial output
+idf.py -p /dev/ttyACM0 monitor
+```
+
+**Detach device (when done):**
+```powershell
+usbipd detach --busid 3-4
 ```
 
 ## Architecture

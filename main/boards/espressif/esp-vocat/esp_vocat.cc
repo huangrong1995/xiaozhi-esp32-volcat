@@ -1,4 +1,6 @@
 #include "application.h"
+#include "assets/lang_config.h"
+#include "audio/audio_service.h"
 #include "backlight.h"
 #include "button.h"
 #include "codecs/box_audio_codec.h"
@@ -13,6 +15,7 @@
 #include <esp_timer.h>
 #include <cinttypes>
 #include <mutex>
+#include <time.h>
 #include "esp_idf_version.h"
 
 #define ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0))
@@ -494,6 +497,7 @@ private:
     TaskHandle_t touch_slider_task_handle_ = nullptr;
 #endif
     esp_timer_handle_t emotion_reset_timer_ = nullptr;
+    esp_timer_handle_t reminder_timer_ = nullptr;
     bool bmi270_ready_ = false;
     bool was_charging_ = false;
     bool battery_status_initialized_ = false;
@@ -510,6 +514,17 @@ private:
     int64_t touch_last_release_time_ = 0;
     bool touch_is_pressed_ = false;
 
+    // Triple-tap detection for emotion learning mode
+    int tap_count_ = 0;
+    int64_t tap_first_time_ = 0;
+    bool emotion_learning_mode_ = false;
+    size_t current_emotion_index_ = 0;
+
+    // Emotion learning: list of emotions to show
+    static const char* kEmotionLearningEmotions_[];
+    static const char* kEmotionLearningNames_[];
+    static constexpr size_t kEmotionLearningCount = 8;
+
     // Gesture timing thresholds (ms)
     static constexpr int64_t kDoubleTapThresholdMs = 350;
     static constexpr int64_t kLongPressThresholdMs = 1200;
@@ -519,6 +534,64 @@ private:
         if (self && self->display_ != nullptr) {
             self->display_->SetEmotion("neutral");
         }
+    }
+
+    static void reminder_timer_callback(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+
+        // Get current time
+        time_t now;
+        struct tm timeinfo;
+        time(&now);
+        localtime_r(&now, &timeinfo);
+
+        int current_hour = timeinfo.tm_hour;
+        int current_min = timeinfo.tm_min;
+
+        // Check reminder times: 8:00 wake up, 12:00 lunch, 14:00 nap, 18:00 dinner, 21:00 sleep
+        // Format: hour, minute, reminder message, emotion
+        struct Reminder {
+            int hour;
+            int minute;
+            const char* message;
+            const char* emotion;
+        };
+
+        static const Reminder reminders[] = {
+            {8, 0, "该起床了~", "happy"},
+            {12, 0, "该吃午饭了~", "happy"},
+            {14, 0, "该睡午觉了~", "sleepy"},
+            {18, 0, "该吃晚饭了~", "happy"},
+            {21, 0, "该睡觉了~", "sleepy"},
+        };
+
+        for (const auto& r : reminders) {
+            if (current_hour == r.hour && current_min == r.minute) {
+                ESP_LOGI(TAG, "Reminder: %s", r.message);
+                self->ShowTemporaryEmotion(r.emotion, 5000);
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                break;
+            }
+        }
+    }
+
+    void InitializeReminderTimer() {
+        esp_timer_create_args_t timer_args = {
+            .callback = &reminder_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "reminder",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&timer_args, &reminder_timer_);
+        // Check every minute (60 seconds = 60000000 us)
+        esp_timer_start_periodic(reminder_timer_, 60 * 1000000);
+        ESP_LOGI(TAG, "Reminder timer started");
     }
 
     void ShowTemporaryEmotion(const char* emotion, uint32_t duration_ms) {
@@ -544,9 +617,18 @@ private:
         ShowTemporaryEmotion("happy", 2000);
     }
 
-    void ShowSingleTapFeedback() { ShowTemporaryEmotion("happy", 2000); }
+    void ShowSingleTapFeedback() {
+        ShowTemporaryEmotion("happy", 2000);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+    }
 
-    void ShowDoubleTapFeedback() { ShowTemporaryEmotion("shocked", 2500); }
+    void ShowDoubleTapFeedback() {
+        ShowTemporaryEmotion("shocked", 2500);
+        auto& audio = Application::GetInstance().GetAudioService();
+        audio.PlaySound(Lang::Sounds::OGG_POPUP);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        audio.PlaySound(Lang::Sounds::OGG_POPUP);
+    }
 
     void ShowLongPressFeedback() {
         // Toggle mute mode on long press
@@ -557,7 +639,35 @@ private:
         } else {
             ShowTemporaryEmotion("happy", 2000);
         }
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_VIBRATION);
         ESP_LOGI(TAG, "Long press: device %s", is_muted ? "MUTED" : "UNMUTED");
+    }
+
+    void EnterEmotionLearningMode() {
+        emotion_learning_mode_ = true;
+        current_emotion_index_ = 0;
+        ShowEmotionLearningCurrent();
+        ESP_LOGI(TAG, "Entered emotion learning mode");
+    }
+
+    void ExitEmotionLearningMode() {
+        emotion_learning_mode_ = false;
+        ShowTemporaryEmotion("happy", 2000);
+        ESP_LOGI(TAG, "Exited emotion learning mode");
+    }
+
+    void ShowEmotionLearningCurrent() {
+        if (display_ != nullptr) {
+            const char* emotion = kEmotionLearningEmotions_[current_emotion_index_];
+            display_->SetEmotion(emotion);
+            ESP_LOGI(TAG, "Emotion: %s (%s)", emotion,
+                     kEmotionLearningNames_[current_emotion_index_]);
+        }
+    }
+
+    void ShowEmotionLearningNext() {
+        current_emotion_index_ = (current_emotion_index_ + 1) % kEmotionLearningCount;
+        ShowEmotionLearningCurrent();
     }
 
     void PlayBatteryEmotion(const char* emotion, uint32_t duration_ms) {
@@ -932,7 +1042,14 @@ private:
         if (state == TOUCH_STATE_ACTIVE) {
             self->touch_press_time_ = now;
             self->touch_is_pressed_ = true;
-            ESP_LOGD(TAG, "Touch PRESS ch=%" PRIu32, channel);
+
+            // Track tap count for triple-tap detection
+            if (self->tap_count_ == 0) {
+                self->tap_first_time_ = now;
+            }
+            self->tap_count_++;
+
+            ESP_LOGD(TAG, "Touch PRESS ch=%" PRIu32 " (tap %d)", channel, self->tap_count_);
         } else if (state == TOUCH_STATE_INACTIVE) {
             // Detect release by state change from ACTIVE to INACTIVE
             if (!self->touch_is_pressed_) {
@@ -944,21 +1061,50 @@ private:
             // Long press detection (release after holding > threshold)
             if (press_duration >= kLongPressThresholdMs) {
                 ESP_LOGI(TAG, "Gesture: LONG PRESS (%" PRId64 " ms)", press_duration);
-                self->ShowLongPressFeedback();
+                if (self->emotion_learning_mode_) {
+                    self->ExitEmotionLearningMode();
+                } else {
+                    self->ShowLongPressFeedback();
+                }
             }
-            // Double tap detection (current release preceded by recent release)
-            else if ((now - self->touch_last_release_time_) <= kDoubleTapThresholdMs) {
-                ESP_LOGI(TAG, "Gesture: DOUBLE TAP (interval %" PRId64 " ms)",
-                         now - self->touch_last_release_time_);
-                self->ShowDoubleTapFeedback();
-            }
-            // Single tap
+            // Single tap - check triple-tap timeout first
             else {
-                ESP_LOGI(TAG, "Gesture: SINGLE TAP");
-                self->ShowSingleTapFeedback();
+                int64_t time_since_first_tap = now - self->tap_first_time_;
+                if (time_since_first_tap > kDoubleTapThresholdMs + 200) {
+                    // Timeout exceeded, reset and treat as single tap
+                    ESP_LOGI(TAG, "Gesture: SINGLE TAP (timeout reset)");
+                    if (self->emotion_learning_mode_) {
+                        self->ShowEmotionLearningNext();
+                    } else {
+                        self->ShowSingleTapFeedback();
+                    }
+                    self->tap_count_ = 0;
+                } else if (self->emotion_learning_mode_) {
+                    // In emotion learning mode, single tap immediately advances
+                    ESP_LOGI(TAG, "Gesture: SINGLE TAP (emotion learning)");
+                    self->ShowEmotionLearningNext();
+                    self->tap_count_ = 0;
+                }
+                // else: wait for more taps (potential double/triple tap)
             }
 
             self->touch_last_release_time_ = now;
+        }
+
+        // Check for triple tap after each release
+        if (self->tap_count_ >= 3) {
+            int64_t time_since_first = now - self->tap_first_time_;
+            if (time_since_first <= kDoubleTapThresholdMs + 200) {
+                ESP_LOGI(TAG, "Gesture: TRIPLE TAP");
+                if (self->emotion_learning_mode_) {
+                    // Already in mode, do nothing or restart
+                    self->current_emotion_index_ = 0;
+                    self->ShowEmotionLearningCurrent();
+                } else {
+                    self->EnterEmotionLearningMode();
+                }
+                self->tap_count_ = 0;
+            }
         }
     }
 
@@ -1203,6 +1349,11 @@ public:
             esp_timer_delete(emotion_reset_timer_);
             emotion_reset_timer_ = nullptr;
         }
+        if (reminder_timer_ != nullptr) {
+            esp_timer_stop(reminder_timer_);
+            esp_timer_delete(reminder_timer_);
+            reminder_timer_ = nullptr;
+        }
 
         // Disable temperature sensor
         if (temp_sensor != NULL) {
@@ -1231,6 +1382,7 @@ public:
         InitializeSpi();
         InitializeSt77916Display(pcb_version);
         InitializeButtons();
+        InitializeReminderTimer();
 #if ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR
         InitializeCapacitiveTouchPads();
 #endif
@@ -1263,5 +1415,11 @@ public:
         return charge_->GetSnapshot(level, charging, discharging);
     }
 };
+
+// Static array definitions for emotion learning
+const char* EspVocat::kEmotionLearningEmotions_[] = {
+    "happy", "sad", "angry", "shocked", "confused", "sleepy", "loving", "neutral"};
+const char* EspVocat::kEmotionLearningNames_[] = {
+    "开心", "伤心", "生气", "惊讶", "困惑", "困了", "喜欢", "平静"};
 
 DECLARE_BOARD(EspVocat);

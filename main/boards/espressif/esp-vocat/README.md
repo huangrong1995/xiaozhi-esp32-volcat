@@ -8,7 +8,36 @@
 
 ESP-VoCat 喵伴是一款智能 AI 开发套件，搭载 ESP32-S3-WROOM-1 模组，1.85 寸 QSPI 圆形触摸屏，双麦阵列，支持离线语音唤醒与声源定位算法。硬件详情等可查看[立创开源项目](https://oshwhub.com/esp-college/echoear)。
 
+## 硬件规格
+
+- **主控**: ESP32-S3-WROOM-1 (Xtensa dual-core 32-bit LX7)
+- **显示屏**: 1.85寸 QSPI 圆形触摸屏
+- **存储**: 16MB Flash
+- **音频**: 双麦阵列，支持声源定位
+
+## 支持功能
+
+- 离线语音唤醒
+- AI 对话 (小智 / Qwen / DeepSeek)
+- MCP 协议 IoT 控制
+- 触摸交互 (单击/双击/长按/三击)
+- 情绪学习模式
+- 定时提醒
+- 待机表情动画
+
 ## 配置、编译命令
+
+**环境准备**:
+
+```bash
+source /home/hrong/workspace/code/esp-idf-5.5/export.sh
+```
+
+**编译**:
+
+```bash
+python3 scripts/release.py esp-vocat
+```
 
 **配置编译目标为 ESP32S3**
 
@@ -81,7 +110,13 @@ idf.py build
 将 ESP-VoCat 喵伴连接至电脑，**注意打开电源**，并运行：
 
 ```bash
-idf.py flash
+idf.py -p /dev/ttyACM0 flash
+```
+
+**查看日志**
+
+```bash
+idf.py -p /dev/ttyACM0 monitor
 ```
 
 ## Peripheral I2C error handling
@@ -161,4 +196,3 @@ python3 -m unittest discover -s scripts/tests -p test_esp_vocat_i2c.py -v
 **表情循环：** 开心 → 困惑 → 生气 → 惊讶 → 开心
 
 切换到倾听或说话状态时会暂停动画。
-
