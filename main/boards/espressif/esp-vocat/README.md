@@ -119,6 +119,14 @@ idf.py -p /dev/ttyACM0 flash
 idf.py -p /dev/ttyACM0 monitor
 ```
 
+**串口调试** (115200 波特率):
+```bash
+# Linux/WLS2
+picocom -b 115200 /dev/ttyACM0
+
+# Windows: 使用串口工具连接 COM10
+```
+
 ## Peripheral I2C error handling
 
 Battery register reads run on the battery worker, with at most three attempts

@@ -647,12 +647,18 @@ private:
         emotion_learning_mode_ = true;
         current_emotion_index_ = 0;
         ShowEmotionLearningCurrent();
+        // Play sound to indicate entering learning mode
+        auto& audio = Application::GetInstance().GetAudioService();
+        audio.PlaySound(Lang::Sounds::OGG_POPUP);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        audio.PlaySound(Lang::Sounds::OGG_SUCCESS);
         ESP_LOGI(TAG, "Entered emotion learning mode");
     }
 
     void ExitEmotionLearningMode() {
         emotion_learning_mode_ = false;
         ShowTemporaryEmotion("happy", 2000);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
         ESP_LOGI(TAG, "Exited emotion learning mode");
     }
 
