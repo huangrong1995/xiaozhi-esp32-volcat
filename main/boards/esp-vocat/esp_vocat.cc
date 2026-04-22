@@ -9,6 +9,7 @@
 #include "esp_video.h"
 #include "audio/audio_service.h"
 #include "assets/lang_config.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -17,6 +18,7 @@
 
 #include <driver/i2c_master.h>
 #include <cstdlib>
+#include <string.h>
 #include "i2c_device.h"
 #include "i2c_bus.h"
 #include "bmi270_api.h"
@@ -470,6 +472,30 @@ private:
     static const char* kEmotionLearningNames_[];
     static constexpr size_t kEmotionLearningCount = 8;
 
+    // Habit tracking state
+    struct HabitState {
+        int64_t last_drink_time;     // Unix timestamp of last drink
+        int drink_streak;            // Consecutive drink completions today
+        bool drink_reminder_shown;   // Whether reminder is shown for current interval
+    };
+    HabitState habit_state_ = {};
+
+    // Habit configuration
+    static constexpr int64_t kDrinkReminderIntervalMs = 60 * 60 * 1000;  // 60 minutes in ms
+
+    // Swipe detection for yoga challenge
+    bool swipe_start_recorded_ = false;
+    int swipe_start_x_ = 0;
+    int swipe_start_y_ = 0;
+    static constexpr int kSwipeThreshold = 80;  // Minimum swipe distance
+
+    // Yoga challenge mode
+    bool yoga_mode_ = false;
+    size_t current_pose_index_ = 0;
+    static const char* kYogaPoseNames_[];
+    static const char* kYogaPoseDirections_[];
+    static constexpr size_t kYogaPoseCount = 6;
+
     // Gesture timing thresholds (ms)
     static constexpr int64_t kDoubleTapThresholdMs = 350;
     static constexpr int64_t kLongPressThresholdMs = 1200;
@@ -482,12 +508,65 @@ private:
         }
     }
 
+    void LoadHabitState()
+    {
+        Settings s("habit", false);
+        habit_state_.last_drink_time = s.GetInt("last_drink", 0);
+        habit_state_.drink_streak = s.GetInt("drink_streak", 0);
+        habit_state_.drink_reminder_shown = false;
+        ESP_LOGI(TAG, "Habit state loaded: last_drink=%" PRId64 ", streak=%d",
+                  habit_state_.last_drink_time, habit_state_.drink_streak);
+    }
+
+    void SaveHabitState()
+    {
+        Settings s("habit", true);
+        s.SetInt("last_drink", habit_state_.last_drink_time);
+        s.SetInt("drink_streak", habit_state_.drink_streak);
+        ESP_LOGI(TAG, "Habit state saved: last_drink=%" PRId64 ", streak=%d",
+                  habit_state_.last_drink_time, habit_state_.drink_streak);
+    }
+
+    void CheckDrinkReminder()
+    {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        // If no drink recorded today, or interval has passed, show reminder
+        if (habit_state_.last_drink_time == 0 ||
+            (now_ms - habit_state_.last_drink_time) >= kDrinkReminderIntervalMs) {
+            if (!habit_state_.drink_reminder_shown) {
+                ESP_LOGI(TAG, "Drink reminder: time to drink water!");
+                ShowTemporaryEmotion("confused", 5000);
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                habit_state_.drink_reminder_shown = true;
+            }
+        }
+    }
+
+    void MarkDrinkCompleted()
+    {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        habit_state_.last_drink_time = now_ms;
+        habit_state_.drink_streak++;
+        habit_state_.drink_reminder_shown = false;
+        SaveHabitState();
+
+        ESP_LOGI(TAG, "Drink completed! Streak: %d", habit_state_.drink_streak);
+        ShowTemporaryEmotion("loving", 3000);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+    }
+
     static void reminder_timer_callback(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
         if (self == nullptr) {
             return;
         }
+
+        // Check drink reminder
+        self->CheckDrinkReminder();
 
         // Get current time
         time_t now;
@@ -599,6 +678,8 @@ private:
                 prev = cur;
                 has_prev = true;
             }
+            // Check yoga pose match periodically
+            self->ProcessImuForYoga();
             vTaskDelay(pdMS_TO_TICKS(80));
         }
     }
@@ -698,10 +779,34 @@ private:
                 ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
                 touchpad->UpdateTouchPoint();
                 auto touch_event = touchpad->CheckTouchEvent();
+                auto& touch_point = touchpad->GetTouchPoint();
+
+                if (touch_event == Cst816s::TOUCH_PRESS) {
+                    // Record swipe start position
+                    board.swipe_start_x_ = touch_point.x;
+                    board.swipe_start_y_ = touch_point.y;
+                    board.swipe_start_recorded_ = true;
+                }
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
                     if (app.GetDeviceState() == kDeviceStateStarting) {
                         board.EnterWifiConfigMode();
+                    } else if (board.swipe_start_recorded_) {
+                        // Check for swipe right to enter yoga mode
+                        int delta_x = touch_point.x - board.swipe_start_x_;
+                        int delta_y = touch_point.y - board.swipe_start_y_;
+                        ESP_LOGI(TAG, "Swipe check: start(%d,%d) end(%d,%d) delta(%d,%d)",
+                                  board.swipe_start_x_, board.swipe_start_y_,
+                                  touch_point.x, touch_point.y, delta_x, delta_y);
+                        // Swipe right: delta_x > threshold and |delta_y| < delta_x
+                        if (delta_x > kSwipeThreshold && abs(delta_y) < delta_x) {
+                            ESP_LOGI(TAG, "Swipe RIGHT detected, entering yoga challenge mode");
+                            board.EnterYogaChallengeMode();
+                        } else {
+                            // Normal tap - toggle chat state
+                            app.ToggleChatState();
+                        }
+                        board.swipe_start_recorded_ = false;
                     } else {
                         app.ToggleChatState();
                     }
@@ -846,6 +951,87 @@ private:
         ShowEmotionLearningCurrent();
     }
 
+    void EnterYogaChallengeMode()
+    {
+        yoga_mode_ = true;
+        current_pose_index_ = 0;
+        ShowYogaPose();
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+        ESP_LOGI(TAG, "Entered yoga challenge mode");
+    }
+
+    void ExitYogaChallengeMode()
+    {
+        yoga_mode_ = false;
+        ShowTemporaryEmotion("happy", 2000);
+        ESP_LOGI(TAG, "Exited yoga challenge mode");
+    }
+
+    void ShowYogaPose()
+    {
+        if (display_ != nullptr) {
+            const char* direction = kYogaPoseDirections_[current_pose_index_];
+            display_->SetEmotion(direction);
+            ESP_LOGI(TAG, "Yoga pose: %s (%s)", kYogaPoseNames_[current_pose_index_], direction);
+        }
+    }
+
+    void CheckYogaPoseMatch(const char* motion_direction)
+    {
+        if (!yoga_mode_) {
+            return;
+        }
+        const char* target = kYogaPoseDirections_[current_pose_index_];
+        if (strcmp(motion_direction, target) == 0) {
+            ESP_LOGI(TAG, "Correct! Moving to next pose");
+            ShowTemporaryEmotion("happy", 1000);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+            current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            ShowYogaPose();
+        }
+    }
+
+    void ProcessImuForYoga()
+    {
+        if (!yoga_mode_ || !bmi270_ready_) {
+            return;
+        }
+        static int64_t last_check_ms = 0;
+        constexpr int64_t kCooldownMs = 500;  // Only check every 500ms
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_check_ms < kCooldownMs) {
+            return;
+        }
+        last_check_ms = now_ms;
+
+        // Read accelerometer data
+        struct bmi2_sens_data data = {};
+        if (Bmi270Motion::ReadAccelRaw(data)) {
+            // Determine tilt direction
+            int acc_x = data.acc.x;
+            int acc_y = data.acc.y;
+            const char* direction = nullptr;
+            // Check dominant tilt
+            if (abs(acc_x) > abs(acc_y)) {
+                if (acc_x > 5000) {
+                    direction = "right";
+                } else if (acc_x < -5000) {
+                    direction = "left";
+                }
+            } else {
+                if (acc_y > 5000) {
+                    direction = "down";
+                } else if (acc_y < -5000) {
+                    direction = "up";
+                }
+            }
+            if (direction != nullptr) {
+                CheckYogaPoseMatch(direction);
+            }
+        }
+    }
+
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
     {
         (void)handle;
@@ -881,6 +1067,8 @@ private:
                 if (self->emotion_learning_mode_) {
                     self->ExitEmotionLearningMode();
                 } else {
+                    // Mark drink completed and toggle mute
+                    self->MarkDrinkCompleted();
                     self->ShowLongPressFeedback();
                 }
             }
@@ -1190,6 +1378,7 @@ public:
         InitializeSt77916Display(pcb_version);
         InitializeButtons();
         InitializeCapacitiveTouchPads();
+        LoadHabitState();
         InitializeReminderTimer();
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
         InitializeCamera();
@@ -1242,6 +1431,14 @@ const char* EspVocat::kEmotionLearningEmotions_[] = {
 const char* EspVocat::kEmotionLearningNames_[] = {
     "开心", "伤心", "生气", "惊讶",
     "困惑", "困了", "喜欢", "平静"
+};
+
+// Static array definitions for yoga challenge
+const char* EspVocat::kYogaPoseNames_[] = {
+    "向上倾斜", "向下倾斜", "向左倾斜", "向右倾斜", "向上倾斜", "向下倾斜"
+};
+const char* EspVocat::kYogaPoseDirections_[] = {
+    "up", "down", "left", "right", "up", "down"
 };
 
 DECLARE_BOARD(EspVocat);
