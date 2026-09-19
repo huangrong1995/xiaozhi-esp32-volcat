@@ -434,6 +434,23 @@ private:
     SemaphoreHandle_t touch_isr_mux_;
 };
 
+// Unified interaction gesture vocabulary.
+enum class Gesture {
+    None,
+    Tap,
+    LongPress,
+    SwipeLeft,
+    SwipeRight,
+    SwipeUp,
+    SwipeDown,
+    Pet,
+    Shake,
+    ChatToggle,
+};
+
+// Device interaction modes.
+enum class Mode { Chat, EmotionLearning, Yoga };
+
 class EspVocat : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -464,7 +481,6 @@ private:
     // Triple-tap detection for emotion learning mode
     int tap_count_ = 0;
     int64_t tap_first_time_ = 0;
-    bool emotion_learning_mode_ = false;
     size_t current_emotion_index_ = 0;
 
     // Emotion learning: list of emotions to show
@@ -490,11 +506,88 @@ private:
     static constexpr int kSwipeThreshold = 80;  // Minimum swipe distance
 
     // Yoga challenge mode
-    bool yoga_mode_ = false;
     size_t current_pose_index_ = 0;
     static const char* kYogaPoseNames_[];
     static const char* kYogaPoseDirections_[];
     static constexpr size_t kYogaPoseCount = 6;
+
+    // Unified interaction mode state. mode_ is read/written only from the
+    // interaction task/callback context (touch events and timer callbacks),
+    // so it does not require locking.
+    Mode mode_ = Mode::Chat;
+    static constexpr uint64_t kModeIdleTimeoutMs = 30000;  // Idle timeout (ms) before returning to chat
+    esp_timer_handle_t mode_idle_timer_ = nullptr;
+
+    static void mode_idle_timer_callback(void* arg)
+    {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr || self->mode_ == Mode::Chat) {
+            return;
+        }
+        self->ExitToChat();
+    }
+
+    void OnGesture(Gesture gesture)
+    {
+        ResetModeIdleTimer();
+        switch (mode_) {
+        case Mode::Chat:
+            HandleChatGesture(gesture);
+            break;
+        case Mode::EmotionLearning:
+            HandleEmotionLearningGesture(gesture);
+            break;
+        case Mode::Yoga:
+            HandleYogaGesture(gesture);
+            break;
+        }
+    }
+
+    void EnterMode(Mode mode)
+    {
+        if (mode_ == mode) {
+            return;
+        }
+        mode_ = mode;
+        ResetModeIdleTimer();
+    }
+
+    void ExitToChat()
+    {
+        if (mode_ == Mode::Chat) {
+            return;
+        }
+        mode_ = Mode::Chat;
+        if (mode_idle_timer_ != nullptr) {
+            esp_timer_stop(mode_idle_timer_);
+        }
+    }
+
+    void ResetModeIdleTimer()
+    {
+        if (mode_idle_timer_ == nullptr) {
+            return;
+        }
+        esp_timer_stop(mode_idle_timer_);
+        esp_timer_start_once(mode_idle_timer_, kModeIdleTimeoutMs * 1000ULL);
+    }
+
+    // Per-mode gesture handlers. Behavior is filled in by Task 2; until then
+    // they only log. Note: Pet and Shake must never change mode_.
+    void HandleChatGesture(Gesture gesture)
+    {
+        ESP_LOGI(TAG, "Chat gesture: %d", static_cast<int>(gesture));
+    }
+
+    void HandleEmotionLearningGesture(Gesture gesture)
+    {
+        ESP_LOGI(TAG, "EmotionLearning gesture: %d", static_cast<int>(gesture));
+    }
+
+    void HandleYogaGesture(Gesture gesture)
+    {
+        ESP_LOGI(TAG, "Yoga gesture: %d", static_cast<int>(gesture));
+    }
 
     // Gesture timing thresholds (ms)
     static constexpr int64_t kDoubleTapThresholdMs = 350;
@@ -917,7 +1010,10 @@ private:
 
     void EnterEmotionLearningMode()
     {
-        emotion_learning_mode_ = true;
+        if (mode_ == Mode::EmotionLearning) {
+            return;
+        }
+        EnterMode(Mode::EmotionLearning);
         current_emotion_index_ = 0;
         ShowEmotionLearningCurrent();
         // Play sound to indicate entering learning mode
@@ -930,7 +1026,10 @@ private:
 
     void ExitEmotionLearningMode()
     {
-        emotion_learning_mode_ = false;
+        if (mode_ != Mode::EmotionLearning) {
+            return;
+        }
+        ExitToChat();
         ShowTemporaryEmotion("happy", 2000);
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
         ESP_LOGI(TAG, "Exited emotion learning mode");
@@ -953,7 +1052,10 @@ private:
 
     void EnterYogaChallengeMode()
     {
-        yoga_mode_ = true;
+        if (mode_ == Mode::Yoga) {
+            return;
+        }
+        EnterMode(Mode::Yoga);
         current_pose_index_ = 0;
         ShowYogaPose();
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
@@ -962,7 +1064,10 @@ private:
 
     void ExitYogaChallengeMode()
     {
-        yoga_mode_ = false;
+        if (mode_ != Mode::Yoga) {
+            return;
+        }
+        ExitToChat();
         ShowTemporaryEmotion("happy", 2000);
         ESP_LOGI(TAG, "Exited yoga challenge mode");
     }
@@ -979,7 +1084,7 @@ private:
 
     void CheckYogaPoseMatch(const char* motion_direction)
     {
-        if (!yoga_mode_) {
+        if (mode_ != Mode::Yoga) {
             return;
         }
         const char* target = kYogaPoseDirections_[current_pose_index_];
@@ -995,7 +1100,7 @@ private:
 
     void ProcessImuForYoga()
     {
-        if (!yoga_mode_ || !bmi270_ready_) {
+        if (mode_ != Mode::Yoga || !bmi270_ready_) {
             return;
         }
         static int64_t last_check_ms = 0;
@@ -1065,7 +1170,7 @@ private:
             // Long press detection (release after holding > threshold)
             if (press_duration >= kLongPressThresholdMs) {
                 ESP_LOGI(TAG, "Gesture: LONG PRESS (%" PRId64 " ms)", press_duration);
-                if (self->emotion_learning_mode_) {
+                if (self->mode_ == Mode::EmotionLearning) {
                     self->ExitEmotionLearningMode();
                 } else {
                     // Mark drink completed and toggle mute
@@ -1079,13 +1184,13 @@ private:
                 if (time_since_first_tap > kDoubleTapThresholdMs + 200) {
                     // Timeout exceeded, reset and treat as single tap
                     ESP_LOGI(TAG, "Gesture: SINGLE TAP (timeout reset)");
-                    if (self->emotion_learning_mode_) {
+                    if (self->mode_ == Mode::EmotionLearning) {
                         self->ShowEmotionLearningNext();
                     } else {
                         self->ShowSingleTapFeedback();
                     }
                     self->tap_count_ = 0;
-                } else if (self->emotion_learning_mode_) {
+                } else if (self->mode_ == Mode::EmotionLearning) {
                     // In emotion learning mode, single tap immediately advances
                     ESP_LOGI(TAG, "Gesture: SINGLE TAP (emotion learning)");
                     self->ShowEmotionLearningNext();
@@ -1102,7 +1207,7 @@ private:
             int64_t time_since_first = now - self->tap_first_time_;
             if (time_since_first <= kDoubleTapThresholdMs + 200) {
                 ESP_LOGI(TAG, "Gesture: TRIPLE TAP");
-                if (self->emotion_learning_mode_) {
+                if (self->mode_ == Mode::EmotionLearning) {
                     // Already in mode, do nothing or restart
                     self->current_emotion_index_ = 0;
                     self->ShowEmotionLearningCurrent();
@@ -1344,6 +1449,11 @@ public:
             esp_timer_delete(emotion_reset_timer_);
             emotion_reset_timer_ = nullptr;
         }
+        if (mode_idle_timer_ != nullptr) {
+            esp_timer_stop(mode_idle_timer_);
+            esp_timer_delete(mode_idle_timer_);
+            mode_idle_timer_ = nullptr;
+        }
         if (reminder_timer_ != nullptr) {
             esp_timer_stop(reminder_timer_);
             esp_timer_delete(reminder_timer_);
@@ -1368,6 +1478,15 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&emotion_timer_args, &emotion_reset_timer_));
+
+        const esp_timer_create_args_t mode_idle_timer_args = {
+            .callback = &EspVocat::mode_idle_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "mode_idle",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
 
         InitializeI2c();
         uint8_t pcb_version = DetectPcbVersion();
