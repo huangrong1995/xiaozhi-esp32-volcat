@@ -473,14 +473,7 @@ private:
     touch_slider_handle_t touch_slider_handle_ = nullptr;
     touch_button_handle_t touch_button_handle_ = nullptr;
 
-    // Gesture detection state
-    int64_t touch_press_time_ = 0;
-    int64_t touch_last_release_time_ = 0;
-    bool touch_is_pressed_ = false;
-
-    // Triple-tap detection for emotion learning mode
-    int tap_count_ = 0;
-    int64_t tap_first_time_ = 0;
+    // Emotion learning: index of currently displayed emotion
     size_t current_emotion_index_ = 0;
 
     // Emotion learning: list of emotions to show
@@ -505,6 +498,11 @@ private:
     int swipe_start_x_ = 0;
     int swipe_start_y_ = 0;
     static constexpr int kSwipeThreshold = 80;  // Minimum swipe distance
+
+    // Outer capacitive "pet" surface feedback cooldown (moved from a hidden
+    // static local so it is not hidden state).
+    static constexpr int64_t kOuterTouchCooldownUs = 1200000;  // 1200 ms
+    int64_t outer_touch_last_us_ = 0;
 
     // Yoga challenge mode
     size_t current_pose_index_ = 0;
@@ -646,7 +644,6 @@ private:
     }
 
     // Gesture timing thresholds (ms)
-    static constexpr int64_t kDoubleTapThresholdMs = 350;
     static constexpr int64_t kLongPressThresholdMs = 1200;
 
     static void emotion_reset_timer_callback(void* arg)
@@ -782,15 +779,18 @@ private:
         }
     }
 
-    void ShowHappyTouchFeedback()
+    // Outer capacitive "pet" surface: feedback-only touch. A single recognized
+    // touch is routed as Gesture::Pet once per debounced interaction (cooldown
+    // in outer_touch_last_us_). Pet never changes mode, toggles chat, advances
+    // an emotion, or records a drink. (Waking the device is handled separately.)
+    void HandleOuterTouchPet()
     {
-        static int64_t s_last_us = 0;
-        constexpr int64_t kCooldownUs = 1200000;
         const int64_t now = esp_timer_get_time();
-        if ((now - s_last_us) < kCooldownUs) {
+        if ((now - outer_touch_last_us_) < kOuterTouchCooldownUs) {
             return;
         }
-        s_last_us = now;
+        outer_touch_last_us_ = now;
+        OnGesture(Gesture::Pet);
         ShowTemporaryEmotion("happy", 2000);
     }
 
@@ -1042,36 +1042,8 @@ private:
             return;
         }
 
-        self->ShowHappyTouchFeedback();
-    }
-
-    void ShowSingleTapFeedback()
-    {
-        ShowTemporaryEmotion("happy", 2000);
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-    }
-
-    void ShowDoubleTapFeedback()
-    {
-        ShowTemporaryEmotion("shocked", 2500);
-        auto& audio = Application::GetInstance().GetAudioService();
-        audio.PlaySound(Lang::Sounds::OGG_POPUP);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        audio.PlaySound(Lang::Sounds::OGG_POPUP);
-    }
-
-    void ShowLongPressFeedback()
-    {
-        // Toggle mute mode on long press
-        static bool is_muted = false;
-        is_muted = !is_muted;
-        if (is_muted) {
-            ShowTemporaryEmotion("angry", 2000);
-        } else {
-            ShowTemporaryEmotion("happy", 2000);
-        }
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_VIBRATION);
-        ESP_LOGI(TAG, "Long press: device %s", is_muted ? "MUTED" : "UNMUTED");
+        // The outer capacitive surface is a feedback-only "pet" input.
+        self->HandleOuterTouchPet();
     }
 
     void EnterEmotionLearningMode()
@@ -1207,81 +1179,18 @@ private:
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
     {
         (void)handle;
+        (void)channel;
         auto* self = static_cast<EspVocat*>(cb_arg);
         if (self == nullptr || self->display_ == nullptr) {
             return;
         }
 
-        int64_t now = esp_timer_get_time() / 1000;
-
-        if (state == TOUCH_STATE_ACTIVE) {
-            self->touch_press_time_ = now;
-            self->touch_is_pressed_ = true;
-
-            // Track tap count for triple-tap detection
-            if (self->tap_count_ == 0) {
-                self->tap_first_time_ = now;
-            }
-            self->tap_count_++;
-
-            ESP_LOGD(TAG, "Touch PRESS ch=%" PRIu32 " (tap %d)", channel, self->tap_count_);
-        } else if (state == TOUCH_STATE_INACTIVE) {
-            // Detect release by state change from ACTIVE to INACTIVE
-            if (!self->touch_is_pressed_) {
-                return;
-            }
-            self->touch_is_pressed_ = false;
-            int64_t press_duration = now - self->touch_press_time_;
-
-            // Long press detection (release after holding > threshold)
-            if (press_duration >= kLongPressThresholdMs) {
-                ESP_LOGI(TAG, "Gesture: LONG PRESS (%" PRId64 " ms)", press_duration);
-                if (self->mode_ == Mode::EmotionLearning) {
-                    self->ExitEmotionLearningMode();
-                } else {
-                    // Mark drink completed and toggle mute
-                    self->MarkDrinkCompleted();
-                    self->ShowLongPressFeedback();
-                }
-            }
-            // Single tap - check triple-tap timeout first
-            else {
-                int64_t time_since_first_tap = now - self->tap_first_time_;
-                if (time_since_first_tap > kDoubleTapThresholdMs + 200) {
-                    // Timeout exceeded, reset and treat as single tap
-                    ESP_LOGI(TAG, "Gesture: SINGLE TAP (timeout reset)");
-                    if (self->mode_ == Mode::EmotionLearning) {
-                        self->ShowEmotionLearningNext();
-                    } else {
-                        self->ShowSingleTapFeedback();
-                    }
-                    self->tap_count_ = 0;
-                } else if (self->mode_ == Mode::EmotionLearning) {
-                    // In emotion learning mode, single tap immediately advances
-                    ESP_LOGI(TAG, "Gesture: SINGLE TAP (emotion learning)");
-                    self->ShowEmotionLearningNext();
-                    self->tap_count_ = 0;
-                }
-                // else: wait for more taps (potential double/triple tap)
-            }
-
-            self->touch_last_release_time_ = now;
-        }
-
-        // Check for triple tap after each release
-        if (self->tap_count_ >= 3) {
-            int64_t time_since_first = now - self->tap_first_time_;
-            if (time_since_first <= kDoubleTapThresholdMs + 200) {
-                ESP_LOGI(TAG, "Gesture: TRIPLE TAP");
-                if (self->mode_ == Mode::EmotionLearning) {
-                    // Already in mode, do nothing or restart
-                    self->current_emotion_index_ = 0;
-                    self->ShowEmotionLearningCurrent();
-                } else {
-                    self->EnterEmotionLearningMode();
-                }
-                self->tap_count_ = 0;
-            }
+        // Single-pad (PCB v1.0) outer capacitive surface: a touch is recognized
+        // once per debounced interaction, on release. It is feedback-only (Pet)
+        // and never changes mode, toggles chat, advances an emotion, or records
+        // a drink.
+        if (state == TOUCH_STATE_INACTIVE) {
+            self->HandleOuterTouchPet();
         }
     }
 
