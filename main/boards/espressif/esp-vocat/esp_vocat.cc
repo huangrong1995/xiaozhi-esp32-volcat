@@ -528,14 +528,11 @@ private:
     touch_button_handle_t touch_button_handle_ = nullptr;
 #endif
 
-    // Gesture detection state
-    int64_t touch_press_time_ = 0;
-    int64_t touch_last_release_time_ = 0;
-    bool touch_is_pressed_ = false;
-
-    // Triple-tap detection for emotion learning mode
-    int tap_count_ = 0;
-    int64_t tap_first_time_ = 0;
+    // Emotion learning: index of currently displayed emotion
+    // Outer capacitive "pet" surface feedback cooldown (moved from a hidden
+    // static local so it is not hidden state).
+    static constexpr int64_t kOuterTouchCooldownUs = 1200000;  // 1200 ms
+    int64_t outer_touch_last_us_ = 0;
     size_t current_emotion_index_ = 0;
 
     // Emotion learning: list of emotions to show
@@ -691,1092 +688,1008 @@ private:
                 break;
         }
     }
-}
 
-// Gesture timing thresholds (ms)
-static constexpr int64_t kDoubleTapThresholdMs = 350;
-static constexpr int64_t kLongPressThresholdMs = 1200;
+    // Gesture timing thresholds (ms)
+    static constexpr int64_t kLongPressThresholdMs = 1200;
 
-static void emotion_reset_timer_callback(void* arg) {
-    auto* self = static_cast<EspVocat*>(arg);
-    if (self && self->display_ != nullptr) {
-        self->display_->SetEmotion("neutral");
-    }
-}
-
-void LoadHabitState() {
-    Settings s("habit", false);
-    habit_state_.last_drink_time = s.GetInt("last_drink", 0);
-    habit_state_.drink_streak = s.GetInt("drink_streak", 0);
-    habit_state_.drink_reminder_shown = false;
-    ESP_LOGI(TAG, "Habit state loaded: last_drink=%" PRId64 ", streak=%d",
-             habit_state_.last_drink_time, habit_state_.drink_streak);
-}
-
-void SaveHabitState() {
-    Settings s("habit", true);
-    s.SetInt("last_drink", habit_state_.last_drink_time);
-    s.SetInt("drink_streak", habit_state_.drink_streak);
-    ESP_LOGI(TAG, "Habit state saved: last_drink=%" PRId64 ", streak=%d",
-             habit_state_.last_drink_time, habit_state_.drink_streak);
-}
-
-void CheckDrinkReminder() {
-    int64_t now_ms = esp_timer_get_time() / 1000;
-
-    // If no drink recorded today, or interval has passed, show reminder
-    if (habit_state_.last_drink_time == 0 ||
-        (now_ms - habit_state_.last_drink_time) >= kDrinkReminderIntervalMs) {
-        if (!habit_state_.drink_reminder_shown) {
-            ESP_LOGI(TAG, "Drink reminder: time to drink water!");
-            ShowTemporaryEmotion("confused", 5000);
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-            habit_state_.drink_reminder_shown = true;
-        }
-    }
-}
-
-void MarkDrinkCompleted() {
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    habit_state_.last_drink_time = now_ms;
-    habit_state_.drink_streak++;
-    habit_state_.drink_reminder_shown = false;
-    SaveHabitState();
-
-    ESP_LOGI(TAG, "Drink completed! Streak: %d", habit_state_.drink_streak);
-    ShowTemporaryEmotion("loving", 3000);
-    Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-}
-
-static void reminder_timer_callback(void* arg) {
-    auto* self = static_cast<EspVocat*>(arg);
-    if (self == nullptr) {
-        return;
-    }
-
-    // Check drink reminder
-    self->CheckDrinkReminder();
-
-    // Get current time
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
-
-    int current_hour = timeinfo.tm_hour;
-    int current_min = timeinfo.tm_min;
-
-    // Check reminder times: 8:00 wake up, 12:00 lunch, 14:00 nap, 18:00 dinner, 21:00 sleep
-    // Format: hour, minute, reminder message, emotion
-    struct Reminder {
-        int hour;
-        int minute;
-        const char* message;
-        const char* emotion;
-    };
-
-    static const Reminder reminders[] = {
-        {8, 0, "该起床了~", "happy"},     {12, 0, "该吃午饭了~", "happy"},
-        {14, 0, "该睡午觉了~", "sleepy"}, {18, 0, "该吃晚饭了~", "happy"},
-        {21, 0, "该睡觉了~", "sleepy"},
-    };
-
-    for (const auto& r : reminders) {
-        if (current_hour == r.hour && current_min == r.minute) {
-            ESP_LOGI(TAG, "Reminder: %s", r.message);
-            self->ShowTemporaryEmotion(r.emotion, 5000);
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-            break;
-        }
-    }
-}
-
-void InitializeReminderTimer() {
-    esp_timer_create_args_t timer_args = {
-        .callback = &reminder_timer_callback,
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "reminder",
-        .skip_unhandled_events = true,
-    };
-    esp_timer_create(&timer_args, &reminder_timer_);
-    // Check every minute (60 seconds = 60000000 us)
-    esp_timer_start_periodic(reminder_timer_, 60 * 1000000);
-    ESP_LOGI(TAG, "Reminder timer started");
-}
-
-void ShowTemporaryEmotion(const char* emotion, uint32_t duration_ms) {
-    if (display_ == nullptr || emotion == nullptr) {
-        return;
-    }
-    display_->SetEmotion(emotion);
-    if (emotion_reset_timer_ != nullptr) {
-        esp_timer_stop(emotion_reset_timer_);
-        esp_timer_start_once(emotion_reset_timer_, static_cast<uint64_t>(duration_ms) * 1000ULL);
-    }
-}
-
-void ShowHappyTouchFeedback() {
-    static int64_t s_last_us = 0;
-    constexpr int64_t kCooldownUs = 1200000;
-    const int64_t now = esp_timer_get_time();
-    if ((now - s_last_us) < kCooldownUs) {
-        return;
-    }
-    s_last_us = now;
-    ShowTemporaryEmotion("happy", 2000);
-}
-
-void PlayBatteryEmotion(const char* emotion, uint32_t duration_ms) {
-#if CONFIG_USE_EMOTE_MESSAGE_STYLE
-    if (display_ == nullptr || emotion == nullptr) {
-        return;
-    }
-    if (display_->InsertAnimDialog(emotion, duration_ms)) {
-        return;
-    }
-#endif
-    ShowTemporaryEmotion(emotion, duration_ms);
-}
-
-void StartLowBatteryAlertSequence() {
-    constexpr int kMaxPlays = 3;
-    constexpr int64_t kIntervalMs = 5 * 60 * 1000;
-
-    low_battery_plays_left_ = kMaxPlays - 1;
-    next_low_battery_play_ms_ = (esp_timer_get_time() / 1000) + kIntervalMs;
-    PlayBatteryEmotion("low_battery", 4000);
-}
-
-void HandleBatteryEmotions() {
-    if (charge_ == nullptr) {
-        return;
-    }
-
-    int level;
-    bool charging, discharging;
-    if (!charge_->GetSnapshot(level, charging, discharging))
-        return;
-    if (!battery_status_initialized_) {
-        was_charging_ = charging;
-        battery_status_initialized_ = true;
-    }
-
-    if (charging && !was_charging_) {
-        PlayBatteryEmotion("battery_connected", 4000);
-        low_battery_alert_mask_ = 0;
-        low_battery_plays_left_ = 0;
-        next_low_battery_play_ms_ = 0;
-    }
-    was_charging_ = charging;
-
-    if (charging) {
-        return;
-    }
-
-    if (level > 12) {
-        low_battery_alert_mask_ = 0;
-        low_battery_plays_left_ = 0;
-        next_low_battery_play_ms_ = 0;
-        return;
-    }
-
-    const int64_t now_ms = esp_timer_get_time() / 1000;
-    if (low_battery_plays_left_ > 0 && now_ms >= next_low_battery_play_ms_) {
-        PlayBatteryEmotion("low_battery", 4000);
-        low_battery_plays_left_--;
-        if (low_battery_plays_left_ > 0) {
-            next_low_battery_play_ms_ = now_ms + 5 * 60 * 1000;
+    static void emotion_reset_timer_callback(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self && self->display_ != nullptr) {
+            self->display_->SetEmotion("neutral");
         }
     }
 
-    if (level <= 5 && (low_battery_alert_mask_ & 0x02) == 0) {
-        low_battery_alert_mask_ |= 0x02;
-        StartLowBatteryAlertSequence();
-        return;
+    void LoadHabitState() {
+        Settings s("habit", false);
+        habit_state_.last_drink_time = s.GetInt("last_drink", 0);
+        habit_state_.drink_streak = s.GetInt("drink_streak", 0);
+        habit_state_.drink_reminder_shown = false;
+        ESP_LOGI(TAG, "Habit state loaded: last_drink=%" PRId64 ", streak=%d",
+                 habit_state_.last_drink_time, habit_state_.drink_streak);
     }
 
-    if (level <= 10 && (low_battery_alert_mask_ & 0x01) == 0) {
-        low_battery_alert_mask_ |= 0x01;
-        StartLowBatteryAlertSequence();
-    }
-}
-
-static void battery_task(void* arg) {
-    auto* self = static_cast<EspVocat*>(arg);
-    while (true) {
-        bool healthy = false;
-        if (self != nullptr && self->charge_ != nullptr) {
-            healthy = self->charge_->Update();
-            if (healthy)
-                self->HandleBatteryEmotions();
-        }
-        vTaskDelay(pdMS_TO_TICKS(healthy ? 2000 : 5000));
-    }
-}
-
-static void imu_event_task(void* arg) {
-    auto* self = static_cast<EspVocat*>(arg);
-    if (self == nullptr || !self->bmi270_ready_) {
-        vTaskDelete(NULL);
-        return;
+    void SaveHabitState() {
+        Settings s("habit", true);
+        s.SetInt("last_drink", habit_state_.last_drink_time);
+        s.SetInt("drink_streak", habit_state_.drink_streak);
+        ESP_LOGI(TAG, "Habit state saved: last_drink=%" PRId64 ", streak=%d",
+                 habit_state_.last_drink_time, habit_state_.drink_streak);
     }
 
-    struct bmi2_sens_data prev = {};
-    struct bmi2_sens_data cur = {};
-    bool has_prev = false;
-    int64_t last_shake_ms = 0;
-    constexpr int kShakeDeltaThreshold = 20000;
-    constexpr int64_t kShakeCooldownMs = 2000;
+    void CheckDrinkReminder() {
+        int64_t now_ms = esp_timer_get_time() / 1000;
 
-    while (true) {
-        if (Bmi270Motion::ReadAccelRaw(cur)) {
-            if (has_prev) {
-                int dx = abs(static_cast<int>(cur.acc.x) - static_cast<int>(prev.acc.x));
-                int dy = abs(static_cast<int>(cur.acc.y) - static_cast<int>(prev.acc.y));
-                int dz = abs(static_cast<int>(cur.acc.z) - static_cast<int>(prev.acc.z));
-                int shake_score = dx + dy + dz;
-
-                int64_t now_ms = esp_timer_get_time() / 1000;
-                if (shake_score > kShakeDeltaThreshold &&
-                    (now_ms - last_shake_ms) > kShakeCooldownMs) {
-                    last_shake_ms = now_ms;
-                    // "dizzy/nauseated" are not guaranteed in current assets, use supported
-                    // fallback.
-                    self->ShowTemporaryEmotion("confused", 1800);
-                }
+        // If no drink recorded today, or interval has passed, show reminder
+        if (habit_state_.last_drink_time == 0 ||
+            (now_ms - habit_state_.last_drink_time) >= kDrinkReminderIntervalMs) {
+            if (!habit_state_.drink_reminder_shown) {
+                ESP_LOGI(TAG, "Drink reminder: time to drink water!");
+                ShowTemporaryEmotion("confused", 5000);
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                habit_state_.drink_reminder_shown = true;
             }
-            prev = cur;
-            has_prev = true;
         }
-        // Check yoga pose match periodically
-        self->ProcessImuForYoga();
-        vTaskDelay(pdMS_TO_TICKS(80));
     }
-}
 
-void InitializeI2c() {
-    i2c_config_t i2c_cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
-        .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
-        .sda_pullup_en = true,
-        .scl_pullup_en = true,
-        .master =
-            {
-                .clk_speed = 400000,
-            },
-        .clk_flags = 0,
-    };
-    shared_i2c_bus_handle_ = i2c_bus_create(I2C_NUM_0, &i2c_cfg);
-    if (!shared_i2c_bus_handle_) {
-        ESP_LOGE(TAG, "Failed to create shared I2C bus");
-        ESP_ERROR_CHECK(ESP_FAIL);
+    void MarkDrinkCompleted() {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        habit_state_.last_drink_time = now_ms;
+        habit_state_.drink_streak++;
+        habit_state_.drink_reminder_shown = false;
+        SaveHabitState();
+
+        ESP_LOGI(TAG, "Drink completed! Streak: %d", habit_state_.drink_streak);
+        ShowTemporaryEmotion("loving", 3000);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
     }
+
+    static void reminder_timer_callback(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+
+        // Check drink reminder
+        self->CheckDrinkReminder();
+
+        // Get current time
+        time_t now;
+        struct tm timeinfo;
+        time(&now);
+        localtime_r(&now, &timeinfo);
+
+        int current_hour = timeinfo.tm_hour;
+        int current_min = timeinfo.tm_min;
+
+        // Check reminder times: 8:00 wake up, 12:00 lunch, 14:00 nap, 18:00 dinner, 21:00 sleep
+        // Format: hour, minute, reminder message, emotion
+        struct Reminder {
+            int hour;
+            int minute;
+            const char* message;
+            const char* emotion;
+        };
+
+        static const Reminder reminders[] = {
+            {8, 0, "该起床了~", "happy"},     {12, 0, "该吃午饭了~", "happy"},
+            {14, 0, "该睡午觉了~", "sleepy"}, {18, 0, "该吃晚饭了~", "happy"},
+            {21, 0, "该睡觉了~", "sleepy"},
+        };
+
+        for (const auto& r : reminders) {
+            if (current_hour == r.hour && current_min == r.minute) {
+                ESP_LOGI(TAG, "Reminder: %s", r.message);
+                self->ShowTemporaryEmotion(r.emotion, 5000);
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                break;
+            }
+        }
+    }
+
+    void InitializeReminderTimer() {
+        esp_timer_create_args_t timer_args = {
+            .callback = &reminder_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "reminder",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&timer_args, &reminder_timer_);
+        // Check every minute (60 seconds = 60000000 us)
+        esp_timer_start_periodic(reminder_timer_, 60 * 1000000);
+        ESP_LOGI(TAG, "Reminder timer started");
+    }
+
+    void ShowTemporaryEmotion(const char* emotion, uint32_t duration_ms) {
+        if (display_ == nullptr || emotion == nullptr) {
+            return;
+        }
+        display_->SetEmotion(emotion);
+        if (emotion_reset_timer_ != nullptr) {
+            esp_timer_stop(emotion_reset_timer_);
+            esp_timer_start_once(emotion_reset_timer_,
+                                 static_cast<uint64_t>(duration_ms) * 1000ULL);
+        }
+    }
+
+    // Outer capacitive "pet" surface: feedback-only touch. A single recognized
+    // touch is routed as Gesture::Pet once per debounced interaction (cooldown
+    // in outer_touch_last_us_). Pet never changes mode, toggles chat, advances
+    // an emotion, or records a drink. (Waking the device is handled separately.)
+    void HandleOuterTouchPet() {
+        const int64_t now = esp_timer_get_time();
+        if ((now - outer_touch_last_us_) < kOuterTouchCooldownUs) {
+            return;
+        }
+        outer_touch_last_us_ = now;
+        OnGesture(Gesture::Pet);
+        ShowTemporaryEmotion("happy", 2000);
+    }
+
+    void PlayBatteryEmotion(const char* emotion, uint32_t duration_ms) {
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        if (display_ == nullptr || emotion == nullptr) {
+            return;
+        }
+        if (display_->InsertAnimDialog(emotion, duration_ms)) {
+            return;
+        }
+#endif
+        ShowTemporaryEmotion(emotion, duration_ms);
+    }
+
+    void StartLowBatteryAlertSequence() {
+        constexpr int kMaxPlays = 3;
+        constexpr int64_t kIntervalMs = 5 * 60 * 1000;
+
+        low_battery_plays_left_ = kMaxPlays - 1;
+        next_low_battery_play_ms_ = (esp_timer_get_time() / 1000) + kIntervalMs;
+        PlayBatteryEmotion("low_battery", 4000);
+    }
+
+    void HandleBatteryEmotions() {
+        if (charge_ == nullptr) {
+            return;
+        }
+
+        int level;
+        bool charging, discharging;
+        if (!charge_->GetSnapshot(level, charging, discharging))
+            return;
+        if (!battery_status_initialized_) {
+            was_charging_ = charging;
+            battery_status_initialized_ = true;
+        }
+
+        if (charging && !was_charging_) {
+            PlayBatteryEmotion("battery_connected", 4000);
+            low_battery_alert_mask_ = 0;
+            low_battery_plays_left_ = 0;
+            next_low_battery_play_ms_ = 0;
+        }
+        was_charging_ = charging;
+
+        if (charging) {
+            return;
+        }
+
+        if (level > 12) {
+            low_battery_alert_mask_ = 0;
+            low_battery_plays_left_ = 0;
+            next_low_battery_play_ms_ = 0;
+            return;
+        }
+
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (low_battery_plays_left_ > 0 && now_ms >= next_low_battery_play_ms_) {
+            PlayBatteryEmotion("low_battery", 4000);
+            low_battery_plays_left_--;
+            if (low_battery_plays_left_ > 0) {
+                next_low_battery_play_ms_ = now_ms + 5 * 60 * 1000;
+            }
+        }
+
+        if (level <= 5 && (low_battery_alert_mask_ & 0x02) == 0) {
+            low_battery_alert_mask_ |= 0x02;
+            StartLowBatteryAlertSequence();
+            return;
+        }
+
+        if (level <= 10 && (low_battery_alert_mask_ & 0x01) == 0) {
+            low_battery_alert_mask_ |= 0x01;
+            StartLowBatteryAlertSequence();
+        }
+    }
+
+    static void battery_task(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        while (true) {
+            bool healthy = false;
+            if (self != nullptr && self->charge_ != nullptr) {
+                healthy = self->charge_->Update();
+                if (healthy)
+                    self->HandleBatteryEmotions();
+            }
+            vTaskDelay(pdMS_TO_TICKS(healthy ? 2000 : 5000));
+        }
+    }
+
+    static void imu_event_task(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr || !self->bmi270_ready_) {
+            vTaskDelete(NULL);
+            return;
+        }
+
+        struct bmi2_sens_data prev = {};
+        struct bmi2_sens_data cur = {};
+        bool has_prev = false;
+        int64_t last_shake_ms = 0;
+        constexpr int kShakeDeltaThreshold = 20000;
+        constexpr int64_t kShakeCooldownMs = 2000;
+
+        while (true) {
+            if (Bmi270Motion::ReadAccelRaw(cur)) {
+                if (has_prev) {
+                    int dx = abs(static_cast<int>(cur.acc.x) - static_cast<int>(prev.acc.x));
+                    int dy = abs(static_cast<int>(cur.acc.y) - static_cast<int>(prev.acc.y));
+                    int dz = abs(static_cast<int>(cur.acc.z) - static_cast<int>(prev.acc.z));
+                    int shake_score = dx + dy + dz;
+
+                    int64_t now_ms = esp_timer_get_time() / 1000;
+                    if (shake_score > kShakeDeltaThreshold &&
+                        (now_ms - last_shake_ms) > kShakeCooldownMs) {
+                        last_shake_ms = now_ms;
+                        // "dizzy/nauseated" are not guaranteed in current assets, use supported
+                        // fallback.
+                        self->ShowTemporaryEmotion("confused", 1800);
+                    }
+                }
+                prev = cur;
+                has_prev = true;
+            }
+            // Check yoga pose match periodically
+            self->ProcessImuForYoga();
+            vTaskDelay(pdMS_TO_TICKS(80));
+        }
+    }
+
+    void InitializeI2c() {
+        i2c_config_t i2c_cfg = {
+            .mode = I2C_MODE_MASTER,
+            .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
+            .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
+            .sda_pullup_en = true,
+            .scl_pullup_en = true,
+            .master =
+                {
+                    .clk_speed = 400000,
+                },
+            .clk_flags = 0,
+        };
+        shared_i2c_bus_handle_ = i2c_bus_create(I2C_NUM_0, &i2c_cfg);
+        if (!shared_i2c_bus_handle_) {
+            ESP_LOGE(TAG, "Failed to create shared I2C bus");
+            ESP_ERROR_CHECK(ESP_FAIL);
+        }
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0) && !CONFIG_I2C_BUS_BACKWARD_CONFIG
-    i2c_bus_ = i2c_bus_get_internal_bus_handle(shared_i2c_bus_handle_);
+        i2c_bus_ = i2c_bus_get_internal_bus_handle(shared_i2c_bus_handle_);
 #else
 #error "ESP-VoCat board requires i2c_bus_get_internal_bus_handle() support"
 #endif
-    if (!i2c_bus_) {
-        ESP_LOGE(TAG, "Failed to get I2C master handle");
-        ESP_ERROR_CHECK(ESP_FAIL);
-    }
-
-    temperature_sensor_config_t temp_sensor_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
-    ESP_ERROR_CHECK(temperature_sensor_install(&temp_sensor_config, &temp_sensor));
-    ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
-}
-// Switch the board-level pin variables from their V1.0 defaults to the
-// V1.2 layout. Must run on every boot that resolves to V1.2, including
-// the cached path: these globals start at the _1 values and GetAudioCodec()
-// reads them long after this function has returned.
-static void ApplyV12Pins() {
-    AUDIO_I2S_GPIO_DIN = AUDIO_I2S_GPIO_DIN_2;
-    AUDIO_CODEC_PA_PIN = AUDIO_CODEC_PA_PIN_2;
-    QSPI_PIN_NUM_LCD_RST = QSPI_PIN_NUM_LCD_RST_2;
-    TOUCH_PAD2 = TOUCH_PAD2_2;
-    UART1_TX = UART1_TX_2;
-    UART1_RX = UART1_RX_2;
-}
-
-uint8_t DetectPcbVersion() {
-    // Pre-set the output latch before switching the pin to output mode:
-    // after an external reset the latch defaults to 0, and driving 0 on
-    // GPIO48 for even a moment cuts the codec rail on V1.2, after which
-    // the first touch/fuel-gauge read aborts and the device reboots. On a
-    // power-on reset we deliberately start at 0 so the probe below sees an
-    // unpowered (and therefore silent) V1.2 codec.
-    const esp_reset_reason_t reset_reason = esp_reset_reason();
-    gpio_set_level(CORDEC_POWER_CTRL, reset_reason != ESP_RST_POWERON ? 1 : 0);
-    gpio_config_t gpio_conf = {.pin_bit_mask = (1ULL << CORDEC_POWER_CTRL),
-                               .mode = GPIO_MODE_OUTPUT,
-                               .pull_up_en = GPIO_PULLUP_DISABLE,
-                               .pull_down_en = GPIO_PULLDOWN_DISABLE,
-                               .intr_type = GPIO_INTR_DISABLE};
-    ESP_ERROR_CHECK(gpio_config(&gpio_conf));
-
-    // After any reset other than a real power cycle the codec rail on
-    // V1.2 keeps residual charge, so the "GPIO48 low" probe below sees a
-    // false ACK from ES8311 and the board is misdetected as V1.0. GPIO48
-    // then stays low, the codec loses power and mic/speaker die while the
-    // screen keeps working; the unpowered chips also clamp the shared I2C
-    // bus and the first fuel-gauge/touch read aborts, causing a reboot
-    // loop (issue #1202). Only probe on a power-on reset; every other
-    // reset reuses the cached result, and the GPIO output latch (kept
-    // across soft resets) keeps the codec powered in the meantime.
-    if (reset_reason != ESP_RST_POWERON && s_pcb_version_magic == kPcbVersionMagic &&
-        s_pcb_version_cached <= 1) {
-        if (s_pcb_version_cached == 1) {
-            // V1.2: the codec rail is powered from GPIO48; make sure it stays
-            // on and wait for the touch controller to answer, since reads
-            // against a still-powering-up chip abort the whole system.
-            ESP_ERROR_CHECK(gpio_set_level(CORDEC_POWER_CTRL, 1));
-            for (int i = 0; i < 10; i++) {
-                if (i2c_master_probe(i2c_bus_, 0x15, 50) == ESP_OK) {
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
-            ApplyV12Pins();
+        if (!i2c_bus_) {
+            ESP_LOGE(TAG, "Failed to get I2C master handle");
+            ESP_ERROR_CHECK(ESP_FAIL);
         }
-        ESP_LOGI(TAG, "PCB version %s (cached, reset reason %d)",
-                 s_pcb_version_cached ? "V1.2" : "V1.0", static_cast<int>(reset_reason));
-        return s_pcb_version_cached;
+
+        temperature_sensor_config_t temp_sensor_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
+        ESP_ERROR_CHECK(temperature_sensor_install(&temp_sensor_config, &temp_sensor));
+        ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
+    }
+    // Switch the board-level pin variables from their V1.0 defaults to the
+    // V1.2 layout. Must run on every boot that resolves to V1.2, including
+    // the cached path: these globals start at the _1 values and GetAudioCodec()
+    // reads them long after this function has returned.
+    static void ApplyV12Pins() {
+        AUDIO_I2S_GPIO_DIN = AUDIO_I2S_GPIO_DIN_2;
+        AUDIO_CODEC_PA_PIN = AUDIO_CODEC_PA_PIN_2;
+        QSPI_PIN_NUM_LCD_RST = QSPI_PIN_NUM_LCD_RST_2;
+        TOUCH_PAD2 = TOUCH_PAD2_2;
+        UART1_TX = UART1_TX_2;
+        UART1_RX = UART1_RX_2;
     }
 
-    ESP_ERROR_CHECK(gpio_set_level(CORDEC_POWER_CTRL, 0));
-    vTaskDelay(pdMS_TO_TICKS(100));
+    uint8_t DetectPcbVersion() {
+        // Pre-set the output latch before switching the pin to output mode:
+        // after an external reset the latch defaults to 0, and driving 0 on
+        // GPIO48 for even a moment cuts the codec rail on V1.2, after which
+        // the first touch/fuel-gauge read aborts and the device reboots. On a
+        // power-on reset we deliberately start at 0 so the probe below sees an
+        // unpowered (and therefore silent) V1.2 codec.
+        const esp_reset_reason_t reset_reason = esp_reset_reason();
+        gpio_set_level(CORDEC_POWER_CTRL, reset_reason != ESP_RST_POWERON ? 1 : 0);
+        gpio_config_t gpio_conf = {.pin_bit_mask = (1ULL << CORDEC_POWER_CTRL),
+                                   .mode = GPIO_MODE_OUTPUT,
+                                   .pull_up_en = GPIO_PULLUP_DISABLE,
+                                   .pull_down_en = GPIO_PULLDOWN_DISABLE,
+                                   .intr_type = GPIO_INTR_DISABLE};
+        ESP_ERROR_CHECK(gpio_config(&gpio_conf));
 
-    bool codec_alive = (i2c_master_probe(i2c_bus_, 0x18, 100) == ESP_OK);
-    uint8_t pcb_version = 0;
-    if (codec_alive) {
-        // Codec answers while GPIO48 is low: its supply is not gated by
-        // GPIO48, so this is a V1.0 board.
-        ESP_LOGI(TAG, "PCB version V1.0");
-    } else {
-        ESP_ERROR_CHECK(gpio_set_level(CORDEC_POWER_CTRL, 1));
-        // V1.2: wait for the SY8088 rail and the ES8311 to come up. The
-        // previous 50 ms delay was too short right after a cold boot and
-        // made the probe fail, falling back to the wrong V1.0 pins.
-        for (int i = 0; i < 10 && !codec_alive; i++) {
-            vTaskDelay(pdMS_TO_TICKS(200));
-            codec_alive = (i2c_master_probe(i2c_bus_, 0x18, 100) == ESP_OK);
-        }
-        if (codec_alive) {
-            ESP_LOGI(TAG, "PCB version V1.2");
-            pcb_version = 1;
-            ApplyV12Pins();
-        } else {
-            // Both probes failed: leave GPIO48 high as a safe fallback. On
-            // V1.0 the pin is unused; on V1.2 it keeps the codec powered so
-            // an unpowered codec cannot clamp the shared I2C bus through
-            // its ESD diodes and crash the system. Nothing is cached in
-            // this branch, so the next boot probes again.
-            ESP_LOGE(TAG, "PCB version detection error");
-            return 0;
-        }
-    }
-    s_pcb_version_magic = kPcbVersionMagic;
-    s_pcb_version_cached = pcb_version;
-    return pcb_version;
-}
-
-static void touch_isr_callback(void* arg) {
-    Cst816s* touchpad = static_cast<Cst816s*>(arg);
-    if (touchpad != nullptr) {
-        touchpad->NotifyTouchEvent();
-    }
-}
-
-static void touch_event_task(void* arg) {
-    Cst816s* touchpad = static_cast<Cst816s*>(arg);
-    if (touchpad == nullptr) {
-        ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    while (true) {
-        if (touchpad->WaitForTouchEvent()) {
-            auto& app = Application::GetInstance();
-            auto& board = (EspVocat&)Board::GetInstance();
-
-            ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
-            if (!touchpad->UpdateTouchPoint())
-                continue;
-            auto touch_event = touchpad->CheckTouchEvent();
-            auto& touch_point = touchpad->GetTouchPoint();
-
-            if (touch_event == Cst816s::TOUCH_PRESS) {
-                // Record press timestamp and start position for later recognition
-                board.touch_press_time_ms_ = esp_timer_get_time() / 1000;
-                board.swipe_start_x_ = touch_point.x;
-                board.swipe_start_y_ = touch_point.y;
-                board.swipe_start_recorded_ = true;
-            }
-
-            if (touch_event == Cst816s::TOUCH_RELEASE) {
-                // Startup special case: first touch release enters WiFi config.
-                if (app.GetDeviceState() == kDeviceStateStarting) {
-                    board.swipe_start_recorded_ = false;
-                    board.EnterWifiConfigMode();
-                    continue;
-                }
-
-                // Normalize the release into a single screen gesture and route it.
-                Gesture gesture = Gesture::Tap;
-                if (board.swipe_start_recorded_) {
-                    int64_t now_ms = esp_timer_get_time() / 1000;
-                    int64_t duration_ms = now_ms - board.touch_press_time_ms_;
-                    int delta_x = touch_point.x - board.swipe_start_x_;
-                    int delta_y = touch_point.y - board.swipe_start_y_;
-                    ESP_LOGI(TAG,
-                             "Touch release: start(%d,%d) end(%d,%d) delta(%d,%d) dur=%" PRId64
-                             " ms",
-                             board.swipe_start_x_, board.swipe_start_y_, touch_point.x,
-                             touch_point.y, delta_x, delta_y, duration_ms);
-
-                    if (duration_ms >= kLongPressThresholdMs) {
-                        gesture = Gesture::LongPress;
-                    } else if (abs(delta_x) >= kSwipeThreshold && abs(delta_x) > abs(delta_y)) {
-                        gesture = (delta_x > 0) ? Gesture::SwipeRight : Gesture::SwipeLeft;
-                    } else if (abs(delta_y) >= kSwipeThreshold && abs(delta_y) > abs(delta_x)) {
-                        gesture = (delta_y > 0) ? Gesture::SwipeDown : Gesture::SwipeUp;
-                    } else {
-                        gesture = Gesture::Tap;
+        // After any reset other than a real power cycle the codec rail on
+        // V1.2 keeps residual charge, so the "GPIO48 low" probe below sees a
+        // false ACK from ES8311 and the board is misdetected as V1.0. GPIO48
+        // then stays low, the codec loses power and mic/speaker die while the
+        // screen keeps working; the unpowered chips also clamp the shared I2C
+        // bus and the first fuel-gauge/touch read aborts, causing a reboot
+        // loop (issue #1202). Only probe on a power-on reset; every other
+        // reset reuses the cached result, and the GPIO output latch (kept
+        // across soft resets) keeps the codec powered in the meantime.
+        if (reset_reason != ESP_RST_POWERON && s_pcb_version_magic == kPcbVersionMagic &&
+            s_pcb_version_cached <= 1) {
+            if (s_pcb_version_cached == 1) {
+                // V1.2: the codec rail is powered from GPIO48; make sure it stays
+                // on and wait for the touch controller to answer, since reads
+                // against a still-powering-up chip abort the whole system.
+                ESP_ERROR_CHECK(gpio_set_level(CORDEC_POWER_CTRL, 1));
+                for (int i = 0; i < 10; i++) {
+                    if (i2c_master_probe(i2c_bus_, 0x15, 50) == ESP_OK) {
+                        break;
                     }
-                    board.swipe_start_recorded_ = false;
+                    vTaskDelay(pdMS_TO_TICKS(200));
                 }
-                board.OnGesture(gesture);
+                ApplyV12Pins();
+            }
+            ESP_LOGI(TAG, "PCB version %s (cached, reset reason %d)",
+                     s_pcb_version_cached ? "V1.2" : "V1.0", static_cast<int>(reset_reason));
+            return s_pcb_version_cached;
+        }
+
+        ESP_ERROR_CHECK(gpio_set_level(CORDEC_POWER_CTRL, 0));
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        bool codec_alive = (i2c_master_probe(i2c_bus_, 0x18, 100) == ESP_OK);
+        uint8_t pcb_version = 0;
+        if (codec_alive) {
+            // Codec answers while GPIO48 is low: its supply is not gated by
+            // GPIO48, so this is a V1.0 board.
+            ESP_LOGI(TAG, "PCB version V1.0");
+        } else {
+            ESP_ERROR_CHECK(gpio_set_level(CORDEC_POWER_CTRL, 1));
+            // V1.2: wait for the SY8088 rail and the ES8311 to come up. The
+            // previous 50 ms delay was too short right after a cold boot and
+            // made the probe fail, falling back to the wrong V1.0 pins.
+            for (int i = 0; i < 10 && !codec_alive; i++) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                codec_alive = (i2c_master_probe(i2c_bus_, 0x18, 100) == ESP_OK);
+            }
+            if (codec_alive) {
+                ESP_LOGI(TAG, "PCB version V1.2");
+                pcb_version = 1;
+                ApplyV12Pins();
+            } else {
+                // Both probes failed: leave GPIO48 high as a safe fallback. On
+                // V1.0 the pin is unused; on V1.2 it keeps the codec powered so
+                // an unpowered codec cannot clamp the shared I2C bus through
+                // its ESD diodes and crash the system. Nothing is cached in
+                // this branch, so the next boot probes again.
+                ESP_LOGE(TAG, "PCB version detection error");
+                return 0;
+            }
+        }
+        s_pcb_version_magic = kPcbVersionMagic;
+        s_pcb_version_cached = pcb_version;
+        return pcb_version;
+    }
+
+    static void touch_isr_callback(void* arg) {
+        Cst816s* touchpad = static_cast<Cst816s*>(arg);
+        if (touchpad != nullptr) {
+            touchpad->NotifyTouchEvent();
+        }
+    }
+
+    static void touch_event_task(void* arg) {
+        Cst816s* touchpad = static_cast<Cst816s*>(arg);
+        if (touchpad == nullptr) {
+            ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
+            vTaskDelete(NULL);
+            return;
+        }
+
+        while (true) {
+            if (touchpad->WaitForTouchEvent()) {
+                auto& app = Application::GetInstance();
+                auto& board = (EspVocat&)Board::GetInstance();
+
+                ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
+                if (!touchpad->UpdateTouchPoint())
+                    continue;
+                auto touch_event = touchpad->CheckTouchEvent();
+                auto& touch_point = touchpad->GetTouchPoint();
+
+                if (touch_event == Cst816s::TOUCH_PRESS) {
+                    // Record press timestamp and start position for later recognition
+                    board.touch_press_time_ms_ = esp_timer_get_time() / 1000;
+                    board.swipe_start_x_ = touch_point.x;
+                    board.swipe_start_y_ = touch_point.y;
+                    board.swipe_start_recorded_ = true;
+                }
+
+                if (touch_event == Cst816s::TOUCH_RELEASE) {
+                    // Startup special case: first touch release enters WiFi config.
+                    if (app.GetDeviceState() == kDeviceStateStarting) {
+                        board.swipe_start_recorded_ = false;
+                        board.EnterWifiConfigMode();
+                        continue;
+                    }
+
+                    // Normalize the release into a single screen gesture and route it.
+                    Gesture gesture = Gesture::Tap;
+                    if (board.swipe_start_recorded_) {
+                        int64_t now_ms = esp_timer_get_time() / 1000;
+                        int64_t duration_ms = now_ms - board.touch_press_time_ms_;
+                        int delta_x = touch_point.x - board.swipe_start_x_;
+                        int delta_y = touch_point.y - board.swipe_start_y_;
+                        ESP_LOGI(TAG,
+                                 "Touch release: start(%d,%d) end(%d,%d) delta(%d,%d) dur=%" PRId64
+                                 " ms",
+                                 board.swipe_start_x_, board.swipe_start_y_, touch_point.x,
+                                 touch_point.y, delta_x, delta_y, duration_ms);
+
+                        if (duration_ms >= kLongPressThresholdMs) {
+                            gesture = Gesture::LongPress;
+                        } else if (abs(delta_x) >= kSwipeThreshold && abs(delta_x) > abs(delta_y)) {
+                            gesture = (delta_x > 0) ? Gesture::SwipeRight : Gesture::SwipeLeft;
+                        } else if (abs(delta_y) >= kSwipeThreshold && abs(delta_y) > abs(delta_x)) {
+                            gesture = (delta_y > 0) ? Gesture::SwipeDown : Gesture::SwipeUp;
+                        } else {
+                            gesture = Gesture::Tap;
+                        }
+                        board.swipe_start_recorded_ = false;
+                    }
+                    board.OnGesture(gesture);
+                }
             }
         }
     }
-}
 
-void InitializeCharge() {
-    charge_ = new Charge(i2c_bus_, 0x55);
-    xTaskCreatePinnedToCore(battery_task, "batteryTask", 3 * 1024, this, 6, &charge_task_handle_,
-                            0);
-}
-
-void InitializeCst816sTouchPad() {
-    cst816s_ = new Cst816s(i2c_bus_, 0x15);
-
-    xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5,
-                            &touch_task_handle_, 1);
-
-    const gpio_config_t int_gpio_config = {.pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
-                                           .mode = GPIO_MODE_INPUT,
-                                           // .intr_type = GPIO_INTR_NEGEDGE
-                                           .intr_type = GPIO_INTR_ANYEDGE};
-    gpio_config(&int_gpio_config);
-    gpio_install_isr_service(0);
-    gpio_intr_enable(TP_PIN_NUM_INT);
-    gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
-}
-
-void InitializeBmi270() {
-    esp_err_t imu_ret = Bmi270Motion::Initialize(shared_i2c_bus_handle_);
-    if (imu_ret == ESP_OK) {
-        bmi270_ready_ = true;
-        xTaskCreatePinnedToCore(imu_event_task, "imu_task", 4 * 1024, this, 4, &imu_task_handle_,
-                                1);
-    } else {
-        ESP_LOGW(TAG, "BMI270 unavailable, shake emotion disabled");
+    void InitializeCharge() {
+        charge_ = new Charge(i2c_bus_, 0x55);
+        xTaskCreatePinnedToCore(battery_task, "batteryTask", 3 * 1024, this, 6,
+                                &charge_task_handle_, 0);
     }
-}
+
+    void InitializeCst816sTouchPad() {
+        cst816s_ = new Cst816s(i2c_bus_, 0x15);
+
+        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5,
+                                &touch_task_handle_, 1);
+
+        const gpio_config_t int_gpio_config = {.pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
+                                               .mode = GPIO_MODE_INPUT,
+                                               // .intr_type = GPIO_INTR_NEGEDGE
+                                               .intr_type = GPIO_INTR_ANYEDGE};
+        gpio_config(&int_gpio_config);
+        gpio_install_isr_service(0);
+        gpio_intr_enable(TP_PIN_NUM_INT);
+        gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
+    }
+
+    void InitializeBmi270() {
+        esp_err_t imu_ret = Bmi270Motion::Initialize(shared_i2c_bus_handle_);
+        if (imu_ret == ESP_OK) {
+            bmi270_ready_ = true;
+            xTaskCreatePinnedToCore(imu_event_task, "imu_task", 4 * 1024, this, 4,
+                                    &imu_task_handle_, 1);
+        } else {
+            ESP_LOGW(TAG, "BMI270 unavailable, shake emotion disabled");
+        }
+    }
 
 #if ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR
-static uint32_t TouchChannelFromPadGpio(gpio_num_t gpio) {
-    if (gpio == GPIO_NUM_NC) {
+    static uint32_t TouchChannelFromPadGpio(gpio_num_t gpio) {
+        if (gpio == GPIO_NUM_NC) {
+            return 0;
+        }
+        if (gpio >= GPIO_NUM_1 && gpio <= GPIO_NUM_14) {
+            return static_cast<uint32_t>(gpio);
+        }
         return 0;
     }
-    if (gpio >= GPIO_NUM_1 && gpio <= GPIO_NUM_14) {
-        return static_cast<uint32_t>(gpio);
+
+    static void touch_slider_event_callback(touch_slider_handle_t handle,
+                                            touch_slider_event_t event, int32_t data,
+                                            void* cb_arg) {
+        (void)handle;
+        auto* self = static_cast<EspVocat*>(cb_arg);
+        if (self == nullptr || self->display_ == nullptr) {
+            return;
+        }
+        if (event != TOUCH_SLIDER_EVENT_POSITION) {
+            ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
+        }
+
+        bool gesture = false;
+        if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
+            gesture = true;
+        } else if (event == TOUCH_SLIDER_EVENT_RELEASE) {
+            gesture = true;
+        }
+
+        if (!gesture) {
+            return;
+        }
+
+        // The outer capacitive surface is a feedback-only "pet" input.
+        self->HandleOuterTouchPet();
     }
-    return 0;
-}
 
-static void touch_slider_event_callback(touch_slider_handle_t handle, touch_slider_event_t event,
-                                        int32_t data, void* cb_arg) {
-    (void)handle;
-    auto* self = static_cast<EspVocat*>(cb_arg);
-    if (self == nullptr || self->display_ == nullptr) {
-        return;
-    }
-    if (event != TOUCH_SLIDER_EVENT_POSITION) {
-        ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
-    }
-
-    bool gesture = false;
-    if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
-        gesture = true;
-    } else if (event == TOUCH_SLIDER_EVENT_RELEASE) {
-        gesture = true;
+    void EnterEmotionLearningMode() {
+        if (mode_ == Mode::EmotionLearning) {
+            return;
+        }
+        EnterMode(Mode::EmotionLearning);
+        current_emotion_index_ = 0;
+        ShowEmotionLearningCurrent();
+        // Play sound to indicate entering learning mode
+        auto& audio = Application::GetInstance().GetAudioService();
+        audio.PlaySound(Lang::Sounds::OGG_POPUP);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        audio.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        ESP_LOGI(TAG, "Entered emotion learning mode");
     }
 
-    if (!gesture) {
-        return;
-    }
-
-    self->ShowHappyTouchFeedback();
-}
-
-void ShowSingleTapFeedback() {
-    ShowTemporaryEmotion("happy", 2000);
-    Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-}
-
-void ShowDoubleTapFeedback() {
-    ShowTemporaryEmotion("shocked", 2500);
-    auto& audio = Application::GetInstance().GetAudioService();
-    audio.PlaySound(Lang::Sounds::OGG_POPUP);
-    vTaskDelay(pdMS_TO_TICKS(150));
-    audio.PlaySound(Lang::Sounds::OGG_POPUP);
-}
-
-void ShowLongPressFeedback() {
-    // Toggle mute mode on long press
-    static bool is_muted = false;
-    is_muted = !is_muted;
-    if (is_muted) {
-        ShowTemporaryEmotion("angry", 2000);
-    } else {
+    void ExitEmotionLearningMode() {
+        if (mode_ != Mode::EmotionLearning) {
+            return;
+        }
+        ExitToChat();
         ShowTemporaryEmotion("happy", 2000);
-    }
-    Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_VIBRATION);
-    ESP_LOGI(TAG, "Long press: device %s", is_muted ? "MUTED" : "UNMUTED");
-}
-
-void EnterEmotionLearningMode() {
-    if (mode_ == Mode::EmotionLearning) {
-        return;
-    }
-    EnterMode(Mode::EmotionLearning);
-    current_emotion_index_ = 0;
-    ShowEmotionLearningCurrent();
-    // Play sound to indicate entering learning mode
-    auto& audio = Application::GetInstance().GetAudioService();
-    audio.PlaySound(Lang::Sounds::OGG_POPUP);
-    vTaskDelay(pdMS_TO_TICKS(150));
-    audio.PlaySound(Lang::Sounds::OGG_SUCCESS);
-    ESP_LOGI(TAG, "Entered emotion learning mode");
-}
-
-void ExitEmotionLearningMode() {
-    if (mode_ != Mode::EmotionLearning) {
-        return;
-    }
-    ExitToChat();
-    ShowTemporaryEmotion("happy", 2000);
-    Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-    ESP_LOGI(TAG, "Exited emotion learning mode");
-}
-
-void ShowEmotionLearningCurrent() {
-    if (display_ != nullptr) {
-        const char* emotion = kEmotionLearningEmotions_[current_emotion_index_];
-        display_->SetEmotion(emotion);
-        ESP_LOGI(TAG, "Emotion: %s (%s)", emotion, kEmotionLearningNames_[current_emotion_index_]);
-    }
-}
-
-void ShowEmotionLearningNext() {
-    current_emotion_index_ = (current_emotion_index_ + 1) % kEmotionLearningCount;
-    ShowEmotionLearningCurrent();
-}
-
-void EnterYogaChallengeMode() {
-    if (mode_ == Mode::Yoga) {
-        return;
-    }
-    EnterMode(Mode::Yoga);
-    current_pose_index_ = 0;
-    ShowYogaPose();
-    Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-    ESP_LOGI(TAG, "Entered yoga challenge mode");
-}
-
-void ExitYogaChallengeMode() {
-    if (mode_ != Mode::Yoga) {
-        return;
-    }
-    ExitToChat();
-    ShowTemporaryEmotion("happy", 2000);
-    ESP_LOGI(TAG, "Exited yoga challenge mode");
-}
-
-void ShowYogaPose() {
-    if (display_ != nullptr) {
-        const char* direction = kYogaPoseDirections_[current_pose_index_];
-        // Use DrawArrow to directly draw arrow on LCD panel
-        static_cast<emote::EmoteDisplay*>(display_)->DrawArrow(direction);
-        ESP_LOGI(TAG, "Yoga pose: %s (%s)", kYogaPoseNames_[current_pose_index_], direction);
-    }
-}
-
-void CheckYogaPoseMatch(const char* motion_direction) {
-    if (mode_ != Mode::Yoga) {
-        return;
-    }
-    const char* target = kYogaPoseDirections_[current_pose_index_];
-    if (strcmp(motion_direction, target) == 0) {
-        ESP_LOGI(TAG, "Correct! Moving to next pose");
-        ShowTemporaryEmotion("happy", 1000);
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-        current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
-        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI(TAG, "Exited emotion learning mode");
+    }
+
+    void ShowEmotionLearningCurrent() {
+        if (display_ != nullptr) {
+            const char* emotion = kEmotionLearningEmotions_[current_emotion_index_];
+            display_->SetEmotion(emotion);
+            ESP_LOGI(TAG, "Emotion: %s (%s)", emotion,
+                     kEmotionLearningNames_[current_emotion_index_]);
+        }
+    }
+
+    void ShowEmotionLearningNext() {
+        current_emotion_index_ = (current_emotion_index_ + 1) % kEmotionLearningCount;
+        ShowEmotionLearningCurrent();
+    }
+
+    void EnterYogaChallengeMode() {
+        if (mode_ == Mode::Yoga) {
+            return;
+        }
+        EnterMode(Mode::Yoga);
+        current_pose_index_ = 0;
         ShowYogaPose();
-    }
-}
-
-void ProcessImuForYoga() {
-    if (mode_ != Mode::Yoga || !bmi270_ready_) {
-        return;
-    }
-    static int64_t last_check_ms = 0;
-    constexpr int64_t kCooldownMs = 500;  // Only check every 500ms
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    if (now_ms - last_check_ms < kCooldownMs) {
-        return;
-    }
-    last_check_ms = now_ms;
-
-    // Read accelerometer data
-    struct bmi2_sens_data data = {};
-    if (Bmi270Motion::ReadAccelRaw(data)) {
-        // Determine tilt direction
-        int acc_x = data.acc.x;
-        int acc_y = data.acc.y;
-        const char* direction = nullptr;
-        // Check dominant tilt
-        if (abs(acc_x) > abs(acc_y)) {
-            if (acc_x > 5000) {
-                direction = "right";
-            } else if (acc_x < -5000) {
-                direction = "left";
-            }
-        } else {
-            if (acc_y > 5000) {
-                direction = "down";
-            } else if (acc_y < -5000) {
-                direction = "up";
-            }
-        }
-        if (direction != nullptr) {
-            CheckYogaPoseMatch(direction);
-        }
-    }
-}
-
-static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel,
-                                        touch_state_t state, void* cb_arg) {
-    (void)handle;
-    auto* self = static_cast<EspVocat*>(cb_arg);
-    if (self == nullptr || self->display_ == nullptr) {
-        return;
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+        ESP_LOGI(TAG, "Entered yoga challenge mode");
     }
 
-    int64_t now = esp_timer_get_time() / 1000;
-
-    if (state == TOUCH_STATE_ACTIVE) {
-        self->touch_press_time_ = now;
-        self->touch_is_pressed_ = true;
-
-        // Track tap count for triple-tap detection
-        if (self->tap_count_ == 0) {
-            self->tap_first_time_ = now;
-        }
-        self->tap_count_++;
-
-        ESP_LOGD(TAG, "Touch PRESS ch=%" PRIu32 " (tap %d)", channel, self->tap_count_);
-    } else if (state == TOUCH_STATE_INACTIVE) {
-        // Detect release by state change from ACTIVE to INACTIVE
-        if (!self->touch_is_pressed_) {
+    void ExitYogaChallengeMode() {
+        if (mode_ != Mode::Yoga) {
             return;
         }
-        self->touch_is_pressed_ = false;
-        int64_t press_duration = now - self->touch_press_time_;
+        ExitToChat();
+        ShowTemporaryEmotion("happy", 2000);
+        ESP_LOGI(TAG, "Exited yoga challenge mode");
+    }
 
-        // Long press detection (release after holding > threshold)
-        if (press_duration >= kLongPressThresholdMs) {
-            ESP_LOGI(TAG, "Gesture: LONG PRESS (%" PRId64 " ms)", press_duration);
-            if (self->mode_ == Mode::EmotionLearning) {
-                self->ExitEmotionLearningMode();
-            } else {
-                // Mark drink completed and toggle mute
-                self->MarkDrinkCompleted();
-                self->ShowLongPressFeedback();
-            }
+    void ShowYogaPose() {
+        if (display_ != nullptr) {
+            const char* direction = kYogaPoseDirections_[current_pose_index_];
+            // Use DrawArrow to directly draw arrow on LCD panel
+            static_cast<emote::EmoteDisplay*>(display_)->DrawArrow(direction);
+            ESP_LOGI(TAG, "Yoga pose: %s (%s)", kYogaPoseNames_[current_pose_index_], direction);
         }
-        // Single tap - check triple-tap timeout first
-        else {
-            int64_t time_since_first_tap = now - self->tap_first_time_;
-            if (time_since_first_tap > kDoubleTapThresholdMs + 200) {
-                // Timeout exceeded, reset and treat as single tap
-                ESP_LOGI(TAG, "Gesture: SINGLE TAP (timeout reset)");
-                if (self->mode_ == Mode::EmotionLearning) {
-                    self->ShowEmotionLearningNext();
-                } else {
-                    self->ShowSingleTapFeedback();
+    }
+
+    void CheckYogaPoseMatch(const char* motion_direction) {
+        if (mode_ != Mode::Yoga) {
+            return;
+        }
+        const char* target = kYogaPoseDirections_[current_pose_index_];
+        if (strcmp(motion_direction, target) == 0) {
+            ESP_LOGI(TAG, "Correct! Moving to next pose");
+            ShowTemporaryEmotion("happy", 1000);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+            current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            ShowYogaPose();
+        }
+    }
+
+    void ProcessImuForYoga() {
+        if (mode_ != Mode::Yoga || !bmi270_ready_) {
+            return;
+        }
+        static int64_t last_check_ms = 0;
+        constexpr int64_t kCooldownMs = 500;  // Only check every 500ms
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_check_ms < kCooldownMs) {
+            return;
+        }
+        last_check_ms = now_ms;
+
+        // Read accelerometer data
+        struct bmi2_sens_data data = {};
+        if (Bmi270Motion::ReadAccelRaw(data)) {
+            // Determine tilt direction
+            int acc_x = data.acc.x;
+            int acc_y = data.acc.y;
+            const char* direction = nullptr;
+            // Check dominant tilt
+            if (abs(acc_x) > abs(acc_y)) {
+                if (acc_x > 5000) {
+                    direction = "right";
+                } else if (acc_x < -5000) {
+                    direction = "left";
                 }
-                self->tap_count_ = 0;
-            } else if (self->mode_ == Mode::EmotionLearning) {
-                // In emotion learning mode, single tap immediately advances
-                ESP_LOGI(TAG, "Gesture: SINGLE TAP (emotion learning)");
-                self->ShowEmotionLearningNext();
-                self->tap_count_ = 0;
-            }
-            // else: wait for more taps (potential double/triple tap)
-        }
-
-        self->touch_last_release_time_ = now;
-    }
-
-    // Check for triple tap after each release
-    if (self->tap_count_ >= 3) {
-        int64_t time_since_first = now - self->tap_first_time_;
-        if (time_since_first <= kDoubleTapThresholdMs + 200) {
-            ESP_LOGI(TAG, "Gesture: TRIPLE TAP");
-            if (self->mode_ == Mode::EmotionLearning) {
-                // Already in mode, do nothing or restart
-                self->current_emotion_index_ = 0;
-                self->ShowEmotionLearningCurrent();
             } else {
-                self->EnterEmotionLearningMode();
+                if (acc_y > 5000) {
+                    direction = "down";
+                } else if (acc_y < -5000) {
+                    direction = "up";
+                }
             }
-            self->tap_count_ = 0;
-        }
-    }
-}
-
-static void touch_cap_poll_task(void* arg) {
-    auto* self = static_cast<EspVocat*>(arg);
-    while (true) {
-        if (self != nullptr) {
-            if (self->touch_slider_handle_ != nullptr) {
-                touch_slider_sensor_handle_events(self->touch_slider_handle_);
-            } else if (self->touch_button_handle_ != nullptr) {
-                touch_button_sensor_handle_events(self->touch_button_handle_);
+            if (direction != nullptr) {
+                CheckYogaPoseMatch(direction);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
-
-void InitializeCapacitiveTouchPads() {
-    if (TOUCH_PAD1 == GPIO_NUM_NC) {
-        ESP_LOGW(TAG, "Capacitive touch disabled: TOUCH_PAD1 NC");
-        return;
     }
 
-    const uint32_t ch1 = TouchChannelFromPadGpio(TOUCH_PAD1);
-    if (ch1 == 0) {
-        ESP_LOGW(TAG, "TOUCH_PAD1 GPIO %d is not a touch channel (expect GPIO1..GPIO14)",
-                 (int)TOUCH_PAD1);
-        return;
-    }
-
-    if (TOUCH_PAD2 != GPIO_NUM_NC) {
-        const uint32_t ch2 = TouchChannelFromPadGpio(TOUCH_PAD2);
-        if (ch2 == 0) {
-            ESP_LOGW(TAG, "TOUCH_PAD2 GPIO %d is not a touch channel", (int)TOUCH_PAD2);
+    static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel,
+                                            touch_state_t state, void* cb_arg) {
+        (void)handle;
+        (void)channel;
+        auto* self = static_cast<EspVocat*>(cb_arg);
+        if (self == nullptr || self->display_ == nullptr) {
             return;
         }
 
-        static uint32_t slider_ch[2];
-        static float slider_thr[2];
-        slider_ch[0] = ch1;
-        slider_ch[1] = ch2;
-        slider_thr[0] = 0.004f;
-        slider_thr[1] = 0.006f;
+        // Single-pad (PCB v1.0) outer capacitive surface: a touch is recognized
+        // once per debounced interaction, on release. It is feedback-only (Pet)
+        // and never changes mode, toggles chat, advances an emotion, or records
+        // a drink.
+        if (state == TOUCH_STATE_INACTIVE) {
+            self->HandleOuterTouchPet();
+        }
+    }
 
-        touch_slider_config_t sld_cfg = {
-            .channel_num = 2,
-            .channel_list = slider_ch,
-            .channel_threshold = slider_thr,
+    static void touch_cap_poll_task(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        while (true) {
+            if (self != nullptr) {
+                if (self->touch_slider_handle_ != nullptr) {
+                    touch_slider_sensor_handle_events(self->touch_slider_handle_);
+                } else if (self->touch_button_handle_ != nullptr) {
+                    touch_button_sensor_handle_events(self->touch_button_handle_);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    void InitializeCapacitiveTouchPads() {
+        if (TOUCH_PAD1 == GPIO_NUM_NC) {
+            ESP_LOGW(TAG, "Capacitive touch disabled: TOUCH_PAD1 NC");
+            return;
+        }
+
+        const uint32_t ch1 = TouchChannelFromPadGpio(TOUCH_PAD1);
+        if (ch1 == 0) {
+            ESP_LOGW(TAG, "TOUCH_PAD1 GPIO %d is not a touch channel (expect GPIO1..GPIO14)",
+                     (int)TOUCH_PAD1);
+            return;
+        }
+
+        if (TOUCH_PAD2 != GPIO_NUM_NC) {
+            const uint32_t ch2 = TouchChannelFromPadGpio(TOUCH_PAD2);
+            if (ch2 == 0) {
+                ESP_LOGW(TAG, "TOUCH_PAD2 GPIO %d is not a touch channel", (int)TOUCH_PAD2);
+                return;
+            }
+
+            static uint32_t slider_ch[2];
+            static float slider_thr[2];
+            slider_ch[0] = ch1;
+            slider_ch[1] = ch2;
+            slider_thr[0] = 0.004f;
+            slider_thr[1] = 0.006f;
+
+            touch_slider_config_t sld_cfg = {
+                .channel_num = 2,
+                .channel_list = slider_ch,
+                .channel_threshold = slider_thr,
+                .channel_gold_value = nullptr,
+                .debounce_times = 1,
+                .filter_reset_times = 5,
+                .position_range = 10000,
+                .calculate_window = 2,
+                .swipe_threshold = 28.f,
+                .swipe_hysterisis = 22.f,
+                .swipe_alpha = 0.9f,
+                .skip_lowlevel_init = false,
+            };
+            esp_err_t err = touch_slider_sensor_create(&sld_cfg, &touch_slider_handle_,
+                                                       touch_slider_event_callback, this);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "touch_slider_sensor_create failed: %s", esp_err_to_name(err));
+                touch_slider_handle_ = nullptr;
+                return;
+            }
+            xTaskCreatePinnedToCore(touch_cap_poll_task, "touch_cap", 3072, this, 3,
+                                    &touch_slider_task_handle_, 1);
+            ESP_LOGI(TAG, "Touch slider (PCB v1.2+): PAD1 GPIO%d ch%u, PAD2 GPIO%d ch%u",
+                     (int)TOUCH_PAD1, (unsigned)slider_ch[0], (int)TOUCH_PAD2,
+                     (unsigned)slider_ch[1]);
+            return;
+        }
+
+        static uint32_t btn_ch[1];
+        static float btn_thr[1];
+        btn_ch[0] = ch1;
+        btn_thr[0] = 0.004f;
+
+        touch_button_config_t btn_cfg = {
+            .channel_num = 1,
+            .channel_list = btn_ch,
+            .channel_threshold = btn_thr,
             .channel_gold_value = nullptr,
-            .debounce_times = 1,
-            .filter_reset_times = 5,
-            .position_range = 10000,
-            .calculate_window = 2,
-            .swipe_threshold = 28.f,
-            .swipe_hysterisis = 22.f,
-            .swipe_alpha = 0.9f,
+            .debounce_times = 2,
             .skip_lowlevel_init = false,
         };
-        esp_err_t err = touch_slider_sensor_create(&sld_cfg, &touch_slider_handle_,
-                                                   touch_slider_event_callback, this);
+        esp_err_t err = touch_button_sensor_create(&btn_cfg, &touch_button_handle_,
+                                                   touch_button_event_callback, this);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "touch_slider_sensor_create failed: %s", esp_err_to_name(err));
-            touch_slider_handle_ = nullptr;
+            ESP_LOGW(TAG, "touch_button_sensor_create failed: %s", esp_err_to_name(err));
+            touch_button_handle_ = nullptr;
             return;
         }
         xTaskCreatePinnedToCore(touch_cap_poll_task, "touch_cap", 3072, this, 3,
                                 &touch_slider_task_handle_, 1);
-        ESP_LOGI(TAG, "Touch slider (PCB v1.2+): PAD1 GPIO%d ch%u, PAD2 GPIO%d ch%u",
-                 (int)TOUCH_PAD1, (unsigned)slider_ch[0], (int)TOUCH_PAD2, (unsigned)slider_ch[1]);
-        return;
+        ESP_LOGI(TAG, "Touch button (PCB v1.0): TOUCH_PAD1 GPIO%d ch%u", (int)TOUCH_PAD1,
+                 (unsigned)btn_ch[0]);
     }
-
-    static uint32_t btn_ch[1];
-    static float btn_thr[1];
-    btn_ch[0] = ch1;
-    btn_thr[0] = 0.004f;
-
-    touch_button_config_t btn_cfg = {
-        .channel_num = 1,
-        .channel_list = btn_ch,
-        .channel_threshold = btn_thr,
-        .channel_gold_value = nullptr,
-        .debounce_times = 2,
-        .skip_lowlevel_init = false,
-    };
-    esp_err_t err = touch_button_sensor_create(&btn_cfg, &touch_button_handle_,
-                                               touch_button_event_callback, this);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "touch_button_sensor_create failed: %s", esp_err_to_name(err));
-        touch_button_handle_ = nullptr;
-        return;
-    }
-    xTaskCreatePinnedToCore(touch_cap_poll_task, "touch_cap", 3072, this, 3,
-                            &touch_slider_task_handle_, 1);
-    ESP_LOGI(TAG, "Touch button (PCB v1.0): TOUCH_PAD1 GPIO%d ch%u", (int)TOUCH_PAD1,
-             (unsigned)btn_ch[0]);
-}
 #endif
 
-void InitializeSpi() {
-    const spi_bus_config_t bus_config = TAIJIPI_ST77916_PANEL_BUS_QSPI_CONFIG(
-        QSPI_PIN_NUM_LCD_PCLK, QSPI_PIN_NUM_LCD_DATA0, QSPI_PIN_NUM_LCD_DATA1,
-        QSPI_PIN_NUM_LCD_DATA2, QSPI_PIN_NUM_LCD_DATA3, QSPI_LCD_H_RES * 80 * sizeof(uint16_t));
-    ESP_ERROR_CHECK(spi_bus_initialize(QSPI_LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
-}
+    void InitializeSpi() {
+        const spi_bus_config_t bus_config = TAIJIPI_ST77916_PANEL_BUS_QSPI_CONFIG(
+            QSPI_PIN_NUM_LCD_PCLK, QSPI_PIN_NUM_LCD_DATA0, QSPI_PIN_NUM_LCD_DATA1,
+            QSPI_PIN_NUM_LCD_DATA2, QSPI_PIN_NUM_LCD_DATA3, QSPI_LCD_H_RES * 80 * sizeof(uint16_t));
+        ESP_ERROR_CHECK(spi_bus_initialize(QSPI_LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
+    }
 
-void InitializeSt77916Display(uint8_t pcb_version) {
-    esp_lcd_panel_io_handle_t panel_io = nullptr;
-    esp_lcd_panel_handle_t panel = nullptr;
+    void InitializeSt77916Display(uint8_t pcb_version) {
+        esp_lcd_panel_io_handle_t panel_io = nullptr;
+        esp_lcd_panel_handle_t panel = nullptr;
 
-    esp_lcd_panel_io_spi_config_t io_config = {};
-    io_config.cs_gpio_num = QSPI_PIN_NUM_LCD_CS;
-    io_config.dc_gpio_num = GPIO_NUM_NC;
-    io_config.spi_mode = 0;
-    io_config.pclk_hz = 40 * 1000 * 1000;
-    io_config.trans_queue_depth = 10;
-    io_config.lcd_cmd_bits = 32;
-    io_config.lcd_param_bits = 8;
-    io_config.flags.quad_mode = true;
-    ESP_ERROR_CHECK(
-        esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)QSPI_LCD_HOST, &io_config, &panel_io));
-    st77916_vendor_config_t vendor_config = {
-        .init_cmds = vendor_specific_init_yysj,
-        .init_cmds_size = sizeof(vendor_specific_init_yysj) / sizeof(st77916_lcd_init_cmd_t),
-        .flags =
-            {
-                .use_qspi_interface = 1,
-            },
-    };
-    esp_lcd_panel_dev_config_t panel_config = {};
-    panel_config.reset_gpio_num = QSPI_PIN_NUM_LCD_RST;
-    panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
-    panel_config.bits_per_pixel = QSPI_LCD_BIT_PER_PIXEL;
-    panel_config.flags.reset_active_high = pcb_version;
-    panel_config.vendor_config = &vendor_config;
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st77916(panel_io, &panel_config, &panel));
+        esp_lcd_panel_io_spi_config_t io_config = {};
+        io_config.cs_gpio_num = QSPI_PIN_NUM_LCD_CS;
+        io_config.dc_gpio_num = GPIO_NUM_NC;
+        io_config.spi_mode = 0;
+        io_config.pclk_hz = 40 * 1000 * 1000;
+        io_config.trans_queue_depth = 10;
+        io_config.lcd_cmd_bits = 32;
+        io_config.lcd_param_bits = 8;
+        io_config.flags.quad_mode = true;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)QSPI_LCD_HOST,
+                                                 &io_config, &panel_io));
+        st77916_vendor_config_t vendor_config = {
+            .init_cmds = vendor_specific_init_yysj,
+            .init_cmds_size = sizeof(vendor_specific_init_yysj) / sizeof(st77916_lcd_init_cmd_t),
+            .flags =
+                {
+                    .use_qspi_interface = 1,
+                },
+        };
+        esp_lcd_panel_dev_config_t panel_config = {};
+        panel_config.reset_gpio_num = QSPI_PIN_NUM_LCD_RST;
+        panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+        panel_config.bits_per_pixel = QSPI_LCD_BIT_PER_PIXEL;
+        panel_config.flags.reset_active_high = pcb_version;
+        panel_config.vendor_config = &vendor_config;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_st77916(panel_io, &panel_config, &panel));
 
-    esp_lcd_panel_reset(panel);
-    esp_lcd_panel_init(panel);
-    esp_lcd_panel_disp_on_off(panel, true);
-    esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
-    esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        esp_lcd_panel_reset(panel);
+        esp_lcd_panel_init(panel);
+        esp_lcd_panel_disp_on_off(panel, true);
+        esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
+        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
-    display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 #else
-    display_ =
-        new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X,
-                          DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                     DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 #endif
-    backlight_ = new PwmBacklight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
-    backlight_->RestoreBrightness();
-}
+        backlight_ = new PwmBacklight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
+        backlight_->RestoreBrightness();
+    }
 
-void InitializeButtons() {
-    boot_button_.OnClick([this]() {
-        auto& app = Application::GetInstance();
-        if (app.GetDeviceState() == kDeviceStateStarting) {
-            ESP_LOGI(TAG, "Boot button pressed, enter WiFi configuration mode");
-            EnterWifiConfigMode();
-            return;
-        }
-        app.ToggleChatState();
-    });
-    gpio_config_t power_gpio_config = {
-        .pin_bit_mask = (BIT64(POWER_CTRL)),
-        .mode = GPIO_MODE_OUTPUT,
+    void InitializeButtons() {
+        boot_button_.OnClick([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                ESP_LOGI(TAG, "Boot button pressed, enter WiFi configuration mode");
+                EnterWifiConfigMode();
+                return;
+            }
+            app.ToggleChatState();
+        });
+        gpio_config_t power_gpio_config = {
+            .pin_bit_mask = (BIT64(POWER_CTRL)),
+            .mode = GPIO_MODE_OUTPUT,
 
-    };
-    ESP_ERROR_CHECK(gpio_config(&power_gpio_config));
+        };
+        ESP_ERROR_CHECK(gpio_config(&power_gpio_config));
 
-    gpio_set_level(POWER_CTRL, 0);
-}
+        gpio_set_level(POWER_CTRL, 0);
+    }
 
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
-void InitializeCamera() {
-    esp_video_init_usb_uvc_config_t usb_uvc_config = {
-        .uvc =
-            {
-                .uvc_dev_num = 1,
-                .task_stack = 4096,
-                .task_priority = 5,
-                .task_affinity = -1,
-            },
-        .usb =
-            {
-                .init_usb_host_lib = true,
-                .task_stack = 4096,
-                .task_priority = 5,
-                .task_affinity = -1,
-            },
-    };
+    void InitializeCamera() {
+        esp_video_init_usb_uvc_config_t usb_uvc_config = {
+            .uvc =
+                {
+                    .uvc_dev_num = 1,
+                    .task_stack = 4096,
+                    .task_priority = 5,
+                    .task_affinity = -1,
+                },
+            .usb =
+                {
+                    .init_usb_host_lib = true,
+                    .task_stack = 4096,
+                    .task_priority = 5,
+                    .task_affinity = -1,
+                },
+        };
 
-    esp_video_init_config_t video_config = {
-        .usb_uvc = &usb_uvc_config,
-    };
+        esp_video_init_config_t video_config = {
+            .usb_uvc = &usb_uvc_config,
+        };
 
-    camera_ = new EspVideo(video_config);
-}
+        camera_ = new EspVideo(video_config);
+    }
 #endif  // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
 
 public:
-~EspVocat() {
-    // Stop tasks
-    if (charge_task_handle_ != nullptr) {
-        vTaskDelete(charge_task_handle_);
-    }
-    if (touch_task_handle_ != nullptr) {
-        vTaskDelete(touch_task_handle_);
-    }
-    if (imu_task_handle_ != nullptr) {
-        vTaskDelete(imu_task_handle_);
-    }
+    ~EspVocat() {
+        // Stop tasks
+        if (charge_task_handle_ != nullptr) {
+            vTaskDelete(charge_task_handle_);
+        }
+        if (touch_task_handle_ != nullptr) {
+            vTaskDelete(touch_task_handle_);
+        }
+        if (imu_task_handle_ != nullptr) {
+            vTaskDelete(imu_task_handle_);
+        }
 #if ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR
-    if (touch_slider_task_handle_ != nullptr) {
-        vTaskDelete(touch_slider_task_handle_);
-        touch_slider_task_handle_ = nullptr;
-    }
-    if (touch_slider_handle_ != nullptr) {
-        touch_slider_sensor_delete(touch_slider_handle_);
-        touch_slider_handle_ = nullptr;
-    }
-    if (touch_button_handle_ != nullptr) {
-        touch_button_sensor_delete(touch_button_handle_);
-        touch_button_handle_ = nullptr;
-    }
+        if (touch_slider_task_handle_ != nullptr) {
+            vTaskDelete(touch_slider_task_handle_);
+            touch_slider_task_handle_ = nullptr;
+        }
+        if (touch_slider_handle_ != nullptr) {
+            touch_slider_sensor_delete(touch_slider_handle_);
+            touch_slider_handle_ = nullptr;
+        }
+        if (touch_button_handle_ != nullptr) {
+            touch_button_sensor_delete(touch_button_handle_);
+            touch_button_handle_ = nullptr;
+        }
 #endif
 
-    // Delete objects
-    delete charge_;
-    delete cst816s_;
-    delete display_;
-    // Note: backlight_ (PwmBacklight) and camera_ (EspVideo) are not deleted here
-    // because their base classes (Backlight, Camera) don't have virtual destructors.
-    // Since EspVocat is a singleton that lives for the device lifetime, this is acceptable.
+        // Delete objects
+        delete charge_;
+        delete cst816s_;
+        delete display_;
+        // Note: backlight_ (PwmBacklight) and camera_ (EspVideo) are not deleted here
+        // because their base classes (Backlight, Camera) don't have virtual destructors.
+        // Since EspVocat is a singleton that lives for the device lifetime, this is acceptable.
 
-    // Remove GPIO ISR handler
-    gpio_isr_handler_remove(TP_PIN_NUM_INT);
-    if (emotion_reset_timer_ != nullptr) {
-        esp_timer_stop(emotion_reset_timer_);
-        esp_timer_delete(emotion_reset_timer_);
-        emotion_reset_timer_ = nullptr;
+        // Remove GPIO ISR handler
+        gpio_isr_handler_remove(TP_PIN_NUM_INT);
+        if (emotion_reset_timer_ != nullptr) {
+            esp_timer_stop(emotion_reset_timer_);
+            esp_timer_delete(emotion_reset_timer_);
+            emotion_reset_timer_ = nullptr;
+        }
+        if (mode_idle_timer_ != nullptr) {
+            esp_timer_stop(mode_idle_timer_);
+            esp_timer_delete(mode_idle_timer_);
+            mode_idle_timer_ = nullptr;
+        }
+        if (reminder_timer_ != nullptr) {
+            esp_timer_stop(reminder_timer_);
+            esp_timer_delete(reminder_timer_);
+            reminder_timer_ = nullptr;
+        }
+
+        // Disable temperature sensor
+        if (temp_sensor != NULL) {
+            temperature_sensor_disable(temp_sensor);
+            temperature_sensor_uninstall(temp_sensor);
+            temp_sensor = NULL;
+        }
     }
-    if (mode_idle_timer_ != nullptr) {
-        esp_timer_stop(mode_idle_timer_);
-        esp_timer_delete(mode_idle_timer_);
-        mode_idle_timer_ = nullptr;
-    }
-    if (reminder_timer_ != nullptr) {
-        esp_timer_stop(reminder_timer_);
-        esp_timer_delete(reminder_timer_);
-        reminder_timer_ = nullptr;
-    }
 
-    // Disable temperature sensor
-    if (temp_sensor != NULL) {
-        temperature_sensor_disable(temp_sensor);
-        temperature_sensor_uninstall(temp_sensor);
-        temp_sensor = NULL;
-    }
-}
+    EspVocat() : boot_button_(BOOT_BUTTON_GPIO) {
+        const esp_timer_create_args_t emotion_timer_args = {
+            .callback = &EspVocat::emotion_reset_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "emotion_rst",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&emotion_timer_args, &emotion_reset_timer_));
 
-EspVocat() : boot_button_(BOOT_BUTTON_GPIO) {
-    const esp_timer_create_args_t emotion_timer_args = {
-        .callback = &EspVocat::emotion_reset_timer_callback,
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "emotion_rst",
-        .skip_unhandled_events = true,
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&emotion_timer_args, &emotion_reset_timer_));
+        const esp_timer_create_args_t mode_idle_timer_args = {
+            .callback = &EspVocat::mode_idle_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "mode_idle",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
 
-    const esp_timer_create_args_t mode_idle_timer_args = {
-        .callback = &EspVocat::mode_idle_timer_callback,
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "mode_idle",
-        .skip_unhandled_events = true,
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
+        InitializeI2c();
+        uint8_t pcb_version = DetectPcbVersion();
+        InitializeCharge();
+        InitializeCst816sTouchPad();
+        InitializeBmi270();
 
-    InitializeI2c();
-    uint8_t pcb_version = DetectPcbVersion();
-    InitializeCharge();
-    InitializeCst816sTouchPad();
-    InitializeBmi270();
-
-    InitializeSpi();
-    InitializeSt77916Display(pcb_version);
-    InitializeButtons();
-    LoadHabitState();
-    InitializeReminderTimer();
+        InitializeSpi();
+        InitializeSt77916Display(pcb_version);
+        InitializeButtons();
+        LoadHabitState();
+        InitializeReminderTimer();
 #if ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR
-    InitializeCapacitiveTouchPads();
+        InitializeCapacitiveTouchPads();
 #endif
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
-    InitializeCamera();
+        InitializeCamera();
 #endif  // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
-}
-
-virtual AudioCodec* GetAudioCodec() override {
-    static BoxAudioCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-                                     AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
-                                     AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN,
-                                     AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR,
-                                     AUDIO_INPUT_REFERENCE);
-    return &audio_codec;
-}
-
-virtual Display* GetDisplay() override { return display_; }
-
-Cst816s* GetTouchpad() { return cst816s_; }
-
-virtual Backlight* GetBacklight() override { return backlight_; }
-
-virtual Camera* GetCamera() override { return camera_; }
-
-virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-    if (charge_ == nullptr) {
-        return false;
     }
-    return charge_->GetSnapshot(level, charging, discharging);
-}
-}
-;
+
+    virtual AudioCodec* GetAudioCodec() override {
+        static BoxAudioCodec audio_codec(
+            i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR,
+            AUDIO_INPUT_REFERENCE);
+        return &audio_codec;
+    }
+
+    virtual Display* GetDisplay() override { return display_; }
+
+    Cst816s* GetTouchpad() { return cst816s_; }
+
+    virtual Backlight* GetBacklight() override { return backlight_; }
+
+    virtual Camera* GetCamera() override { return camera_; }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (charge_ == nullptr) {
+            return false;
+        }
+        return charge_->GetSnapshot(level, charging, discharging);
+    }
+};
 
 // Static array definitions for emotion learning
 const char* EspVocat::kEmotionLearningEmotions_[] = {"happy",    "sad",    "angry",  "shocked",
