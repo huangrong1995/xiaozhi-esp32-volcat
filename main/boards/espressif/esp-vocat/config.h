@@ -85,4 +85,9 @@
         .max_transfer_sz = max_trans_sz,                                          \
     }
 
+// Interaction-mode design note: the unified gesture/mode enums
+// (enum class Gesture, enum class Mode) and the interaction-mode state
+// (Mode mode_ = Mode::Chat, kModeIdleTimeoutMs) live in esp_vocat.cc at
+// namespace scope and as EspVocat members, not in this config header.
+
 #endif // _BOARD_CONFIG_H_
