@@ -499,8 +499,9 @@ private:
     // Habit configuration
     static constexpr int64_t kDrinkReminderIntervalMs = 60 * 60 * 1000;  // 60 minutes in ms
 
-    // Swipe detection for yoga challenge
+    // Touch swipe detection for CST816S
     bool swipe_start_recorded_ = false;
+    int64_t touch_press_time_ms_ = 0;
     int swipe_start_x_ = 0;
     int swipe_start_y_ = 0;
     static constexpr int kSwipeThreshold = 80;  // Minimum swipe distance
@@ -572,21 +573,76 @@ private:
         esp_timer_start_once(mode_idle_timer_, kModeIdleTimeoutMs * 1000ULL);
     }
 
-    // Per-mode gesture handlers. Behavior is filled in by Task 2; until then
-    // they only log. Note: Pet and Shake must never change mode_.
+    // Per-mode gesture handlers. Note: Pet and Shake must never change mode_.
     void HandleChatGesture(Gesture gesture)
     {
-        ESP_LOGI(TAG, "Chat gesture: %d", static_cast<int>(gesture));
+        switch (gesture) {
+        case Gesture::Tap:
+            Application::GetInstance().ToggleChatState();
+            break;
+        case Gesture::SwipeLeft:
+            EnterEmotionLearningMode();
+            break;
+        case Gesture::SwipeRight:
+            EnterYogaChallengeMode();
+            break;
+        case Gesture::LongPress:
+            // Short cancel/help feedback without muting or recording drink.
+            ShowTemporaryEmotion("confused", 2000);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+            ESP_LOGI(TAG, "Long press help/cancel feedback");
+            break;
+        default:
+            // Ignore mode-only gestures (SwipeUp, SwipeDown, Pet, Shake,
+            // ChatToggle, None). A swipe must never toggle chat.
+            break;
+        }
     }
 
     void HandleEmotionLearningGesture(Gesture gesture)
     {
-        ESP_LOGI(TAG, "EmotionLearning gesture: %d", static_cast<int>(gesture));
+        switch (gesture) {
+        case Gesture::SwipeLeft:  // next emotion
+            ShowEmotionLearningNext();
+            break;
+        case Gesture::SwipeRight:  // previous emotion
+            current_emotion_index_ =
+                (current_emotion_index_ + kEmotionLearningCount - 1) % kEmotionLearningCount;
+            ShowEmotionLearningCurrent();
+            break;
+        case Gesture::Tap:  // feedback for the current emotion
+            ShowEmotionLearningCurrent();
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+            break;
+        case Gesture::LongPress:
+            ExitToChat();
+            break;
+        default:
+            break;
+        }
     }
 
     void HandleYogaGesture(Gesture gesture)
     {
-        ESP_LOGI(TAG, "Yoga gesture: %d", static_cast<int>(gesture));
+        switch (gesture) {
+        case Gesture::SwipeLeft:  // next pose
+            current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
+            ShowYogaPose();
+            break;
+        case Gesture::SwipeRight:  // previous pose
+            current_pose_index_ =
+                (current_pose_index_ + kYogaPoseCount - 1) % kYogaPoseCount;
+            ShowYogaPose();
+            break;
+        case Gesture::Tap:  // replay the current pose
+            ShowYogaPose();
+            break;
+        case Gesture::LongPress:
+            ExitToChat();
+            break;
+        default:
+            break;
+        }
     }
 
     // Gesture timing thresholds (ms)
@@ -875,34 +931,44 @@ private:
                 auto& touch_point = touchpad->GetTouchPoint();
 
                 if (touch_event == Cst816s::TOUCH_PRESS) {
-                    // Record swipe start position
+                    // Record press timestamp and start position for later recognition
+                    board.touch_press_time_ms_ = esp_timer_get_time() / 1000;
                     board.swipe_start_x_ = touch_point.x;
                     board.swipe_start_y_ = touch_point.y;
                     board.swipe_start_recorded_ = true;
                 }
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
+                    // Startup special case: first touch release enters WiFi config.
                     if (app.GetDeviceState() == kDeviceStateStarting) {
+                        board.swipe_start_recorded_ = false;
                         board.EnterWifiConfigMode();
-                    } else if (board.swipe_start_recorded_) {
-                        // Check for swipe right to enter yoga mode
+                        continue;
+                    }
+
+                    // Normalize the release into a single screen gesture and route it.
+                    Gesture gesture = Gesture::Tap;
+                    if (board.swipe_start_recorded_) {
+                        int64_t now_ms = esp_timer_get_time() / 1000;
+                        int64_t duration_ms = now_ms - board.touch_press_time_ms_;
                         int delta_x = touch_point.x - board.swipe_start_x_;
                         int delta_y = touch_point.y - board.swipe_start_y_;
-                        ESP_LOGI(TAG, "Swipe check: start(%d,%d) end(%d,%d) delta(%d,%d)",
+                        ESP_LOGI(TAG, "Touch release: start(%d,%d) end(%d,%d) delta(%d,%d) dur=%" PRId64 " ms",
                                   board.swipe_start_x_, board.swipe_start_y_,
-                                  touch_point.x, touch_point.y, delta_x, delta_y);
-                        // Swipe right: delta_x > threshold and |delta_y| < delta_x
-                        if (delta_x > kSwipeThreshold && abs(delta_y) < delta_x) {
-                            ESP_LOGI(TAG, "Swipe RIGHT detected, entering yoga challenge mode");
-                            board.EnterYogaChallengeMode();
+                                  touch_point.x, touch_point.y, delta_x, delta_y, duration_ms);
+
+                        if (duration_ms >= kLongPressThresholdMs) {
+                            gesture = Gesture::LongPress;
+                        } else if (abs(delta_x) >= kSwipeThreshold && abs(delta_x) > abs(delta_y)) {
+                            gesture = (delta_x > 0) ? Gesture::SwipeRight : Gesture::SwipeLeft;
+                        } else if (abs(delta_y) >= kSwipeThreshold && abs(delta_y) > abs(delta_x)) {
+                            gesture = (delta_y > 0) ? Gesture::SwipeDown : Gesture::SwipeUp;
                         } else {
-                            // Normal tap - toggle chat state
-                            app.ToggleChatState();
+                            gesture = Gesture::Tap;
                         }
                         board.swipe_start_recorded_ = false;
-                    } else {
-                        app.ToggleChatState();
                     }
+                    board.OnGesture(gesture);
                 }
             }
         }
