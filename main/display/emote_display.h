@@ -30,6 +30,9 @@ public:
 
     void RefreshAll();
 
+    // Draw yoga arrow directly to LCD panel
+    void DrawArrow(const char* direction);
+
     // Get emote handle for internal use
     emote_handle_t GetEmoteHandle() const { return emote_handle_; }
 

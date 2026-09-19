@@ -971,7 +971,8 @@ private:
     {
         if (display_ != nullptr) {
             const char* direction = kYogaPoseDirections_[current_pose_index_];
-            display_->SetEmotion(direction);
+            // Use DrawArrow to directly draw arrow on LCD panel
+            static_cast<emote::EmoteDisplay*>(display_)->DrawArrow(direction);
             ESP_LOGI(TAG, "Yoga pose: %s (%s)", kYogaPoseNames_[current_pose_index_], direction);
         }
     }
