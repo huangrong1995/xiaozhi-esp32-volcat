@@ -125,6 +125,8 @@ EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
       is_idle_(false),
       current_idle_index_(0),
       idle_emotions_({"happy", "confused", "angry", "shocked"}) {
+    width_ = width;
+    height_ = height;
     emote_handle_ = InitializeEmote(panel, width, height);
 
     const esp_lcd_panel_io_callbacks_t cbs = {
@@ -160,172 +162,652 @@ void EmoteDisplay::SetEmotion(const char* const emotion) {
     if (emote_handle_ && emotion && strlen(emotion) > 0) {
         emote_set_anim_emoji(emote_handle_, emotion);
     }
-}
+    void EmoteDisplay::DrawArrow(const char* direction) {
+        if (!direction) {
+            return;
+        }
 
-void EmoteDisplay::SetChatMessage(const char* const role, const char* const content) {
-    ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
-    if (emote_handle_ && content && strlen(content) > 0) {
-        if ((std::strcmp(role, "system") == 0) && std::strstr(content, "xiaozhi.me")) {
-            size_t len = strlen(content);
-            char* new_content = new char[len + 1];
-            strcpy(new_content, content);
-            std::replace(new_content, new_content + len, static_cast<char>(0x0A),
-                         static_cast<char>(0x20));
-            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SYS, new_content);
-            delete[] new_content;
+        esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)emote_get_user_data(emote_handle_);
+        if (!panel) {
+            ESP_LOGE(TAG, "Panel is null");
+            return;
+        }
+
+        // Arrow pixel data (32x32 RGB565) - 绿色箭头
+        // up arrow - 三角形指向上方
+        static const uint16_t arrow_up[32 * 16] = {
+            // Row 0-9 (顶部三角)
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            0x0000,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x0000,
+            // Row 10-21 (方块身躯)
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+            0x07E0,
+        };
+
+        // down arrow - 三角形指向下方
+        static const uint16_t arrow_down[32 * 16] = {
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000,
+            0x0000, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000,
+        };
+
+        // left arrow - 三角形指向左边 (16行 x 32列)
+        static const uint16_t arrow_left[16 * 32] = {
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000,
+        };
+
+        // right arrow - 三角形指向右边 (16行 x 32列)
+        static const uint16_t arrow_right[16 * 32] = {
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+            0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x0000,
+        };
+
+        const uint16_t* arrow_data = nullptr;
+        int arrow_size = 32;
+
+        if (strcmp(direction, "up") == 0) {
+            arrow_data = arrow_up;
+        } else if (strcmp(direction, "down") == 0) {
+            arrow_data = arrow_down;
+        } else if (strcmp(direction, "left") == 0) {
+            arrow_data = arrow_left;
+        } else if (strcmp(direction, "right") == 0) {
+            arrow_data = arrow_right;
         } else {
-            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, content);
+            ESP_LOGW(TAG, "Unknown direction: %s", direction);
+            return;
+        }
+
+        // Calculate center position (assuming 320x240 display)
+        int center_x = width_ / 2 - arrow_size / 2;
+        int center_y = height_ / 2 - arrow_size / 2;
+
+        ESP_LOGI(TAG, "Drawing arrow: %s at (%d, %d)", direction, center_x, center_y);
+
+        // Draw the arrow directly to LCD panel
+        esp_lcd_panel_draw_bitmap(panel, center_x, center_y, center_x + arrow_size,
+                                  center_y + arrow_size, arrow_data);
+    }
+
+    void EmoteDisplay::SetChatMessage(const char* const role, const char* const content) {
+        ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
+        if (emote_handle_ && content && strlen(content) > 0) {
+            if ((std::strcmp(role, "system") == 0) && std::strstr(content, "xiaozhi.me")) {
+                size_t len = strlen(content);
+                char* new_content = new char[len + 1];
+                strcpy(new_content, content);
+                std::replace(new_content, new_content + len, static_cast<char>(0x0A),
+                             static_cast<char>(0x20));
+                emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SYS, new_content);
+                delete[] new_content;
+            } else {
+                emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, content);
+            }
         }
     }
-}
 
-void EmoteDisplay::SetStatus(const char* const status) {
-    ESP_LOGI(TAG, "SetStatus: %s", status);
-    if (emote_handle_ && status && strlen(status) > 0) {
-        if (std::strcmp(status, Lang::Strings::LISTENING) == 0) {
-            // Stop idle animation when listening
-            StopIdleAnimation();
-            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_LISTEN, NULL);
-        } else if (std::strcmp(status, Lang::Strings::STANDBY) == 0) {
-            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_IDLE, NULL);
-            // Start idle animation
-            StartIdleAnimation();
-        } else if (std::strcmp(status, Lang::Strings::SPEAKING) == 0) {
-            // Stop idle animation when speaking
-            StopIdleAnimation();
-            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, NULL);
-        } else if (std::strcmp(status, Lang::Strings::ERROR) == 0) {
-            StopIdleAnimation();
-            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SET, NULL);
+    void EmoteDisplay::SetStatus(const char* const status) {
+        ESP_LOGI(TAG, "SetStatus: %s", status);
+        if (emote_handle_ && status && strlen(status) > 0) {
+            if (std::strcmp(status, Lang::Strings::LISTENING) == 0) {
+                // Stop idle animation when listening
+                StopIdleAnimation();
+                emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_LISTEN, NULL);
+            } else if (std::strcmp(status, Lang::Strings::STANDBY) == 0) {
+                emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_IDLE, NULL);
+                // Start idle animation
+                StartIdleAnimation();
+            } else if (std::strcmp(status, Lang::Strings::SPEAKING) == 0) {
+                // Stop idle animation when speaking
+                StopIdleAnimation();
+                emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, NULL);
+            } else if (std::strcmp(status, Lang::Strings::ERROR) == 0) {
+                StopIdleAnimation();
+                emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SET, NULL);
+            }
         }
     }
-}
 
-void EmoteDisplay::ShowNotification(const char* notification, int duration_ms) {
-    ESP_LOGI(TAG, "ShowNotification: %s", notification);
-    if (emote_handle_ && notification && strlen(notification) > 0) {
-        emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SYS, notification);
+    void EmoteDisplay::ShowNotification(const char* notification, int duration_ms) {
+        ESP_LOGI(TAG, "ShowNotification: %s", notification);
+        if (emote_handle_ && notification && strlen(notification) > 0) {
+            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SYS, notification);
+        }
     }
-}
 
-void EmoteDisplay::UpdateStatusBar(bool update_all) {
-    ESP_LOGD(TAG, "UpdateStatusBar: %s", update_all ? "true" : "false");
-    if (!emote_handle_) {
-        return;
+    void EmoteDisplay::UpdateStatusBar(bool update_all) {
+        ESP_LOGD(TAG, "UpdateStatusBar: %s", update_all ? "true" : "false");
+        if (!emote_handle_) {
+            return;
+        }
     }
-}
 
-void EmoteDisplay::SetPowerSaveMode(bool on) {
-    ESP_LOGI(TAG, "SetPowerSaveMode: %s", on ? "ON" : "OFF");
-    if (!emote_handle_) {
-        return;
+    void EmoteDisplay::SetPowerSaveMode(bool on) {
+        ESP_LOGI(TAG, "SetPowerSaveMode: %s", on ? "ON" : "OFF");
+        if (!emote_handle_) {
+            return;
+        }
     }
-}
 
-void EmoteDisplay::SetPreviewImage(const void* image) {
-    if (image) {
-        ESP_LOGI(TAG, "SetPreviewImage: Preview image not supported, using default icon");
+    void EmoteDisplay::SetPreviewImage(const void* image) {
+        if (image) {
+            ESP_LOGI(TAG, "SetPreviewImage: Preview image not supported, using default icon");
+        }
     }
-}
 
-bool EmoteDisplay::MountAssets(const char* partition_label) {
-    if (emote_handle_ == nullptr || partition_label == nullptr) {
+    bool EmoteDisplay::MountAssets(const char* partition_label) {
+        if (emote_handle_ == nullptr || partition_label == nullptr) {
+            return false;
+        }
+        const emote_data_t data = {
+            .type = EMOTE_SOURCE_PARTITION,
+            .source =
+                {
+                    .partition_label = partition_label,
+                },
+            .flags =
+                {
+                    .mmap_enable = true,
+                },
+        };
+        return emote_mount_assets(emote_handle_, &data) == ESP_OK;
+    }
+
+    void EmoteDisplay::UnmountAssets() {
+        if (emote_handle_ != nullptr) {
+            emote_unmount_assets(emote_handle_);
+        }
+    }
+
+    bool EmoteDisplay::GetAssetData(const std::string& name, const uint8_t*& data, size_t& size) {
+        if (emote_handle_ == nullptr) {
+            return false;
+        }
+        return emote_get_asset_data_by_name(emote_handle_, name.c_str(), &data, &size) == ESP_OK;
+    }
+
+    void EmoteDisplay::LoadAssets() {
+        if (emote_handle_ != nullptr) {
+            emote_load_assets(emote_handle_);
+        }
+    }
+
+    void EmoteDisplay::SetTheme(Theme* const theme) { ESP_LOGI(TAG, "SetTheme: %p", theme); }
+
+    bool EmoteDisplay::Lock(const int timeout_ms) {
+        (void)timeout_ms;
+        return true;
+    }
+
+    void EmoteDisplay::Unlock() {}
+
+    bool EmoteDisplay::StopAnimDialog() {
+        ESP_LOGI(TAG, "StopAnimDialog");
+        if (emote_handle_) {
+            return emote_stop_anim_dialog(emote_handle_);
+        }
         return false;
     }
-    const emote_data_t data = {
-        .type = EMOTE_SOURCE_PARTITION,
-        .source =
-            {
-                .partition_label = partition_label,
-            },
-        .flags =
-            {
-                .mmap_enable = true,
-            },
-    };
-    return emote_mount_assets(emote_handle_, &data) == ESP_OK;
-}
 
-void EmoteDisplay::UnmountAssets() {
-    if (emote_handle_ != nullptr) {
-        emote_unmount_assets(emote_handle_);
-    }
-}
-
-bool EmoteDisplay::GetAssetData(const std::string& name, const uint8_t*& data, size_t& size) {
-    if (emote_handle_ == nullptr) {
+    bool EmoteDisplay::InsertAnimDialog(const char* emoji_name, uint32_t duration_ms) {
+        ESP_LOGI(TAG, "InsertAnimDialog: %s, %" PRIu32, emoji_name, duration_ms);
+        if (emote_handle_ && emoji_name) {
+            return emote_insert_anim_dialog(emote_handle_, emoji_name, duration_ms);
+        }
         return false;
     }
-    return emote_get_asset_data_by_name(emote_handle_, name.c_str(), &data, &size) == ESP_OK;
-}
 
-void EmoteDisplay::LoadAssets() {
-    if (emote_handle_ != nullptr) {
-        emote_load_assets(emote_handle_);
-    }
-}
-
-void EmoteDisplay::SetTheme(Theme* const theme) { ESP_LOGI(TAG, "SetTheme: %p", theme); }
-
-bool EmoteDisplay::Lock(const int timeout_ms) {
-    (void)timeout_ms;
-    return true;
-}
-
-void EmoteDisplay::Unlock() {}
-
-bool EmoteDisplay::StopAnimDialog() {
-    ESP_LOGI(TAG, "StopAnimDialog");
-    if (emote_handle_) {
-        return emote_stop_anim_dialog(emote_handle_);
-    }
-    return false;
-}
-
-bool EmoteDisplay::InsertAnimDialog(const char* emoji_name, uint32_t duration_ms) {
-    ESP_LOGI(TAG, "InsertAnimDialog: %s, %" PRIu32, emoji_name, duration_ms);
-    if (emote_handle_ && emoji_name) {
-        return emote_insert_anim_dialog(emote_handle_, emoji_name, duration_ms);
-    }
-    return false;
-}
-
-void EmoteDisplay::RefreshAll() {
-    if (emote_handle_) {
-        emote_notify_all_refresh(emote_handle_);
-        return;
-    }
-}
-
-void EmoteDisplay::StartIdleAnimation() {
-    if (idle_anim_timer_ && !is_idle_) {
-        is_idle_ = true;
-        current_idle_index_ = 0;
-        // Show first emotion immediately
-        if (!idle_emotions_.empty()) {
-            SetEmotion(idle_emotions_[current_idle_index_].c_str());
+    void EmoteDisplay::RefreshAll() {
+        if (emote_handle_) {
+            emote_notify_all_refresh(emote_handle_);
+            return;
         }
-        // Start timer to cycle emotions (every 3 seconds)
-        esp_timer_start_periodic(idle_anim_timer_, 30000000);
-        ESP_LOGI(TAG, "Idle animation started");
     }
-}
 
-void EmoteDisplay::StopIdleAnimation() {
-    if (idle_anim_timer_ && is_idle_) {
-        esp_timer_stop(idle_anim_timer_);
-        is_idle_ = false;
-        SetEmotion("neutral");
-        ESP_LOGI(TAG, "Idle animation stopped");
+    void EmoteDisplay::StartIdleAnimation() {
+        if (idle_anim_timer_ && !is_idle_) {
+            is_idle_ = true;
+            current_idle_index_ = 0;
+            // Show first emotion immediately
+            if (!idle_emotions_.empty()) {
+                SetEmotion(idle_emotions_[current_idle_index_].c_str());
+            }
+            // Start timer to cycle emotions (every 3 seconds)
+            esp_timer_start_periodic(idle_anim_timer_, 30000000);
+            ESP_LOGI(TAG, "Idle animation started");
+        }
     }
-}
 
-void EmoteDisplay::IdleAnimTimerCallback(void* arg) {
-    auto* self = static_cast<EmoteDisplay*>(arg);
-    if (self && self->is_idle_ && !self->idle_emotions_.empty()) {
-        self->current_idle_index_ = (self->current_idle_index_ + 1) % self->idle_emotions_.size();
-        self->SetEmotion(self->idle_emotions_[self->current_idle_index_].c_str());
+    void EmoteDisplay::StopIdleAnimation() {
+        if (idle_anim_timer_ && is_idle_) {
+            esp_timer_stop(idle_anim_timer_);
+            is_idle_ = false;
+            SetEmotion("neutral");
+            ESP_LOGI(TAG, "Idle animation stopped");
+        }
     }
-}
+
+    void EmoteDisplay::IdleAnimTimerCallback(void* arg) {
+        auto* self = static_cast<EmoteDisplay*>(arg);
+        if (self && self->is_idle_ && !self->idle_emotions_.empty()) {
+            self->current_idle_index_ =
+                (self->current_idle_index_ + 1) % self->idle_emotions_.size();
+            self->SetEmotion(self->idle_emotions_[self->current_idle_index_].c_str());
+        }
+    }
 
 }  // namespace emote
