@@ -293,6 +293,21 @@ void EmoteDisplay::DrawArrow(const char* direction)
                               arrow_data);
 }
 
+void EmoteDisplay::ShowReminder(const char* emotion)
+{
+    // Pause idle animation so it does not overwrite the reminder, then present
+    // the reminder emotion.
+    StopIdleAnimation();
+    SetEmotion(emotion);
+}
+
+void EmoteDisplay::RestoreFromReminder()
+{
+    // Return to the standby presentation. StartIdleAnimation() is a no-op when
+    // idle is already running, so this is safe to call at any time.
+    StartIdleAnimation();
+}
+
 void EmoteDisplay::SetChatMessage(const char* const role, const char* const content)
 {
     ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);

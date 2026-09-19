@@ -33,6 +33,11 @@ public:
     // Draw yoga arrow directly to LCD panel
     void DrawArrow(const char* direction);
 
+    // Reminder presentation: pause idle animation and show the reminder emotion.
+    // RestoreFromReminder() returns to the standby/mode presentation.
+    void ShowReminder(const char* emotion);
+    void RestoreFromReminder();
+
     // Get emote handle for internal use
     emote_handle_t GetEmoteHandle() const { return emote_handle_; }
 

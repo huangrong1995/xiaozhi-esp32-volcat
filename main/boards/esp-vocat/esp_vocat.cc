@@ -15,6 +15,7 @@
 #include <esp_timer.h>
 #include "esp_idf_version.h"
 #include <cinttypes>
+#include <string_view>
 
 #include <driver/i2c_master.h>
 #include <cstdlib>
@@ -481,16 +482,50 @@ private:
     static const char* kEmotionLearningNames_[];
     static constexpr size_t kEmotionLearningCount = 8;
 
-    // Habit tracking state
+    // Habit tracking state (persisted fields).
     struct HabitState {
-        int64_t last_drink_time;     // Unix timestamp of last drink
-        int drink_streak;            // Consecutive drink completions today
-        bool drink_reminder_shown;   // Whether reminder is shown for current interval
+        int64_t last_drink_time;  // Unix timestamp of last drink
+        int drink_streak;         // Consecutive drink completions today
     };
     HabitState habit_state_ = {};
 
     // Habit configuration
     static constexpr int64_t kDrinkReminderIntervalMs = 60 * 60 * 1000;  // 60 minutes in ms
+
+    // Unified reminder record. Exactly one reminder is presented at a time; a
+    // second due reminder is deferred until the active one is handled.
+    struct Reminder {
+        enum class Type { Drink, Schedule };
+        Type type;
+        const char* message;
+        const char* emotion;
+        std::string_view sound;
+        int64_t due_time_ms;
+        bool handled;  // true once acknowledged or given up on
+    };
+
+    // Unified reminder queue state. The timer only enqueues due reminders;
+    // ShowNextReminder()/DismissReminder() own presentation and acknowledgement.
+    Reminder reminder_ = {};
+    bool reminder_active_ = false;               // a reminder is currently shown
+    int reminder_snooze_count_ = 0;              // ignores for the active reminder
+    int64_t reminder_shown_ms_ = 0;              // when the active reminder was last shown
+    int64_t reminder_quiet_until_ms_ = 0;        // suppress a drink reminder until this time
+    static constexpr int kReminderMaxSnooze = 3; // bounded retries before going quiet
+    static constexpr int64_t kReminderAutoSnoozeMs = 60 * 1000;  // re-remind after no action
+
+    // Daily schedule reminders (hour, minute, message, emotion).
+    struct ScheduleEntry {
+        int hour;
+        int minute;
+        const char* message;
+        const char* emotion;
+    };
+    static const ScheduleEntry kScheduleReminders_[];
+    static constexpr size_t kScheduleCount = 5;
+
+    static constexpr const char* kDrinkReminderMessage = "该喝水了~";
+    static constexpr const char* kDrinkReminderEmotion = "delicious";  // water/drink-oriented
 
     // Touch swipe detection for CST816S
     bool swipe_start_recorded_ = false;
@@ -529,6 +564,12 @@ private:
     void OnGesture(Gesture gesture)
     {
         ResetModeIdleTimer();
+        // Reminder-first routing: while a reminder is active, its acknowledgement
+        // owns all screen gestures; mode navigation is blocked until handled.
+        if (reminder_active_) {
+            HandleReminderGesture(gesture);
+            return;
+        }
         switch (mode_) {
         case Mode::Chat:
             HandleChatGesture(gesture);
@@ -659,7 +700,6 @@ private:
         Settings s("habit", false);
         habit_state_.last_drink_time = s.GetInt("last_drink", 0);
         habit_state_.drink_streak = s.GetInt("drink_streak", 0);
-        habit_state_.drink_reminder_shown = false;
         ESP_LOGI(TAG, "Habit state loaded: last_drink=%" PRId64 ", streak=%d",
                   habit_state_.last_drink_time, habit_state_.drink_streak);
     }
@@ -673,35 +713,110 @@ private:
                   habit_state_.last_drink_time, habit_state_.drink_streak);
     }
 
-    void CheckDrinkReminder()
-    {
-        int64_t now_ms = esp_timer_get_time() / 1000;
-
-        // If no drink recorded today, or interval has passed, show reminder
-        if (habit_state_.last_drink_time == 0 ||
-            (now_ms - habit_state_.last_drink_time) >= kDrinkReminderIntervalMs) {
-            if (!habit_state_.drink_reminder_shown) {
-                ESP_LOGI(TAG, "Drink reminder: time to drink water!");
-                ShowTemporaryEmotion("confused", 5000);
-                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-                vTaskDelay(pdMS_TO_TICKS(500));
-                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-                habit_state_.drink_reminder_shown = true;
-            }
-        }
-    }
-
     void MarkDrinkCompleted()
     {
         int64_t now_ms = esp_timer_get_time() / 1000;
         habit_state_.last_drink_time = now_ms;
         habit_state_.drink_streak++;
-        habit_state_.drink_reminder_shown = false;
         SaveHabitState();
 
         ESP_LOGI(TAG, "Drink completed! Streak: %d", habit_state_.drink_streak);
         ShowTemporaryEmotion("loving", 3000);
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+    }
+
+    // Non-blocking reminder presentation. The timer only enqueues due reminders;
+    // acknowledgement flows back through the gesture path (HandleReminderGesture).
+    void ShowNextReminder()
+    {
+        if (!reminder_active_ || display_ == nullptr) {
+            return;
+        }
+        static_cast<emote::EmoteDisplay*>(display_)->ShowReminder(reminder_.emotion);
+        Application::GetInstance().GetAudioService().PlaySound(reminder_.sound);
+        ESP_LOGI(TAG, "Reminder active: %s (%s)",
+                 reminder_.message ? reminder_.message : "drink", reminder_.emotion);
+    }
+
+    void DismissReminder()
+    {
+        if (!reminder_active_) {
+            return;
+        }
+        reminder_active_ = false;
+        if (display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(display_)->RestoreFromReminder();
+        }
+    }
+
+    void PresentReminder(Reminder::Type type, const char* message, const char* emotion,
+                         std::string_view sound, bool reset_snooze)
+    {
+        reminder_ = Reminder{type, message, emotion, sound, esp_timer_get_time() / 1000, false};
+        if (reset_snooze) {
+            reminder_snooze_count_ = 0;
+        }
+        reminder_active_ = true;
+        reminder_shown_ms_ = esp_timer_get_time() / 1000;
+        ShowNextReminder();
+    }
+
+    // Detect and enqueue due reminders. Never renders or blocks; presentation is
+    // delegated to ShowNextReminder().
+    void EnqueueDueReminders()
+    {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        // Auto-snooze an unacknowledged reminder after a delay (bounded retry),
+        // so an ignored reminder eventually goes quiet.
+        if (reminder_active_ && (now_ms - reminder_shown_ms_) >= kReminderAutoSnoozeMs) {
+            reminder_snooze_count_++;
+            ESP_LOGI(TAG, "Reminder auto-snoozed (%d/%d)",
+                     reminder_snooze_count_, kReminderMaxSnooze);
+            if (reminder_snooze_count_ >= kReminderMaxSnooze) {
+                reminder_.handled = true;
+                reminder_quiet_until_ms_ = now_ms + kDrinkReminderIntervalMs;
+            }
+            DismissReminder();
+            return;
+        }
+        if (reminder_active_) {
+            // One reminder is shown; a newly due reminder is deferred until this
+            // one is handled.
+            return;
+        }
+
+        // Re-present a snoozed (unhandled) drink reminder within its retry bound.
+        if (!reminder_.handled && reminder_.type == Reminder::Type::Drink &&
+            now_ms < reminder_quiet_until_ms_) {
+            reminder_active_ = true;
+            reminder_shown_ms_ = now_ms;
+            ShowNextReminder();
+            return;
+        }
+
+        // Fresh drink reminder.
+        bool drink_due = (habit_state_.last_drink_time == 0 ||
+                          (now_ms - habit_state_.last_drink_time) >= kDrinkReminderIntervalMs);
+        if (drink_due && now_ms >= reminder_quiet_until_ms_) {
+            PresentReminder(Reminder::Type::Drink, kDrinkReminderMessage, kDrinkReminderEmotion,
+                            Lang::Sounds::OGG_POPUP, true);
+            return;
+        }
+
+        // Daily schedule reminders.
+        time_t now;
+        struct tm timeinfo;
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        for (size_t i = 0; i < kScheduleCount; ++i) {
+            const ScheduleEntry& r = kScheduleReminders_[i];
+            if (timeinfo.tm_hour == r.hour && timeinfo.tm_min == r.minute) {
+                PresentReminder(Reminder::Type::Schedule, r.message, r.emotion,
+                                Lang::Sounds::OGG_POPUP, true);
+                return;
+            }
+        }
     }
 
     static void reminder_timer_callback(void* arg)
@@ -710,45 +825,41 @@ private:
         if (self == nullptr) {
             return;
         }
+        // The timer only enqueues; presentation and acknowledgement are owned by
+        // the reminder path (ShowNextReminder/DismissReminder via gestures).
+        self->EnqueueDueReminders();
+    }
 
-        // Check drink reminder
-        self->CheckDrinkReminder();
-
-        // Get current time
-        time_t now;
-        struct tm timeinfo;
-        time(&now);
-        localtime_r(&now, &timeinfo);
-
-        int current_hour = timeinfo.tm_hour;
-        int current_min = timeinfo.tm_min;
-
-        // Check reminder times: 8:00 wake up, 12:00 lunch, 14:00 nap, 18:00 dinner, 21:00 sleep
-        // Format: hour, minute, reminder message, emotion
-        struct Reminder {
-            int hour;
-            int minute;
-            const char* message;
-            const char* emotion;
-        };
-
-        static const Reminder reminders[] = {
-            {8, 0, "该起床了~", "happy"},
-            {12, 0, "该吃午饭了~", "happy"},
-            {14, 0, "该睡午觉了~", "sleepy"},
-            {18, 0, "该吃晚饭了~", "happy"},
-            {21, 0, "该睡觉了~", "sleepy"},
-        };
-
-        for (const auto& r : reminders) {
-            if (current_hour == r.hour && current_min == r.minute) {
-                ESP_LOGI(TAG, "Reminder: %s", r.message);
-                self->ShowTemporaryEmotion(r.emotion, 5000);
-                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-                vTaskDelay(pdMS_TO_TICKS(500));
-                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-                break;
+    void HandleReminderGesture(Gesture gesture)
+    {
+        switch (gesture) {
+        case Gesture::Tap:
+            if (reminder_.type == Reminder::Type::Drink) {
+                // Screen tap confirms "done drinking"; MarkDrinkCompleted records
+                // the habit and plays the success feedback.
+                MarkDrinkCompleted();
+            } else {
+                // Schedule acknowledgement: feedback only, no habit change.
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
             }
+            reminder_.handled = true;
+            DismissReminder();
+            break;
+        case Gesture::LongPress:
+            // Ignore/snooze the reminder; bounded retry, then quiet.
+            reminder_snooze_count_++;
+            ESP_LOGI(TAG, "Reminder ignored (%d/%d)",
+                     reminder_snooze_count_, kReminderMaxSnooze);
+            if (reminder_snooze_count_ >= kReminderMaxSnooze) {
+                reminder_.handled = true;
+                reminder_quiet_until_ms_ = esp_timer_get_time() / 1000 + kDrinkReminderIntervalMs;
+                ESP_LOGI(TAG, "Reminder given up after %d ignores; quiet", reminder_snooze_count_);
+            }
+            DismissReminder();
+            break;
+        default:
+            // Mode navigation (swipes) is blocked while a reminder is active.
+            break;
         }
     }
 
@@ -1526,6 +1637,15 @@ const char* EspVocat::kEmotionLearningEmotions_[] = {
 const char* EspVocat::kEmotionLearningNames_[] = {
     "开心", "伤心", "生气", "惊讶",
     "困惑", "困了", "喜欢", "平静"
+};
+
+// Daily schedule reminders: 8:00 wake, 12:00 lunch, 14:00 nap, 18:00 dinner, 21:00 sleep.
+const EspVocat::ScheduleEntry EspVocat::kScheduleReminders_[] = {
+    {8, 0, "该起床了~", "happy"},
+    {12, 0, "该吃午饭了~", "happy"},
+    {14, 0, "该睡午觉了~", "sleepy"},
+    {18, 0, "该吃晚饭了~", "happy"},
+    {21, 0, "该睡觉了~", "sleepy"},
 };
 
 // Static array definitions for yoga challenge
