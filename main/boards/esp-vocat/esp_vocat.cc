@@ -513,6 +513,9 @@ private:
     int64_t reminder_shown_ms_ = 0;              // when the active reminder was last shown
     int64_t reminder_quiet_until_ms_ = 0;        // suppress a drink reminder until this time
     SemaphoreHandle_t reminder_mutex_ = nullptr; // guards all reminder state
+    esp_timer_handle_t reminder_restore_timer_ = nullptr; // deferred standby-restore
+    bool reminder_restore_pending_ = false;               // standby restore is armed
+    static constexpr uint32_t kDrinkSuccessDurationMs = 3000;  // loving face duration (ms)
     static constexpr int kReminderMaxSnooze = 3; // bounded retries before going quiet
     static constexpr int64_t kReminderAutoSnoozeMs = 60 * 1000;  // re-remind after no action
 
@@ -741,12 +744,56 @@ private:
         }
     }
 
+    // Cancel a pending deferred standby-restore. Callers must hold reminder_mutex_.
+    void CancelReminderRestore()
+    {
+        reminder_restore_pending_ = false;
+        if (reminder_restore_timer_ != nullptr) {
+            esp_timer_stop(reminder_restore_timer_);
+        }
+    }
+
+    // Schedule a one-shot deferred restore to the standby idle presentation.
+    // Callers must hold reminder_mutex_.
+    void ArmReminderRestore(uint32_t delay_ms)
+    {
+        reminder_restore_pending_ = true;
+        if (reminder_restore_timer_ != nullptr) {
+            esp_timer_stop(reminder_restore_timer_);
+            esp_timer_start_once(reminder_restore_timer_,
+                                 static_cast<uint64_t>(delay_ms) * 1000ULL);
+        }
+    }
+
+    // Deferred standby-restore used after drink confirmation, so the display
+    // returns to its idle animation once the ~3s success face has been shown.
+    void RestoreFromReminderDeferred()
+    {
+        LockReminder();
+        if (reminder_restore_pending_ && display_ != nullptr) {
+            reminder_restore_pending_ = false;
+            static_cast<emote::EmoteDisplay*>(display_)->RestoreFromReminder();
+        }
+        UnlockReminder();
+    }
+
+    static void reminder_restore_callback(void* arg)
+    {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+        self->RestoreFromReminderDeferred();
+    }
+
     // Non-blocking reminder presentation. Callers must hold reminder_mutex_.
     void ShowNextReminder()
     {
         if (!reminder_active_ || display_ == nullptr) {
             return;
         }
+        // A newly shown reminder supersedes any pending deferred standby-restore.
+        CancelReminderRestore();
         static_cast<emote::EmoteDisplay*>(display_)->ShowReminder(reminder_.emotion);
         Application::GetInstance().GetAudioService().PlaySound(reminder_.sound);
         ESP_LOGI(TAG, "Reminder active: %s (%s)",
@@ -874,6 +921,9 @@ private:
                 reminder_.handled = true;
                 reminder_pending_ = false;
                 reminder_active_ = false;
+                // Return to the standby idle animation after the ~3s success face,
+                // so idle pet animation resumes instead of freezing on neutral.
+                ArmReminderRestore(kDrinkSuccessDurationMs);
             } else {
                 // Schedule acknowledgement: feedback only, no habit change.
                 Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
@@ -1588,6 +1638,11 @@ public:
             vSemaphoreDelete(reminder_mutex_);
             reminder_mutex_ = nullptr;
         }
+        if (reminder_restore_timer_ != nullptr) {
+            esp_timer_stop(reminder_restore_timer_);
+            esp_timer_delete(reminder_restore_timer_);
+            reminder_restore_timer_ = nullptr;
+        }
 
         // Disable temperature sensor
         if (temp_sensor != NULL) {
@@ -1616,6 +1671,15 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
+
+        const esp_timer_create_args_t reminder_restore_timer_args = {
+            .callback = &EspVocat::reminder_restore_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "rmd_rst",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&reminder_restore_timer_args, &reminder_restore_timer_));
 
         if (reminder_mutex_ == nullptr) {
             reminder_mutex_ = xSemaphoreCreateMutex();
