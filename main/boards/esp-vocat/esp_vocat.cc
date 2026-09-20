@@ -508,9 +508,11 @@ private:
     // ShowNextReminder()/DismissReminder() own presentation and acknowledgement.
     Reminder reminder_ = {};
     bool reminder_active_ = false;               // a reminder is currently shown
+    bool reminder_pending_ = false;              // reminder awaits resolution (shown or snoozed)
     int reminder_snooze_count_ = 0;              // ignores for the active reminder
     int64_t reminder_shown_ms_ = 0;              // when the active reminder was last shown
     int64_t reminder_quiet_until_ms_ = 0;        // suppress a drink reminder until this time
+    SemaphoreHandle_t reminder_mutex_ = nullptr; // guards all reminder state
     static constexpr int kReminderMaxSnooze = 3; // bounded retries before going quiet
     static constexpr int64_t kReminderAutoSnoozeMs = 60 * 1000;  // re-remind after no action
 
@@ -725,8 +727,21 @@ private:
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
     }
 
-    // Non-blocking reminder presentation. The timer only enqueues due reminders;
-    // acknowledgement flows back through the gesture path (HandleReminderGesture).
+    void LockReminder()
+    {
+        if (reminder_mutex_ != nullptr) {
+            xSemaphoreTake(reminder_mutex_, portMAX_DELAY);
+        }
+    }
+
+    void UnlockReminder()
+    {
+        if (reminder_mutex_ != nullptr) {
+            xSemaphoreGive(reminder_mutex_);
+        }
+    }
+
+    // Non-blocking reminder presentation. Callers must hold reminder_mutex_.
     void ShowNextReminder()
     {
         if (!reminder_active_ || display_ == nullptr) {
@@ -738,6 +753,7 @@ private:
                  reminder_.message ? reminder_.message : "drink", reminder_.emotion);
     }
 
+    // Callers must hold reminder_mutex_.
     void DismissReminder()
     {
         if (!reminder_active_) {
@@ -749,6 +765,7 @@ private:
         }
     }
 
+    // Callers must hold reminder_mutex_.
     void PresentReminder(Reminder::Type type, const char* message, const char* emotion,
                          std::string_view sound, bool reset_snooze)
     {
@@ -757,14 +774,17 @@ private:
             reminder_snooze_count_ = 0;
         }
         reminder_active_ = true;
+        reminder_pending_ = true;
         reminder_shown_ms_ = esp_timer_get_time() / 1000;
         ShowNextReminder();
     }
 
-    // Detect and enqueue due reminders. Never renders or blocks; presentation is
-    // delegated to ShowNextReminder().
+    // Detect and enqueue due reminders. Presentation and acknowledgement are
+    // serialized through reminder_mutex_ so the timer task and the touch task
+    // cannot race on the reminder fields.
     void EnqueueDueReminders()
     {
+        LockReminder();
         int64_t now_ms = esp_timer_get_time() / 1000;
 
         // Auto-snooze an unacknowledged reminder after a delay (bounded retry),
@@ -775,32 +795,39 @@ private:
                      reminder_snooze_count_, kReminderMaxSnooze);
             if (reminder_snooze_count_ >= kReminderMaxSnooze) {
                 reminder_.handled = true;
+                reminder_pending_ = false;
                 reminder_quiet_until_ms_ = now_ms + kDrinkReminderIntervalMs;
             }
             DismissReminder();
+            UnlockReminder();
             return;
         }
         if (reminder_active_) {
             // One reminder is shown; a newly due reminder is deferred until this
             // one is handled.
+            UnlockReminder();
             return;
         }
 
-        // Re-present a snoozed (unhandled) drink reminder within its retry bound.
-        if (!reminder_.handled && reminder_.type == Reminder::Type::Drink &&
-            now_ms < reminder_quiet_until_ms_) {
+        // Re-present a snoozed (unhandled) drink reminder without resetting the
+        // snooze counter. It stays pending until acknowledged or given up, so an
+        // ignored reminder reaches kReminderMaxSnooze and goes quiet.
+        if (reminder_pending_ && reminder_.type == Reminder::Type::Drink) {
             reminder_active_ = true;
             reminder_shown_ms_ = now_ms;
             ShowNextReminder();
+            UnlockReminder();
             return;
         }
 
-        // Fresh drink reminder.
+        // Fresh drink reminder: only after a resolved/quiet cycle. The counter
+        // resets here, on a genuinely new interval.
         bool drink_due = (habit_state_.last_drink_time == 0 ||
                           (now_ms - habit_state_.last_drink_time) >= kDrinkReminderIntervalMs);
         if (drink_due && now_ms >= reminder_quiet_until_ms_) {
             PresentReminder(Reminder::Type::Drink, kDrinkReminderMessage, kDrinkReminderEmotion,
                             Lang::Sounds::OGG_POPUP, true);
+            UnlockReminder();
             return;
         }
 
@@ -814,9 +841,11 @@ private:
             if (timeinfo.tm_hour == r.hour && timeinfo.tm_min == r.minute) {
                 PresentReminder(Reminder::Type::Schedule, r.message, r.emotion,
                                 Lang::Sounds::OGG_POPUP, true);
+                UnlockReminder();
                 return;
             }
         }
+        UnlockReminder();
     }
 
     static void reminder_timer_callback(void* arg)
@@ -826,24 +855,32 @@ private:
             return;
         }
         // The timer only enqueues; presentation and acknowledgement are owned by
-        // the reminder path (ShowNextReminder/DismissReminder via gestures).
+        // the reminder path (ShowNextReminder/DismissReminder via gestures), all
+        // serialized through reminder_mutex_.
         self->EnqueueDueReminders();
     }
 
     void HandleReminderGesture(Gesture gesture)
     {
+        LockReminder();
         switch (gesture) {
         case Gesture::Tap:
             if (reminder_.type == Reminder::Type::Drink) {
-                // Screen tap confirms "done drinking"; MarkDrinkCompleted records
-                // the habit and plays the success feedback.
+                // Screen tap confirms "done drinking". MarkDrinkCompleted plays the
+                // success feedback and leaves the success face up for its ~3s
+                // (emotion_reset_timer returns to neutral), so do NOT force an
+                // idle restore on top of it.
                 MarkDrinkCompleted();
+                reminder_.handled = true;
+                reminder_pending_ = false;
+                reminder_active_ = false;
             } else {
                 // Schedule acknowledgement: feedback only, no habit change.
                 Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+                reminder_.handled = true;
+                reminder_pending_ = false;
+                DismissReminder();
             }
-            reminder_.handled = true;
-            DismissReminder();
             break;
         case Gesture::LongPress:
             // Ignore/snooze the reminder; bounded retry, then quiet.
@@ -852,6 +889,7 @@ private:
                      reminder_snooze_count_, kReminderMaxSnooze);
             if (reminder_snooze_count_ >= kReminderMaxSnooze) {
                 reminder_.handled = true;
+                reminder_pending_ = false;
                 reminder_quiet_until_ms_ = esp_timer_get_time() / 1000 + kDrinkReminderIntervalMs;
                 ESP_LOGI(TAG, "Reminder given up after %d ignores; quiet", reminder_snooze_count_);
             }
@@ -861,6 +899,7 @@ private:
             // Mode navigation (swipes) is blocked while a reminder is active.
             break;
         }
+        UnlockReminder();
     }
 
     void InitializeReminderTimer()
@@ -1545,6 +1584,10 @@ public:
             esp_timer_delete(reminder_timer_);
             reminder_timer_ = nullptr;
         }
+        if (reminder_mutex_ != nullptr) {
+            vSemaphoreDelete(reminder_mutex_);
+            reminder_mutex_ = nullptr;
+        }
 
         // Disable temperature sensor
         if (temp_sensor != NULL) {
@@ -1573,6 +1616,10 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
+
+        if (reminder_mutex_ == nullptr) {
+            reminder_mutex_ = xSemaphoreCreateMutex();
+        }
 
         InitializeI2c();
         uint8_t pcb_version = DetectPcbVersion();
