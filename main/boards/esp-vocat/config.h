@@ -90,4 +90,21 @@
 // (Mode mode_ = Mode::Chat, kModeIdleTimeoutMs) live in esp_vocat.cc at
 // namespace scope and as EspVocat members, not in this config header.
 
+// Two-level power save (spec §6.1):
+//   ① Light power save (display sleep) after DISPLAY_SLEEP_TIMEOUT_SECONDS of
+//     eligible idle: screen/backlight off, wake word stays on.
+//   ② Deep power save (light sleep) after LIGHT_SLEEP_TIMEOUT_SECONDS: reuse the
+//     common PowerSaveTimer to lower CPU, disable wake word/audio input, and
+//     (when CONFIG_PM_ENABLE is set) enter light sleep woken by the cap pad.
+#define DISPLAY_SLEEP_TIMEOUT_SECONDS   30
+#define LIGHT_SLEEP_TIMEOUT_SECONDS     60
+
+// Fallback GPIO wake sources (LCD touch INT GPIO10 and BOOT GPIO0) are both
+// active-low. ESP32-S3 light-sleep GPIO wake is level based and each GPIO is
+// armed individually via gpio_wakeup_enable(). Left disabled until the board's
+// polarity and wake capability are confirmed on hardware; the outer capacitive
+// pad (esp_sleep_enable_touchpad_wakeup on TOUCH_PAD1/TOUCH_PAD2) is the
+// preferred wake source and is always armed.
+#define VOCAT_ENABLE_GPIO_WAKEUP        0
+
 #endif // _BOARD_CONFIG_H_
