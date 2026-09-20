@@ -729,13 +729,13 @@ private:
     void HandleEmotionLearningGesture(Gesture gesture)
     {
         switch (gesture) {
-        case Gesture::SwipeLeft:  // next emotion
-            ShowEmotionLearningNext();
-            break;
-        case Gesture::SwipeRight:  // previous emotion
+        case Gesture::SwipeLeft:  // previous emotion
             current_emotion_index_ =
                 (current_emotion_index_ + kEmotionLearningCount - 1) % kEmotionLearningCount;
             ShowEmotionLearningCurrent();
+            break;
+        case Gesture::SwipeRight:  // next emotion
+            ShowEmotionLearningNext();
             break;
         case Gesture::Tap:  // feedback for the current emotion
             ShowEmotionLearningCurrent();
@@ -752,11 +752,11 @@ private:
     void HandleYogaGesture(Gesture gesture)
     {
         switch (gesture) {
-        case Gesture::SwipeLeft:  // next pose
-            ShowNextYogaPose();
-            break;
-        case Gesture::SwipeRight:  // previous pose
+        case Gesture::SwipeLeft:  // previous pose
             ShowPrevYogaPose();
+            break;
+        case Gesture::SwipeRight:  // next pose
+            ShowNextYogaPose();
             break;
         case Gesture::Tap:  // replay the current pose
             ShowYogaPose();
