@@ -8,15 +8,18 @@
 #include "display/emote_display.h"
 #include "display/lcd_display.h"
 #include "esp_video.h"
+#include "power_save_timer.h"
 #include "settings.h"
 #include "wifi_board.h"
 
 #include <esp_log.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <time.h>
 #include <cinttypes>
 #include <mutex>
+#include "driver/touch_sensor_common.h"
 #include "esp_idf_version.h"
 
 #define ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0))
@@ -451,6 +454,14 @@ public:
 
     void ResetPressCount() { press_count_ = 0; }
 
+    // Clear the press/release tracking so the next touch reads as a fresh
+    // transition. Used on light-sleep wake so a stale LCD edge cannot produce
+    // an accidental tap, mode entry, drink confirmation, or chat toggle.
+    void ResetTouchState() {
+        was_touched_ = false;
+        press_count_ = 0;
+    }
+
     // Semaphore management methods
     SemaphoreHandle_t GetTouchSemaphore() { return touch_isr_mux_; }
 
@@ -628,6 +639,17 @@ private:
         30000;  // Idle timeout (ms) before returning to chat
     esp_timer_handle_t mode_idle_timer_ = nullptr;
 
+    // Two-level power save (spec §6.1). Level 1 is a 1s tick that turns off the
+    // display after DISPLAY_SLEEP_TIMEOUT_SECONDS of eligible idle while keeping
+    // the wake word available. Level 2 reuses the common PowerSaveTimer for a
+    // light sleep after LIGHT_SLEEP_TIMEOUT_SECONDS, gated by UpdatePowerSaveEligibility().
+    PowerSaveTimer* power_save_timer_ = nullptr;
+    esp_timer_handle_t display_sleep_timer_ = nullptr;
+    int display_idle_ticks_ = 0;         // seconds since the last eligible interaction
+    bool display_sleep_active_ = false;  // level-1 display sleep is on
+    static constexpr int kDisplaySleepTimeoutSeconds = DISPLAY_SLEEP_TIMEOUT_SECONDS;
+    static constexpr int kLightSleepTimeoutSeconds = LIGHT_SLEEP_TIMEOUT_SECONDS;
+
     static void mode_idle_timer_callback(void* arg) {
         auto* self = static_cast<EspVocat*>(arg);
         if (self == nullptr || self->mode_ == Mode::Chat) {
@@ -637,6 +659,9 @@ private:
     }
 
     void OnGesture(Gesture gesture) {
+        // Any normalized gesture is interaction: reset both power-save countdowns
+        // and wake the display if it had fallen to level-1 sleep (spec §6.2).
+        TouchPowerSaveActivity();
         ResetModeIdleTimer();
         // Reminder-first routing: while a reminder is active, its acknowledgement
         // owns all screen gestures; mode navigation is blocked until handled.
@@ -663,6 +688,8 @@ private:
         }
         mode_ = mode;
         ResetModeIdleTimer();
+        // A mode is a high-priority presentation: it must not light-sleep (spec §6.1).
+        UpdatePowerSaveEligibility();
     }
 
     void ExitToChat() {
@@ -673,6 +700,8 @@ private:
         if (mode_idle_timer_ != nullptr) {
             esp_timer_stop(mode_idle_timer_);
         }
+        // Back in the root Chat state: re-allow light sleep if no reminder is up.
+        UpdatePowerSaveEligibility();
         // Return to the standby idle presentation (Chat → idle pet animation).
         ResetToStandby();
     }
@@ -881,6 +910,9 @@ private:
         if (!reminder_active_ || display_ == nullptr) {
             return;
         }
+        // A due reminder is interaction: wake the display so it is actually
+        // visible even if it had fallen to level-1 display sleep.
+        TouchPowerSaveActivity();
         // A newly shown reminder supersedes any pending deferred standby-restore.
         CancelReminderRestore();
         presentation_ = Presentation::Reminder;
@@ -896,6 +928,8 @@ private:
             return;
         }
         reminder_active_ = false;
+        // A reminder must not light-sleep while shown; re-allow it once resolved.
+        UpdatePowerSaveEligibility();
         ResetToStandby();
     }
 
@@ -909,6 +943,9 @@ private:
         reminder_active_ = true;
         reminder_pending_ = true;
         reminder_shown_ms_ = esp_timer_get_time() / 1000;
+        // A reminder is a high-priority presentation: suspend light sleep while
+        // it is shown (spec §6.1).
+        UpdatePowerSaveEligibility();
         ShowNextReminder();
     }
 
@@ -1078,91 +1115,157 @@ private:
         ShowTemporaryEmotion("happy", 2000);
     }
 
-    void PlayBatteryEmotion(const char* emotion, uint32_t duration_ms) {
-#if CONFIG_USE_EMOTE_MESSAGE_STYLE
-        if (display_ == nullptr || emotion == nullptr) {
+    // ---- Two-level power save (spec §6.1 / §6.2) ------------------------------
+
+    // Called on every interaction (gesture, BOOT, reminder, mode entry, audio):
+    // reset both power-save countdowns and wake the display from level-1 sleep.
+    void TouchPowerSaveActivity() {
+        display_idle_ticks_ = 0;
+        if (power_save_timer_ != nullptr) {
+            // Resets its count and, if the chip woke from a light sleep, exits
+            // sleep mode (restoring wake word, CPU config, and the display).
+            power_save_timer_->WakeUp();
+        }
+        WakeDisplay();
+    }
+
+    // Level-1: turn off the display and backlight. Wake word/audio stay on.
+    void EnterDisplayPowerSave() {
+        if (display_sleep_active_) {
             return;
         }
-        if (display_->InsertAnimDialog(emotion, duration_ms)) {
+        display_sleep_active_ = true;
+        if (display_ != nullptr) {
+            display_->SetPowerSaveMode(true);
+        }
+        if (backlight_ != nullptr) {
+            backlight_->SetBrightness(0);
+        }
+        ESP_LOGI(TAG, "Display sleep after %ds idle (wake word stays on)",
+                 kDisplaySleepTimeoutSeconds);
+    }
+
+    // Restore the backlight and the presentation for the current mode.
+    void WakeDisplay() {
+        if (!display_sleep_active_) {
             return;
         }
+        display_sleep_active_ = false;
+        if (backlight_ != nullptr) {
+            backlight_->RestoreBrightness();
+        }
+        if (display_ != nullptr) {
+            display_->SetPowerSaveMode(false);
+        }
+        ResetToStandby();
+        ESP_LOGI(TAG, "Display woken");
+    }
+
+    // Arm the wake sources for level-2 light sleep. The outer capacitive pad is
+    // the preferred wake source (spec §6.2): esp_sleep_enable_touchpad_wakeup()
+    // uses the TOUCH_PAD1/TOUCH_PAD2 channels the cap sensor already configured.
+    void ConfigureWakeSources() {
+        esp_sleep_enable_touchpad_wakeup();
+#if VOCAT_ENABLE_GPIO_WAKEUP
+        // Fallback wake sources: LCD touch INT (GPIO10) and BOOT (GPIO0), both
+        // active-low. ESP32-S3 light-sleep GPIO wake is level based and each pin
+        // is armed individually with gpio_wakeup_enable(). Left off until the
+        // board's polarity and wake capability are confirmed on hardware.
+        gpio_wakeup_enable(TP_PIN_NUM_INT, GPIO_WAKEUP_LOW);
+        gpio_wakeup_enable(BOOT_BUTTON_GPIO, GPIO_WAKEUP_LOW);
+        esp_sleep_enable_gpio_wakeup();
 #endif
-        ShowTemporaryEmotion(emotion, duration_ms);
     }
 
-    void StartLowBatteryAlertSequence() {
-        constexpr int kMaxPlays = 3;
-        constexpr int64_t kIntervalMs = 5 * 60 * 1000;
-
-        low_battery_plays_left_ = kMaxPlays - 1;
-        next_low_battery_play_ms_ = (esp_timer_get_time() / 1000) + kIntervalMs;
-        PlayBatteryEmotion("low_battery", 4000);
+    // Step 5: after a light-sleep wake, the first edge can be stale. Reset the
+    // LCD touch tracking so the wake touch cannot yield an accidental tap, mode
+    // entry, drink confirmation, or chat toggle, and discard any latched cap-pad
+    // wake edge. Safe to call from the light-sleep exit path (never from inside
+    // a cap-sensor callback). The cap surface only ever yields a feedback-only
+    // Pet, so its own edges are benign.
+    void ClearStaleWakeTouch() {
+        if (cst816s_ != nullptr) {
+            cst816s_->ResetTouchState();
+        }
+        swipe_start_recorded_ = false;
+        touch_pad_clear_status();
     }
 
-    void HandleBatteryEmotions() {
-        if (charge_ == nullptr) {
+    // Gate level-2 light sleep to the root Chat mode outside a reminder; the
+    // PowerSaveTimer itself additionally requires Application::CanEnterSleepMode().
+    void UpdatePowerSaveEligibility() {
+        if (power_save_timer_ == nullptr) {
             return;
         }
-
-        int level;
-        bool charging, discharging;
-        if (!charge_->GetSnapshot(level, charging, discharging))
-            return;
-        if (!battery_status_initialized_) {
-            was_charging_ = charging;
-            battery_status_initialized_ = true;
-        }
-
-        if (charging && !was_charging_) {
-            PlayBatteryEmotion("battery_connected", 4000);
-            low_battery_alert_mask_ = 0;
-            low_battery_plays_left_ = 0;
-            next_low_battery_play_ms_ = 0;
-        }
-        was_charging_ = charging;
-
-        if (charging) {
-            return;
-        }
-
-        if (level > 12) {
-            low_battery_alert_mask_ = 0;
-            low_battery_plays_left_ = 0;
-            next_low_battery_play_ms_ = 0;
-            return;
-        }
-
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        if (low_battery_plays_left_ > 0 && now_ms >= next_low_battery_play_ms_) {
-            PlayBatteryEmotion("low_battery", 4000);
-            low_battery_plays_left_--;
-            if (low_battery_plays_left_ > 0) {
-                next_low_battery_play_ms_ = now_ms + 5 * 60 * 1000;
-            }
-        }
-
-        if (level <= 5 && (low_battery_alert_mask_ & 0x02) == 0) {
-            low_battery_alert_mask_ |= 0x02;
-            StartLowBatteryAlertSequence();
-            return;
-        }
-
-        if (level <= 10 && (low_battery_alert_mask_ & 0x01) == 0) {
-            low_battery_alert_mask_ |= 0x01;
-            StartLowBatteryAlertSequence();
-        }
+        bool eligible = (mode_ == Mode::Chat) && !reminder_active_;
+        power_save_timer_->SetEnabled(eligible);
     }
 
-    static void battery_task(void* arg) {
+    static void display_sleep_tick_callback(void* arg) {
         auto* self = static_cast<EspVocat*>(arg);
-        while (true) {
-            bool healthy = false;
-            if (self != nullptr && self->charge_ != nullptr) {
-                healthy = self->charge_->Update();
-                if (healthy)
-                    self->HandleBatteryEmotions();
+        if (self != nullptr) {
+            self->OnDisplaySleepTick();
+        }
+    }
+
+    // Level-1 countdown. Only the root Chat mode, with no active reminder and a
+    // standby presentation, and only when the application is genuinely idle
+    // (kDeviceStateIdle, no audio/protocol activity), may sleep the display.
+    void OnDisplaySleepTick() {
+        if (display_sleep_active_) {
+            return;  // already at level 1
+        }
+        auto& app = Application::GetInstance();
+        bool eligible = (mode_ == Mode::Chat) && !reminder_active_ &&
+                        (presentation_ == Presentation::Standby) && app.CanEnterSleepMode();
+        if (!eligible) {
+            display_idle_ticks_ = 0;
+            return;
+        }
+        display_idle_ticks_++;
+        if (display_idle_ticks_ >= kDisplaySleepTimeoutSeconds) {
+            EnterDisplayPowerSave();
+        }
+    }
+
+    void InitializePowerSave() {
+        // Level-2 light sleep via the common PowerSaveTimer. A real cpu_max_freq
+        // makes it lower the CPU and (when CONFIG_PM_ENABLE is set) light-sleep,
+        // disabling wake-word/audio input through its existing helper behaviour.
+        power_save_timer_ = new PowerSaveTimer(240, kLightSleepTimeoutSeconds, -1);
+        power_save_timer_->OnEnterSleepMode([this]() {
+            ESP_LOGI(TAG, "Entering light sleep (level 2)");
+            // Build on level 1: ensure the display/backlight are off.
+            display_sleep_active_ = true;
+            if (display_ != nullptr) {
+                display_->SetPowerSaveMode(true);
             }
-            vTaskDelay(pdMS_TO_TICKS(healthy ? 2000 : 5000));
+            if (backlight_ != nullptr) {
+                backlight_->SetBrightness(0);
+            }
+            ConfigureWakeSources();
+        });
+        power_save_timer_->OnExitSleepMode([this]() {
+            ESP_LOGI(TAG, "Exiting light sleep (woke)");
+            ClearStaleWakeTouch();
+            WakeDisplay();
+        });
+
+        // Level-1 display sleep: separate 1s periodic timer, wake word stays on.
+        esp_timer_create_args_t sleep_timer_args = {
+            .callback = &EspVocat::display_sleep_tick_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "sleep_1s",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&sleep_timer_args, &display_sleep_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(display_sleep_timer_, 1000000));
+
+        // Begin counting to light sleep; Chat root with no reminder is eligible.
+        UpdatePowerSaveEligibility();
+        if (power_save_timer_ != nullptr) {
+            power_save_timer_->SetEnabled(true);
         }
     }
 
@@ -1817,6 +1920,8 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
+            // A BOOT press is interaction: wake the display / exit light sleep.
+            TouchPowerSaveActivity();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 ESP_LOGI(TAG, "Boot button pressed, enter WiFi configuration mode");
                 EnterWifiConfigMode();
@@ -1922,6 +2027,13 @@ public:
             esp_timer_delete(reminder_restore_timer_);
             reminder_restore_timer_ = nullptr;
         }
+        if (display_sleep_timer_ != nullptr) {
+            esp_timer_stop(display_sleep_timer_);
+            esp_timer_delete(display_sleep_timer_);
+            display_sleep_timer_ = nullptr;
+        }
+        delete power_save_timer_;
+        power_save_timer_ = nullptr;
 
         // Disable temperature sensor
         if (temp_sensor != NULL) {
@@ -1974,9 +2086,7 @@ public:
         InitializeButtons();
         LoadHabitState();
         InitializeReminderTimer();
-#if ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR
-        InitializeCapacitiveTouchPads();
-#endif
+        InitializePowerSave();
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
         InitializeCamera();
 #endif  // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
