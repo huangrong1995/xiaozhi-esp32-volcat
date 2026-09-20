@@ -599,7 +599,7 @@ private:
     static void mode_idle_timer_callback(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
-        if (self == nullptr || self->mode_ == Mode::Chat) {
+        if (self == nullptr || self->mode_ == Mode::Chat || self->reminder_active_) {
             return;
         }
         self->ExitToChat();
@@ -1083,7 +1083,11 @@ private:
         }
         outer_touch_last_us_ = now;
         OnGesture(Gesture::Pet);
-        ShowTemporaryEmotion("happy", 2000);
+        // While a reminder is active, it is the highest-priority presentation
+        // (spec §3.4): suppress pet feedback so it does not overwrite it.
+        if (!reminder_active_) {
+            ShowTemporaryEmotion("happy", 2000);
+        }
     }
 
     // ---- Two-level power save (spec §6.1 / §6.2) ------------------------------
@@ -1228,6 +1232,12 @@ private:
         power_save_timer_->OnExitSleepMode([this]() {
             ESP_LOGI(TAG, "Exiting light sleep (woke)");
             ClearStaleWakeTouch();
+            // Re-enable the audio codec input, mirroring the level-2 enter
+            // path that disabled it (spec §6.2).
+            auto* codec = Board::GetInstance().GetAudioCodec();
+            if (codec != nullptr) {
+                codec->EnableInput(true);
+            }
             WakeDisplay();
         });
 
@@ -1941,14 +1951,17 @@ public:
             esp_timer_delete(reminder_timer_);
             reminder_timer_ = nullptr;
         }
-        if (reminder_mutex_ != nullptr) {
-            vSemaphoreDelete(reminder_mutex_);
-            reminder_mutex_ = nullptr;
-        }
+        // Stop/delete reminder_restore_timer_ before reminder_mutex_: its
+        // callback locks reminder_mutex_, so it must not fire after the mutex
+        // is freed.
         if (reminder_restore_timer_ != nullptr) {
             esp_timer_stop(reminder_restore_timer_);
             esp_timer_delete(reminder_restore_timer_);
             reminder_restore_timer_ = nullptr;
+        }
+        if (reminder_mutex_ != nullptr) {
+            vSemaphoreDelete(reminder_mutex_);
+            reminder_mutex_ = nullptr;
         }
         if (display_sleep_timer_ != nullptr) {
             esp_timer_stop(display_sleep_timer_);
