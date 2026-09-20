@@ -2,11 +2,7 @@
 
 ## 简介
 
-<div align="center">
-    <a href="https://oshwhub.com/esp-college/echoear"><b> 立创开源平台 </b></a>
-</div>
-
-ESP-VoCat 喵伴是一款智能 AI 开发套件，搭载 ESP32-S3-WROOM-1 模组，1.85 寸 QSPI 圆形触摸屏，双麦阵列，支持离线语音唤醒与声源定位算法。硬件详情等可查看[立创开源项目](https://oshwhub.com/esp-college/echoear)。
+ESP-VoCat 喵伴是一款智能 AI 开发套件，搭载 ESP32-S3-WROOM-1 模组，1.85 寸 QSPI 圆形触摸屏，双麦阵列，支持离线语音唤醒与声源定位算法。
 
 ## 硬件规格
 
@@ -20,101 +16,30 @@ ESP-VoCat 喵伴是一款智能 AI 开发套件，搭载 ESP32-S3-WROOM-1 模组
 - 离线语音唤醒
 - AI 对话 (小智 / Qwen / DeepSeek)
 - MCP 协议 IoT 控制
-- 触摸交互 (单击/双击/长按/三击)
-- 情绪学习模式
-- 定时提醒
+- 触摸交互 (单击/长按/左右滑/倾斜/外圈抚摸)
+- 情绪学习模式、瑜伽挑战模式
+- 统一喝水/整点提醒队列
+- 两级节能 (关屏 / 浅睡眠) + 外圈电容唤醒
 - 待机表情动画
 
-## 配置、编译命令
+## 编译烧录
 
 **环境准备**:
-
 ```bash
 source /home/hrong/workspace/code/esp-idf-5.5/export.sh
 ```
 
 **编译**:
-
 ```bash
 python3 scripts/release.py esp-vocat
 ```
 
-**配置编译目标为 ESP32S3**
-
-```bash
-idf.py set-target esp32s3
-```
-
-**打开 menuconfig 并配置**
-
-```bash
-idf.py menuconfig
-```
-
-分别配置如下选项：
-
-### 基本配置
-- `Xiaozhi Assistant` → `Board Type` → 选择 `Espressif ESP-VoCat`
-
-### UI风格选择
-
-ESP-VoCat 支持多种不同的 UI 显示风格，通过 menuconfig 配置选择：
-
-- `Xiaozhi Assistant` → `Select display style` → 选择显示风格
-
-#### 可选风格
-
-##### 表情动画风格 (Emote animation style) - 推荐
-- **配置选项**: `USE_EMOTE_MESSAGE_STYLE`
-- **特点**: 使用自定义的 `EmoteDisplay` 表情显示系统
-- **功能**: 支持丰富的表情动画、眼睛动画、状态图标显示
-- **适用**: 智能助手场景，提供更生动的人机交互体验
-- **类**: `emote::EmoteDisplay`
-
-**⚠️ 重要**: 选择此风格需要额外配置自定义资源文件：
-1. `Xiaozhi Assistant` → `Flash Assets` → 选择 `Flash Custom Assets`
-2. `Xiaozhi Assistant` → `Custom Assets File` → 填入资源文件地址：
-   ```
-   https://dl.espressif.com/AE/wn9_nihaoxiaozhi_tts-font_puhui_common_20_4-echoear.bin
-   ```
-
-   这是保留表情动画和模型的历史资源包；新版固件会忽略其中没有 Noto 元数据的旧 Puhui
-   字体，并使用内置 Noto basic 字体。待新的 Noto 资源包上传后可直接替换此 URL。
-
-##### 默认消息风格 (Enable default message style)
-- **配置选项**: `USE_DEFAULT_MESSAGE_STYLE` (默认)
-- **特点**: 使用标准的消息显示界面
-- **功能**: 传统的文本和图标显示界面
-- **适用**: 标准的对话场景
-- **类**: `SpiLcdDisplay`
-
-##### 微信消息风格 (Enable WeChat Message Style)
-- **配置选项**: `USE_WECHAT_MESSAGE_STYLE`
-- **特点**: 仿微信聊天界面风格
-- **功能**: 类似微信的消息气泡显示
-- **适用**: 喜欢微信风格的用户
-- **类**: `SpiLcdDisplay`
-
-> **说明**: ESP-VoCat 喵伴使用16MB Flash，需要使用专门的分区表配置来合理分配存储空间给应用程序、OTA更新、资源文件等。
-
-按 `S` 保存，按 `Q` 退出。
-
-**编译**
-
-```bash
-idf.py build
-```
-
-**烧录**
-
-将 ESP-VoCat 喵伴连接至电脑，**注意打开电源**，并运行：
-
+**烧录**:
 ```bash
 idf.py -p /dev/ttyACM0 flash
 ```
 
-**查看日志**
-
+**查看日志**:
 ```bash
 idf.py -p /dev/ttyACM0 monitor
 ```
@@ -127,80 +52,110 @@ picocom -b 115200 /dev/ttyACM0
 # Windows: 使用串口工具连接 COM10
 ```
 
-## Peripheral I2C error handling
+## 交互模式与状态机
 
-Battery register reads run on the battery worker, with at most three attempts
-for timeout/invalid-response/transfer failures, a 50 ms transfer timeout and
-10/20 ms retry delays. Other errors return immediately. Successful sampling
-runs every two seconds; a failed cycle backs off for five seconds and does not
-trigger battery emotes. The worker's own failure warning is limited to once
-per ten seconds; driver logging is unchanged.
+交互以**屏幕为主，外圈为辅**。所有物理输入先被归一化为统一手势（`Gesture`），再交给集中分发入口 `OnGesture()`，按当前模式（`Mode`）路由到对应行为。`Chat` 是唯一根状态，情绪学习与瑜伽都有显式退出路径和 30 秒无操作自动退出兜底。**单击/长按/左滑/右滑/倾斜/外圈抚摸**是唯一保留的全部手势，**双击与三击已移除**。
 
-Battery status queries use a mutex-protected, complete last-good snapshot
-instead of performing transfers in UI callbacks. Samples expire after ten
-seconds; absent/stale readings return `false`, never a fabricated empty battery.
-Touch performs one checked transfer and skips gesture processing on failure,
-so a failed read cannot synthesize a release. The first valid battery sample
-establishes the initial charging state without a false charger-insertion event.
+### 模式切换表
 
-This contains peripheral read errors; it does not diagnose power instability,
-reset the shared bus, change codec startup or disable watchdog/brownout checks.
-Temperature sensor handling is unchanged. Host regression tests use an I2C
-failure double and do not replace physical fault injection:
+| 当前模式 | 手势 | 目标 |
+|---|---|---|
+| `Chat`（对话） | 屏幕右滑 | 进入瑜伽挑战 |
+| `Chat` | 屏幕左滑 | 进入情绪学习 |
+| `Chat` | 屏幕单击 / BOOT 键 | 开始/停止对话 |
+| `EmotionLearning` | 屏幕长按 | 退回 `Chat` |
+| `EmotionLearning` | 30s 无操作 | 自动退回 `Chat` |
+| `Yoga` | 屏幕长按 | 退回 `Chat` |
+| `Yoga` | 30s 无操作 | 自动退回 `Chat` |
+| `Yoga` | 完成全部动作 | 播放完成反馈并退回 `Chat` |
 
-```bash
-python3 -m unittest discover -s scripts/tests -p test_esp_vocat_i2c.py -v
-```
+> 任意手势都会重置节能倒计时和模式空闲计时。
 
-## 触摸交互功能
+## 屏幕手势交互
 
-### 触摸手势
+### 日常模式 `Chat`（根状态）
 
-| 手势 | 触发条件 | 反馈效果 |
-|------|----------|----------|
-| 单击 | 触碰后 < 350ms 松开 | 开心表情 (2秒) + 音效 |
-| 双击 | 350ms 内连续触碰两次 | 惊讶表情 (2.5秒) + 双音效 |
-| 长按 | 按住 > 1.2秒后松开 | 切换静音模式 + 震动音效 |
-| 三击 | 500ms 内连续触碰三次 | 进入情绪学习模式 |
+| 手势 | 功能 | 说明 |
+|------|------|------|
+| 屏幕单击 | 开始/停止一次对话 | 唯一的语义点击源 |
+| 屏幕长按 | 取消/操作提示反馈 | 不再切换静音、不再记录喝水 |
+| 屏幕右滑 | 进入瑜伽挑战 | |
+| 屏幕左滑 | 进入情绪学习 | |
+| IMU 甩动 | 播放"被摇晃"反馈 | 仅在此模式生效 |
+| 外圈抚摸/滑动 | 轻量互动反馈 | 仅做陪伴反馈，不改变模式、不切换对话 |
+| BOOT 物理键 | 开始/停止对话 | 对话兜底；启动阶段仍进入 Wi-Fi 配网 |
 
-### 情绪学习模式
+> 手势与对话的关系：**滑动绝不切换对话**，只有单击和 BOOT 键才切换对话。
 
-三击进入情绪学习模式，用于教儿童识别不同表情：
+### 情绪学习模式 `EmotionLearning`
 
-**使用方法：**
-1. 在待机状态下，快速连续触碰三次进入学习模式
-2. 屏幕显示当前表情（开心/伤心/生气/惊讶/困惑/困了/喜欢/平静）
-3. 每次单击切换到下一个表情
-4. 长按退出学习模式
+用于教儿童识别不同表情（开心、伤心、生气、惊讶、困惑、困了、喜欢、平静）：
 
-**学习的表情：**
-- 开心 (happy)
-- 伤心 (sad)
-- 生气 (angry)
-- 惊讶 (shocked)
-- 困惑 (confused)
-- 困了 (sleepy)
-- 喜欢 (loving)
-- 平静 (neutral)
+| 手势 | 功能 |
+|------|------|
+| 屏幕左滑 | 下一个情绪 |
+| 屏幕右滑 | 上一个情绪 |
+| 屏幕单击 | 播放当前情绪的名称/示范 |
+| 屏幕长按 | 退出情绪学习，退回 `Chat` |
+| 外圈抚摸 | 只做陪伴反馈，不切换内容 |
+| 30s 无操作 | 自动退出，退回 `Chat` |
 
-## 定时提醒功能
+### 瑜伽挑战模式 `Yoga`
 
-设备会在以下时间自动播放提醒：
+| 手势 | 功能 |
+|------|------|
+| 屏幕单击 | 重播当前动作提示 |
+| 屏幕左滑 | 下一个动作 |
+| 屏幕右滑 | 上一个动作 |
+| IMU 倾斜 | 检查当前动作是否完成 |
+| 屏幕长按 | 退出瑜伽，退回 `Chat` |
+| 30s 无操作 | 自动退出，退回 `Chat` |
+| 完成全部动作 | 播放完成反馈并退出 |
 
-| 时间 | 提醒内容 | 显示表情 |
-|------|----------|----------|
-| 08:00 | 该起床了~ | 开心 |
-| 12:00 | 该吃午饭了~ | 开心 |
-| 14:00 | 该睡午觉了~ | 困了 |
-| 18:00 | 该吃晚饭了~ | 开心 |
-| 21:00 | 该睡觉了~ | 困了 |
+> 完成动作时的反馈顺序：当前动作箭头 → 检测到正确姿势 → 短暂成功表情和音效 → 显示下一动作，避免表情覆盖箭头。
 
-提醒触发时：播放提示音两次 + 显示对应表情 5 秒。
+## 提醒与喝水
 
-## 待机表情动画
+提醒（喝水周期 + 5 个整点日程）统一进单一队列，一次只弹一条。提醒为最高优先级表现层，显示期间屏幕手势由提醒主导，模式导航被遮挡，直到处理完。
 
-设备在待机状态下，每 30 秒自动切换一次表情：
+| 操作 | 行为 |
+|------|------|
+| 屏幕单击 | 确认；若为喝水提醒则记录喝水打卡并播放成功反馈，否则仅确认 |
+| 屏幕长按 | 忽略本次提醒（可重复，最多 N 次后静默，延迟再提醒） |
+| 无操作 | 延迟后再提醒，最多 N 次后静默 |
 
-**表情循环：** 开心 → 困惑 → 生气 → 惊讶 → 开心
+> 喝水打卡不再使用隐式手势（移除"长按=打卡"），统一为提醒出现时的**屏幕单击确认**。
 
-切换到倾听或说话状态时会暂停动画。
+## 节能与唤醒（两级节能）
+
+| 阶段 | 无操作阈值 | 动作 | 唤醒词 |
+|---|---|---|---|
+| ① 轻度节能（关屏） | 30s（可配） | 关闭背光/关屏，CPU 不降频 | ✅ 仍可用 |
+| ② 深度节能（浅睡眠） | 60s（可配） | 复用 `PowerSaveTimer` 降频 + 浅睡眠，关闭唤醒词/音频 | ❌ 靠触摸唤醒 |
+
+- 屏幕为最大耗电源，主要省电靠①关屏。
+- 两级阈值通过 `config.h` 的 `DISPLAY_SLEEP_TIMEOUT_SECONDS` / `LIGHT_SLEEP_TIMEOUT_SECONDS` 宏配置。
+- 提醒与模式状态为高优先级表现层，显示期间不进入休眠。
+- 仅在根 `Chat` 状态、无提醒、且 `Application::CanEnterSleepMode()` 为真（Idle、无音频/对话）时进入浅睡眠。
+
+### 唤醒优先级
+
+| 唤醒源 | 物理动作 | 优先级 |
+|---|---|---|
+| **外圈电容触摸垫** | 抚摸/拍打宠物身体 | ⭐ 首选 |
+| LCD 触摸屏 | 点击屏幕 | 次选（预留，待硬件验证） |
+| BOOT 物理键 | 按键 | 兜底 |
+
+从浅睡眠醒来后：恢复背光、恢复 CPU 频率、重新开启唤醒词与音频输入，回到可对话状态。
+
+> 注：②深度节能中的浅睡眠需 `CONFIG_PM_ENABLE` 生效，LCD 触摸与 BOOT 的 GPIO 唤醒源受极性与唤醒能力影响（见 `config.h` 的 `VOCAT_ENABLE_GPIO_WAKEUP`）；外圈电容垫为始终启用的首选唤醒源。此部分为待硬件验证的后续项，本说明书聚焦预期行为。
+
+## 定时提醒
+
+| 时间 | 内容 |
+|------|------|
+| 08:00 | 该起床了~ |
+| 12:00 | 该吃午饭了~ |
+| 14:00 | 该睡午觉了~ |
+| 18:00 | 该吃晚饭了~ |
+| 21:00 | 该睡觉了~ |
