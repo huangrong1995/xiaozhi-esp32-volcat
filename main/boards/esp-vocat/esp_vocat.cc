@@ -550,6 +550,22 @@ private:
     static const char* kYogaPoseDirections_[];
     static constexpr size_t kYogaPoseCount = 6;
 
+    // Yoga success feedback window: tilt matches for the same pose are ignored
+    // during the success animation so a pose is not completed twice (spec §2.3).
+    int64_t yoga_success_until_ms_ = 0;
+    static constexpr uint32_t kYogaSuccessDurationMs = 1000;
+
+    // Display presentation owner. Higher layers take priority and are restored
+    // by ResetToStandby(), so transient/mode/reminder feedback do not clobber
+    // each other or the standby idle animation (spec §3.4).
+    enum class Presentation {
+        Standby,            // idle pet animation (lowest priority)
+        Mode,               // emotion-learning / yoga presentation
+        Reminder,           // active reminder (highest priority)
+        TransientFeedback,  // short touch/shake feedback
+    };
+    Presentation presentation_ = Presentation::Standby;
+
     // Unified interaction mode state. mode_ is read/written only from the
     // interaction task/callback context (touch events and timer callbacks),
     // so it does not require locking.
@@ -606,6 +622,8 @@ private:
         if (mode_idle_timer_ != nullptr) {
             esp_timer_stop(mode_idle_timer_);
         }
+        // Return to the standby idle presentation (Chat → idle pet animation).
+        ResetToStandby();
     }
 
     void ResetModeIdleTimer()
@@ -615,6 +633,35 @@ private:
         }
         esp_timer_stop(mode_idle_timer_);
         esp_timer_start_once(mode_idle_timer_, kModeIdleTimeoutMs * 1000ULL);
+    }
+
+    // Return the display to the presentation appropriate for the current mode:
+    // the idle pet animation in Chat, the current emotion/pose inside a mode.
+    // Stops any transient animation and cannot permanently overwrite a mode
+    // or reminder presentation, so feedback layers stay isolated (spec §3.4).
+    void ResetToStandby()
+    {
+        if (display_ == nullptr) {
+            return;
+        }
+        if (emotion_reset_timer_ != nullptr) {
+            esp_timer_stop(emotion_reset_timer_);
+        }
+        auto* emote = static_cast<emote::EmoteDisplay*>(display_);
+        switch (mode_) {
+        case Mode::Chat:
+            presentation_ = Presentation::Standby;
+            emote->RestoreFromReminder();  // restarts the standby idle animation
+            break;
+        case Mode::EmotionLearning:
+            presentation_ = Presentation::Mode;
+            ShowEmotionLearningCurrent();
+            break;
+        case Mode::Yoga:
+            presentation_ = Presentation::Mode;
+            ShowYogaPose();
+            break;
+        }
     }
 
     // Per-mode gesture handlers. Note: Pet and Shake must never change mode_.
@@ -635,6 +682,12 @@ private:
             ShowTemporaryEmotion("confused", 2000);
             Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
             ESP_LOGI(TAG, "Long press help/cancel feedback");
+            break;
+        case Gesture::Shake:
+            // "被摇晃" feedback: shake is meaningful only in Chat (spec §1.3).
+            // Other modes' handlers ignore Shake, so it never advances a mode.
+            ShowTemporaryEmotion("confused", 1800);
+            ESP_LOGI(TAG, "Shake feedback (Chat mode)");
             break;
         default:
             // Ignore mode-only gestures (SwipeUp, SwipeDown, Pet, Shake,
@@ -659,7 +712,7 @@ private:
             Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
             break;
         case Gesture::LongPress:
-            ExitToChat();
+            ExitEmotionLearningMode();
             break;
         default:
             break;
@@ -670,19 +723,16 @@ private:
     {
         switch (gesture) {
         case Gesture::SwipeLeft:  // next pose
-            current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
-            ShowYogaPose();
+            ShowNextYogaPose();
             break;
         case Gesture::SwipeRight:  // previous pose
-            current_pose_index_ =
-                (current_pose_index_ + kYogaPoseCount - 1) % kYogaPoseCount;
-            ShowYogaPose();
+            ShowPrevYogaPose();
             break;
         case Gesture::Tap:  // replay the current pose
             ShowYogaPose();
             break;
         case Gesture::LongPress:
-            ExitToChat();
+            ExitYogaChallengeMode();
             break;
         default:
             break;
@@ -695,8 +745,10 @@ private:
     static void emotion_reset_timer_callback(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
-        if (self && self->display_ != nullptr) {
-            self->display_->SetEmotion("neutral");
+        // Return to the presentation appropriate for the current mode instead of
+        // blindly resetting to "neutral", which would wipe a mode/reminder state.
+        if (self != nullptr) {
+            self->ResetToStandby();
         }
     }
 
@@ -766,13 +818,15 @@ private:
     }
 
     // Deferred standby-restore used after drink confirmation, so the display
-    // returns to its idle animation once the ~3s success face has been shown.
+    // returns to its presentation once the ~3s success face has been shown.
+    // ResetToStandby() restores based on the current mode, so a mode change
+    // made while the restore was pending is not clobbered by the idle animation.
     void RestoreFromReminderDeferred()
     {
         LockReminder();
         if (reminder_restore_pending_ && display_ != nullptr) {
             reminder_restore_pending_ = false;
-            static_cast<emote::EmoteDisplay*>(display_)->RestoreFromReminder();
+            ResetToStandby();
         }
         UnlockReminder();
     }
@@ -794,6 +848,7 @@ private:
         }
         // A newly shown reminder supersedes any pending deferred standby-restore.
         CancelReminderRestore();
+        presentation_ = Presentation::Reminder;
         static_cast<emote::EmoteDisplay*>(display_)->ShowReminder(reminder_.emotion);
         Application::GetInstance().GetAudioService().PlaySound(reminder_.sound);
         ESP_LOGI(TAG, "Reminder active: %s (%s)",
@@ -807,9 +862,7 @@ private:
             return;
         }
         reminder_active_ = false;
-        if (display_ != nullptr) {
-            static_cast<emote::EmoteDisplay*>(display_)->RestoreFromReminder();
-        }
+        ResetToStandby();
     }
 
     // Callers must hold reminder_mutex_.
@@ -972,6 +1025,7 @@ private:
         if (display_ == nullptr || emotion == nullptr) {
             return;
         }
+        presentation_ = Presentation::TransientFeedback;
         display_->SetEmotion(emotion);
         if (emotion_reset_timer_ != nullptr) {
             esp_timer_stop(emotion_reset_timer_);
@@ -1020,8 +1074,10 @@ private:
                     int64_t now_ms = esp_timer_get_time() / 1000;
                     if (shake_score > kShakeDeltaThreshold && (now_ms - last_shake_ms) > kShakeCooldownMs) {
                         last_shake_ms = now_ms;
-                        // "dizzy/nauseated" are not guaranteed in current assets, use supported fallback.
-                        self->ShowTemporaryEmotion("confused", 1800);
+                        // Shake is a mode-aware gesture: OnGesture() resets the idle
+                        // timer and only Chat handles it (spec §1.3/§2.1), so a shake
+                        // never silently extends a mode.
+                        self->OnGesture(Gesture::Shake);
                     }
                 }
                 prev = cur;
@@ -1276,6 +1332,9 @@ private:
     void ShowEmotionLearningCurrent()
     {
         if (display_ != nullptr) {
+            // Emotion-learning is a Mode presentation: it must not be clobbered
+            // by transient feedback or the standby idle animation.
+            presentation_ = Presentation::Mode;
             const char* emotion = kEmotionLearningEmotions_[current_emotion_index_];
             display_->SetEmotion(emotion);
             ESP_LOGI(TAG, "Emotion: %s (%s)", emotion, kEmotionLearningNames_[current_emotion_index_]);
@@ -1295,6 +1354,7 @@ private:
         }
         EnterMode(Mode::Yoga);
         current_pose_index_ = 0;
+        yoga_success_until_ms_ = 0;  // start fresh: no success cooldown pending
         ShowYogaPose();
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
         ESP_LOGI(TAG, "Entered yoga challenge mode");
@@ -1313,11 +1373,29 @@ private:
     void ShowYogaPose()
     {
         if (display_ != nullptr) {
+            // Yoga is a Mode presentation: the arrow must not be overwritten by
+            // transient feedback or the standby idle animation (spec §2.3).
+            presentation_ = Presentation::Mode;
             const char* direction = kYogaPoseDirections_[current_pose_index_];
-            // Use DrawArrow to directly draw arrow on LCD panel
             static_cast<emote::EmoteDisplay*>(display_)->DrawArrow(direction);
             ESP_LOGI(TAG, "Yoga pose: %s (%s)", kYogaPoseNames_[current_pose_index_], direction);
         }
+    }
+
+    // Deterministic pose navigation with wraparound (spec §2.3).
+    void ShowNextYogaPose()
+    {
+        current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
+        yoga_success_until_ms_ = 0;  // a manually navigated pose is immediately matchable
+        ShowYogaPose();
+    }
+
+    void ShowPrevYogaPose()
+    {
+        current_pose_index_ =
+            (current_pose_index_ + kYogaPoseCount - 1) % kYogaPoseCount;
+        yoga_success_until_ms_ = 0;
+        ShowYogaPose();
     }
 
     void CheckYogaPoseMatch(const char* motion_direction)
@@ -1325,15 +1403,37 @@ private:
         if (mode_ != Mode::Yoga) {
             return;
         }
-        const char* target = kYogaPoseDirections_[current_pose_index_];
-        if (strcmp(motion_direction, target) == 0) {
-            ESP_LOGI(TAG, "Correct! Moving to next pose");
-            ShowTemporaryEmotion("happy", 1000);
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-            current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
-            vTaskDelay(pdMS_TO_TICKS(500));
-            ShowYogaPose();
+        // Ignore duplicate tilt matches during the success window so the same
+        // pose is not completed twice (spec §2.3 feedback order).
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms < yoga_success_until_ms_) {
+            return;
         }
+        const char* target = kYogaPoseDirections_[current_pose_index_];
+        if (strcmp(motion_direction, target) != 0) {
+            return;
+        }
+
+        // Correct pose matched: block further matches, then success feedback.
+        // ShowTemporaryEmotion() arms emotion_reset_timer, which calls
+        // ResetToStandby() → ShowYogaPose() once the success emotion has been
+        // shown for kYogaSuccessDurationMs, redrawing the (advanced) arrow.
+        yoga_success_until_ms_ = now_ms + kYogaSuccessDurationMs;
+        ShowTemporaryEmotion("happy", kYogaSuccessDurationMs);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+
+        if (current_pose_index_ == kYogaPoseCount - 1) {
+            // Completed all poses: completion feedback then return to Chat.
+            ESP_LOGI(TAG, "Yoga challenge complete!");
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+            ExitYogaChallengeMode();
+            return;
+        }
+
+        // Advance to the next pose; ResetToStandby() draws its arrow after the
+        // success face has been shown for its duration.
+        current_pose_index_++;
+        ESP_LOGI(TAG, "Correct! Next pose: %s", kYogaPoseDirections_[current_pose_index_]);
     }
 
     void ProcessImuForYoga()
@@ -1371,6 +1471,10 @@ private:
                 }
             }
             if (direction != nullptr) {
+                // A tilt is a meaningful Yoga interaction: keep the mode alive.
+                // (This is the IMU-mode-aware path, distinct from the Chat-only
+                // shake path, per spec §2.3.)
+                ResetModeIdleTimer();
                 CheckYogaPoseMatch(direction);
             }
         }
