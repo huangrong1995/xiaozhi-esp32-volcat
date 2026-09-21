@@ -757,12 +757,9 @@ private:
         case Gesture::SwipeLeft:
         case Gesture::SwipeRight:
             if (!settings_adjusting_) {
-                // Move the highlight; wrap between the two settings rows.
-                if (gesture == Gesture::SwipeRight) {
-                    settings_selected_index_ = (settings_selected_index_ + 1) % 2;
-                } else {
-                    settings_selected_index_ = (settings_selected_index_ + 2) % 2;
-                }
+                // Move the highlight; with two settings rows, either swipe
+                // toggles between brightness and volume.
+                settings_selected_index_ = (settings_selected_index_ + 1) % 2;
                 RenderSettingsPage();
             } else {
                 // Adjust the active setting's value live (brightness or volume).
