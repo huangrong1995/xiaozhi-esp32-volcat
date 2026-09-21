@@ -462,7 +462,7 @@ enum class Gesture {
 };
 
 // Device interaction modes.
-enum class Mode { Chat, EmotionLearning, Yoga };
+enum class Mode { Chat, FunctionPage, SettingsPage, EmotionLearning };
 
 class EspVocat : public WifiBoard {
 private:
@@ -556,23 +556,19 @@ private:
     static constexpr int64_t kOuterTouchCooldownUs = 1200000;  // 1200 ms
     int64_t outer_touch_last_us_ = 0;
 
-    // Yoga challenge mode
-    size_t current_pose_index_ = 0;
-    static const char* kYogaPoseNames_[];
-    static const char* kYogaPoseDirections_[];
-    static constexpr size_t kYogaPoseCount = 6;
-
-    // Yoga success feedback window: tilt matches for the same pose are ignored
-    // during the success animation so a pose is not completed twice (spec §2.3).
-    int64_t yoga_success_until_ms_ = 0;
-    static constexpr uint32_t kYogaSuccessDurationMs = 1000;
+    // Settings page state. settings_selected_index_ picks the active row
+    // (0 = brightness, 1 = volume); settings_adjusting_ toggles whether the
+    // highlight moves or the active setting's value is adjusted live.
+    int settings_selected_index_ = 0;
+    bool settings_adjusting_ = false;
+    int volume_ = 50;  // cached output volume (0-100); used until codec is ready
 
     // Display presentation owner. Higher layers take priority and are restored
     // by ResetToStandby(), so transient/mode/reminder feedback do not clobber
     // each other or the standby idle animation (spec §3.4).
     enum class Presentation {
         Standby,            // idle pet animation (lowest priority)
-        Mode,               // emotion-learning / yoga presentation
+        Mode,               // mode presentation (function/settings/emotion-learning)
         Reminder,           // active reminder (highest priority)
         TransientFeedback,  // short touch/shake feedback
     };
@@ -621,11 +617,14 @@ private:
         case Mode::Chat:
             HandleChatGesture(gesture);
             break;
+        case Mode::FunctionPage:
+            HandleFunctionPageGesture(gesture);
+            break;
+        case Mode::SettingsPage:
+            HandleSettingsPageGesture(gesture);
+            break;
         case Mode::EmotionLearning:
             HandleEmotionLearningGesture(gesture);
-            break;
-        case Mode::Yoga:
-            HandleYogaGesture(gesture);
             break;
         }
     }
@@ -687,9 +686,14 @@ private:
             presentation_ = Presentation::Mode;
             ShowEmotionLearningCurrent();
             break;
-        case Mode::Yoga:
+        case Mode::FunctionPage:
             presentation_ = Presentation::Mode;
-            ShowYogaPose();
+            emote->ShowFunctionPage();
+            break;
+        case Mode::SettingsPage:
+            presentation_ = Presentation::Mode;
+            emote->ShowSettingsPage(settings_selected_index_, settings_adjusting_,
+                                    CurrentSettingsValue());
             break;
         }
     }
@@ -698,20 +702,19 @@ private:
     void HandleChatGesture(Gesture gesture)
     {
         switch (gesture) {
-        case Gesture::Tap:
-            Application::GetInstance().ToggleChatState();
-            break;
         case Gesture::SwipeLeft:
-            EnterEmotionLearningMode();
+            EnterFunctionPage();
             break;
         case Gesture::SwipeRight:
-            EnterYogaChallengeMode();
+            EnterSettingsPage();
             break;
         case Gesture::LongPress:
-            // Short cancel/help feedback without muting or recording drink.
-            ShowTemporaryEmotion("confused", 2000);
+            Application::GetInstance().ToggleChatState();
+            break;
+        case Gesture::Tap:
+            // Light touch feedback without leaving Chat.
+            ShowTemporaryEmotion("happy", 1500);
             Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-            ESP_LOGI(TAG, "Long press help/cancel feedback");
             break;
         case Gesture::Shake:
             // "被摇晃" feedback: shake is meaningful only in Chat (spec §1.3).
@@ -726,9 +729,67 @@ private:
         }
     }
 
+    void HandleFunctionPageGesture(Gesture gesture)
+    {
+        switch (gesture) {
+        case Gesture::SwipeUp:
+            ExitToChat();
+            break;
+        case Gesture::LongPress:
+            EnterEmotionLearningMode();
+            break;
+        case Gesture::Tap:
+            // Light touch feedback.
+            ShowTemporaryEmotion("happy", 1500);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void HandleSettingsPageGesture(Gesture gesture)
+    {
+        switch (gesture) {
+        case Gesture::SwipeUp:
+            ExitToChat();
+            break;
+        case Gesture::SwipeLeft:
+        case Gesture::SwipeRight:
+            if (!settings_adjusting_) {
+                // Move the highlight; wrap between the two settings rows.
+                if (gesture == Gesture::SwipeRight) {
+                    settings_selected_index_ = (settings_selected_index_ + 1) % 2;
+                } else {
+                    settings_selected_index_ = (settings_selected_index_ + 2) % 2;
+                }
+                RenderSettingsPage();
+            } else {
+                // Adjust the active setting's value live (brightness or volume).
+                int delta = (gesture == Gesture::SwipeRight) ? 5 : -5;
+                AdjustSettingsValue(delta);
+            }
+            break;
+        case Gesture::LongPress:
+            settings_adjusting_ = !settings_adjusting_;
+            RenderSettingsPage();
+            break;
+        case Gesture::Tap:
+            // Light touch feedback.
+            ShowTemporaryEmotion("happy", 1500);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+            break;
+        default:
+            break;
+        }
+    }
+
     void HandleEmotionLearningGesture(Gesture gesture)
     {
         switch (gesture) {
+        case Gesture::SwipeUp:
+            ExitToChat();
+            break;
         case Gesture::SwipeLeft:  // previous emotion
             current_emotion_index_ =
                 (current_emotion_index_ + kEmotionLearningCount - 1) % kEmotionLearningCount;
@@ -742,27 +803,9 @@ private:
             Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
             break;
         case Gesture::LongPress:
+            // Leave learning mode and start a conversation.
             ExitEmotionLearningMode();
-            break;
-        default:
-            break;
-        }
-    }
-
-    void HandleYogaGesture(Gesture gesture)
-    {
-        switch (gesture) {
-        case Gesture::SwipeLeft:  // previous pose
-            ShowPrevYogaPose();
-            break;
-        case Gesture::SwipeRight:  // next pose
-            ShowNextYogaPose();
-            break;
-        case Gesture::Tap:  // replay the current pose
-            ShowYogaPose();
-            break;
-        case Gesture::LongPress:
-            ExitYogaChallengeMode();
+            Application::GetInstance().ToggleChatState();
             break;
         default:
             break;
@@ -1294,8 +1337,6 @@ private:
                 prev = cur;
                 has_prev = true;
             }
-            // Check yoga pose match periodically
-            self->ProcessImuForYoga();
             vTaskDelay(pdMS_TO_TICKS(80));
         }
     }
@@ -1548,7 +1589,11 @@ private:
             presentation_ = Presentation::Mode;
             const char* emotion = kEmotionLearningEmotions_[current_emotion_index_];
             display_->SetEmotion(emotion);
-            ESP_LOGI(TAG, "Emotion: %s (%s)", emotion, kEmotionLearningNames_[current_emotion_index_]);
+            // Render the emotion name label on the learning page.
+            static_cast<emote::EmoteDisplay*>(display_)->ShowEmotionLearning(
+                kEmotionLearningNames_[current_emotion_index_]);
+            ESP_LOGI(TAG, "Emotion: %s (%s)", emotion,
+                     kEmotionLearningNames_[current_emotion_index_]);
         }
     }
 
@@ -1558,137 +1603,67 @@ private:
         ShowEmotionLearningCurrent();
     }
 
-    void EnterYogaChallengeMode()
+    void EnterFunctionPage()
     {
-        if (mode_ == Mode::Yoga) {
+        if (mode_ == Mode::FunctionPage) {
             return;
         }
-        EnterMode(Mode::Yoga);
-        current_pose_index_ = 0;
-        yoga_success_until_ms_ = 0;  // start fresh: no success cooldown pending
-        ShowYogaPose();
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-        ESP_LOGI(TAG, "Entered yoga challenge mode");
-    }
-
-    void ExitYogaChallengeMode()
-    {
-        if (mode_ != Mode::Yoga) {
-            return;
-        }
-        ExitToChat();
-        ShowTemporaryEmotion("happy", 2000);
-        ESP_LOGI(TAG, "Exited yoga challenge mode");
-    }
-
-    void ShowYogaPose()
-    {
+        EnterMode(Mode::FunctionPage);
         if (display_ != nullptr) {
-            // Yoga is a Mode presentation: the arrow must not be overwritten by
-            // transient feedback or the standby idle animation (spec §2.3).
-            presentation_ = Presentation::Mode;
-            const char* direction = kYogaPoseDirections_[current_pose_index_];
-            static_cast<emote::EmoteDisplay*>(display_)->DrawArrow(direction);
-            ESP_LOGI(TAG, "Yoga pose: %s (%s)", kYogaPoseNames_[current_pose_index_], direction);
+            static_cast<emote::EmoteDisplay*>(display_)->ShowFunctionPage();
         }
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+        ESP_LOGI(TAG, "Entered function page");
     }
 
-    // Deterministic pose navigation with wraparound (spec §2.3).
-    void ShowNextYogaPose()
+    void EnterSettingsPage()
     {
-        current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
-        yoga_success_until_ms_ = 0;  // a manually navigated pose is immediately matchable
-        ShowYogaPose();
+        if (mode_ == Mode::SettingsPage) {
+            return;
+        }
+        settings_selected_index_ = 0;
+        settings_adjusting_ = false;
+        EnterMode(Mode::SettingsPage);
+        RenderSettingsPage();
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+        ESP_LOGI(TAG, "Entered settings page");
     }
 
-    void ShowPrevYogaPose()
+    // The active setting's current value: backlight brightness for row 0
+    // (from backlight_), output volume (from the cached volume_) for row 1.
+    int CurrentSettingsValue() const
     {
-        current_pose_index_ =
-            (current_pose_index_ + kYogaPoseCount - 1) % kYogaPoseCount;
-        yoga_success_until_ms_ = 0;
-        ShowYogaPose();
+        if (settings_selected_index_ == 0) {
+            return backlight_ != nullptr ? static_cast<int>(backlight_->brightness()) : 0;
+        }
+        return volume_;
     }
 
-    void CheckYogaPoseMatch(const char* motion_direction)
+    // Adjust and live-apply the active setting, clamped to 0-100.
+    void AdjustSettingsValue(int delta)
     {
-        if (mode_ != Mode::Yoga) {
-            return;
-        }
-        // Ignore duplicate tilt matches during the success window so the same
-        // pose is not completed twice (spec §2.3 feedback order).
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms < yoga_success_until_ms_) {
-            return;
-        }
-        const char* target = kYogaPoseDirections_[current_pose_index_];
-        if (strcmp(motion_direction, target) != 0) {
-            return;
-        }
-
-        // Correct pose matched: block further matches, then success feedback.
-        // ShowTemporaryEmotion() arms emotion_reset_timer, which calls
-        // ResetToStandby() → ShowYogaPose() once the success emotion has been
-        // shown for kYogaSuccessDurationMs, redrawing the (advanced) arrow.
-        yoga_success_until_ms_ = now_ms + kYogaSuccessDurationMs;
-        ShowTemporaryEmotion("happy", kYogaSuccessDurationMs);
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-
-        if (current_pose_index_ == kYogaPoseCount - 1) {
-            // Completed all poses: completion feedback then return to Chat.
-            ESP_LOGI(TAG, "Yoga challenge complete!");
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-            ExitYogaChallengeMode();
-            return;
-        }
-
-        // Advance to the next pose; ResetToStandby() draws its arrow after the
-        // success face has been shown for its duration.
-        current_pose_index_++;
-        ESP_LOGI(TAG, "Correct! Next pose: %s", kYogaPoseDirections_[current_pose_index_]);
-    }
-
-    void ProcessImuForYoga()
-    {
-        if (mode_ != Mode::Yoga || !bmi270_ready_) {
-            return;
-        }
-        static int64_t last_check_ms = 0;
-        constexpr int64_t kCooldownMs = 500;  // Only check every 500ms
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_check_ms < kCooldownMs) {
-            return;
-        }
-        last_check_ms = now_ms;
-
-        // Read accelerometer data
-        struct bmi2_sens_data data = {};
-        if (Bmi270Motion::ReadAccelRaw(data)) {
-            // Determine tilt direction
-            int acc_x = data.acc.x;
-            int acc_y = data.acc.y;
-            const char* direction = nullptr;
-            // Check dominant tilt
-            if (abs(acc_x) > abs(acc_y)) {
-                if (acc_x > 5000) {
-                    direction = "right";
-                } else if (acc_x < -5000) {
-                    direction = "left";
-                }
-            } else {
-                if (acc_y > 5000) {
-                    direction = "down";
-                } else if (acc_y < -5000) {
-                    direction = "up";
-                }
+        if (settings_selected_index_ == 0) {
+            int value = (backlight_ != nullptr ? static_cast<int>(backlight_->brightness()) : 0) + delta;
+            value = value < 0 ? 0 : (value > 100 ? 100 : value);
+            if (backlight_ != nullptr) {
+                backlight_->SetBrightness(static_cast<uint8_t>(value));
             }
-            if (direction != nullptr) {
-                // A tilt is a meaningful Yoga interaction: keep the mode alive.
-                // (This is the IMU-mode-aware path, distinct from the Chat-only
-                // shake path, per spec §2.3.)
-                ResetModeIdleTimer();
-                CheckYogaPoseMatch(direction);
-            }
+        } else {
+            volume_ += delta;
+            volume_ = volume_ < 0 ? 0 : (volume_ > 100 ? 100 : volume_);
+            Application::GetInstance().GetAudioService().SetOutputVolume(volume_);
         }
+        RenderSettingsPage();
+    }
+
+    // Redraw the settings page from the current state.
+    void RenderSettingsPage()
+    {
+        if (display_ == nullptr) {
+            return;
+        }
+        static_cast<emote::EmoteDisplay*>(display_)->ShowSettingsPage(
+            settings_selected_index_, settings_adjusting_, CurrentSettingsValue());
     }
 
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
@@ -2085,14 +2060,6 @@ const EspVocat::ScheduleEntry EspVocat::kScheduleReminders_[] = {
     {14, 0, "该睡午觉了~", "sleepy"},
     {18, 0, "该吃晚饭了~", "happy"},
     {21, 0, "该睡觉了~", "sleepy"},
-};
-
-// Static array definitions for yoga challenge
-const char* EspVocat::kYogaPoseNames_[] = {
-    "向上倾斜", "向下倾斜", "向左倾斜", "向右倾斜", "向上倾斜", "向下倾斜"
-};
-const char* EspVocat::kYogaPoseDirections_[] = {
-    "up", "down", "left", "right", "up", "down"
 };
 
 DECLARE_BOARD(EspVocat);
