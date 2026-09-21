@@ -3,6 +3,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_timer.h>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -72,7 +73,7 @@ private:
     gfx_obj_t* settings_volume_ = nullptr;
     gfx_obj_t* settings_value_ = nullptr;
     gfx_obj_t* emotion_name_ = nullptr;
-    bool page_ui_ready_ = false;
+    std::atomic<bool> page_ui_ready_ = false;
 };
 
 }  // namespace emote

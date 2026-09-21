@@ -226,8 +226,11 @@ void EmoteDisplay::EnsurePageUi() {
     emotion_name_ = create_label("vocat_emotion_name", "", kColorSoftYellow, 320, 48,
                                  GFX_ALIGN_TOP_MID, 0, 120);
 
-    emote_unlock(emote_handle_);
+    // Publish under the lock so a concurrent reader never sees the half-built
+    // set of page labels (page_ui_ready_ is atomic; a reader that samples it
+    // true will only touch labels that are fully created).
     page_ui_ready_ = true;
+    emote_unlock(emote_handle_);
 }
 
 void EmoteDisplay::SetPageUiVisible(bool visible) {

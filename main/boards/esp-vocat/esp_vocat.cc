@@ -1620,6 +1620,9 @@ private:
         }
         settings_selected_index_ = 0;
         settings_adjusting_ = false;
+        // Seed the cached volume from the codec so the displayed value matches
+        // actual output (the codec default may differ from the initial value).
+        volume_ = Application::GetInstance().GetAudioService().GetOutputVolume();
         EnterMode(Mode::SettingsPage);
         RenderSettingsPage();
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
