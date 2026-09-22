@@ -411,6 +411,19 @@ void EspVocatUi::EmotionLearningStartEventCb(lv_event_t* e) {
     }
 }
 
+void EspVocatUi::EmotionLearningStepEventCb(lv_event_t* e) {
+    auto* target = static_cast<EmotionStepTarget*>(lv_event_get_user_data(e));
+    if (target == nullptr || target->ui == nullptr) {
+        return;
+    }
+    ESP_LOGI(TAG, "EspVocatUi: emotion step %s pressed", target->is_next ? "next" : "prev");
+    if (target->is_next && target->ui->emotion_next_cb_) {
+        target->ui->emotion_next_cb_();
+    } else if (!target->is_next && target->ui->emotion_prev_cb_) {
+        target->ui->emotion_prev_cb_();
+    }
+}
+
 void EspVocatUi::BuildEmotionLearningScreen() {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
@@ -448,6 +461,37 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     lv_obj_set_style_text_color(back_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_text_font(back_label, &font_puhui_20_4, 0);
     lv_obj_center(back_label);
+
+    // Left ‹ / right › round emotion-step buttons flanking the current name.
+    // Each fires the board's prev/next callback (which cycles the emotion index
+    // and calls SetEmotionLearningName). Round buttons avoid the panel's edge.
+    lv_obj_t* prev = lv_button_create(scr);
+    lv_obj_set_style_bg_color(prev, lv_color_hex(0x9775FA), 0);
+    lv_obj_set_style_bg_opa(prev, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(prev, 32, 0);
+    lv_obj_set_size(prev, 64, 64);
+    lv_obj_align(prev, LV_ALIGN_LEFT_MID, 12, -30);
+    lv_obj_add_event_cb(prev, EspVocatUi::EmotionLearningStepEventCb, LV_EVENT_CLICKED,
+                        new EmotionStepTarget{this, false});
+    lv_obj_t* prev_label = lv_label_create(prev);
+    lv_label_set_text(prev_label, "<");
+    lv_obj_set_style_text_color(prev_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(prev_label, &font_puhui_20_4, 0);
+    lv_obj_center(prev_label);
+
+    lv_obj_t* next = lv_button_create(scr);
+    lv_obj_set_style_bg_color(next, lv_color_hex(0x9775FA), 0);
+    lv_obj_set_style_bg_opa(next, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(next, 32, 0);
+    lv_obj_set_size(next, 64, 64);
+    lv_obj_align(next, LV_ALIGN_RIGHT_MID, -12, -30);
+    lv_obj_add_event_cb(next, EspVocatUi::EmotionLearningStepEventCb, LV_EVENT_CLICKED,
+                        new EmotionStepTarget{this, true});
+    lv_obj_t* next_label = lv_label_create(next);
+    lv_label_set_text(next_label, ">");
+    lv_obj_set_style_text_color(next_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(next_label, &font_puhui_20_4, 0);
+    lv_obj_center(next_label);
 
     // Central current-emotion name label (large, lavender default; a full
     // emotion->color map is deferred to a later task).

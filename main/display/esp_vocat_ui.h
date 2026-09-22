@@ -134,6 +134,13 @@ public:
     // The board wires this to its existing emotion-learning flow.
     void SetStartLearningCallback(StartCb cb) { start_learning_cb_ = std::move(cb); }
 
+    // Register the callbacks invoked when the user presses the on-screen ‹ / ›
+    // emotion step buttons. The board cycles the current emotion index and calls
+    // SetEmotionLearningName with the new name.
+    using EmotionStepCb = std::function<void()>;
+    void SetEmotionPrevCallback(EmotionStepCb cb) { emotion_prev_cb_ = std::move(cb); }
+    void SetEmotionNextCallback(EmotionStepCb cb) { emotion_next_cb_ = std::move(cb); }
+
     // --- Conversation overlay (Siri-style, pure LVGL, no pet face) ----------
     // Fired when the conversation overlay is left/gone (SetConversationActive
     // off); the board force-stops the running dialogue (bug #2 fix basis).
@@ -186,7 +193,15 @@ private:
         EspVocatUi* ui;
     };
 
+    // Identifies which ‹/› emotion step button was pressed (reused as the
+    // user-data for both buttons; the flag selects prev vs next).
+    struct EmotionStepTarget {
+        EspVocatUi* ui;
+        bool is_next;  // false = previous (‹), true = next (›)
+    };
+
     static void EmotionLearningStartEventCb(lv_event_t* e);
+    static void EmotionLearningStepEventCb(lv_event_t* e);
 
     // Build (once) and show the emotion learning screen; reused across
     // ShowScreen calls. Its back button reuses the shared back_to_home_cb_.
@@ -198,6 +213,8 @@ private:
     lv_obj_t* emotion_name_label_ = nullptr;
     std::string emotion_name_;  // cached; applied to the label once built
     StartCb start_learning_cb_;
+    EmotionStepCb emotion_prev_cb_;
+    EmotionStepCb emotion_next_cb_;
 
     // ---- Conversation overlay implementation --------------------------------
     static constexpr int kWaveBarCount = 9;  // short bars in the waveform

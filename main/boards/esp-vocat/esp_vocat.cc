@@ -463,8 +463,9 @@ enum class Gesture {
     ChatToggle,
 };
 
-// Device interaction modes.
-enum class Mode { Chat, FunctionPage, SettingsPage, EmotionLearning };
+// The active screen is tracked authoritatively by EspVocatUi::CurrentScreen()
+// (ScreenId in main/display/esp_vocat_ui.h). The old emote-gfx "mode" enum was
+// retired in favour of that single source of truth.
 
 class EspVocat : public WifiBoard {
 private:
@@ -476,8 +477,14 @@ private:
     Display* display_ = nullptr;
     // Screen manager that alternates the shared panel between the emote pet
     // renderer (Home) and LVGL page screens. Owns the RenderSwitch and tracks
-    // the current screen.
+    // the current screen (the authoritative source for gesture routing).
     EspVocatUi* ui_ = nullptr;
+    // The screen currently presented. Falls back to Home before ui_ is built so
+    // the interaction timers can run safely during boot.
+    ScreenId CurrentScreen() const
+    {
+        return (ui_ != nullptr) ? ui_->CurrentScreen() : ScreenId::Home;
+    }
     PwmBacklight* backlight_ = nullptr;
     esp_timer_handle_t touchpad_timer_;
     esp_lcd_touch_handle_t tp;   // LCD touch handle
@@ -562,12 +569,9 @@ private:
     static constexpr int64_t kOuterTouchCooldownUs = 1200000;  // 1200 ms
     int64_t outer_touch_last_us_ = 0;
 
-    // Settings page state. settings_selected_index_ picks the active row
-    // (0 = brightness, 1 = volume); settings_adjusting_ toggles whether the
-    // highlight moves or the active setting's value is adjusted live.
-    int settings_selected_index_ = 0;
-    bool settings_adjusting_ = false;
-    int volume_ = 50;  // cached output volume (0-100); used until codec is ready
+    // Settings page values are driven by the LVGL screen's steppers and the Task 3
+    // callbacks (which apply to backlight/AudioService live); no board-side
+    // selection/adjust state is needed anymore.
 
     // Display presentation owner. Higher layers take priority and are restored
     // by ResetToStandby(), so transient/mode/reminder feedback do not clobber
@@ -580,12 +584,21 @@ private:
     };
     Presentation presentation_ = Presentation::Standby;
 
-    // Unified interaction mode state. mode_ is read/written only from the
-    // interaction task/callback context (touch events and timer callbacks),
-    // so it does not require locking.
-    Mode mode_ = Mode::Chat;
-    static constexpr uint64_t kModeIdleTimeoutMs = 30000;  // Idle timeout (ms) before returning to chat
+    // Screen navigation state, read/written only from the interaction
+    // task/callback context (touch events and timer callbacks), so it does not
+    // require locking. The active screen itself is held by ui_->CurrentScreen().
+    static constexpr uint64_t kModeIdleTimeoutMs = 30000;  // Non-Home idle timeout (ms) before returning Home
     esp_timer_handle_t mode_idle_timer_ = nullptr;
+    // True when the last touch began in the right-edge zone: a horizontal swipe
+    // from there means "back Home" instead of page navigation (round-panel
+    // safety, avoiding a direction misread on the far edge).
+    bool swipe_from_edge_ = false;
+    // Right-edge width used by edge-swipe "back Home" detection.
+    static constexpr int kEdgeZonePx = 60;
+    // Last value driven to ui_->SetSpeaking(); polled from the device state so a
+    // change only re-locks LVGL when the listening/speaking sense actually flips.
+    bool last_speaking_state_ = false;
+    esp_timer_handle_t state_poll_timer_ = nullptr;  // maps device state -> SetSpeaking
 
     // Two-level power save (spec §6.1). Level 1 is a 1s tick that turns off the
     // display after DISPLAY_SLEEP_TIMEOUT_SECONDS of eligible idle while keeping
@@ -601,7 +614,7 @@ private:
     static void mode_idle_timer_callback(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
-        if (self == nullptr || self->mode_ == Mode::Chat || self->reminder_active_) {
+        if (self == nullptr || self->CurrentScreen() == ScreenId::Home || self->reminder_active_) {
             return;
         }
         self->ExitToChat();
@@ -614,51 +627,94 @@ private:
         TouchPowerSaveActivity();
         ResetModeIdleTimer();
         // Reminder-first routing: while a reminder is active, its acknowledgement
-        // owns all screen gestures; mode navigation is blocked until handled.
+        // owns all screen gestures; navigation is blocked until handled.
         if (reminder_active_) {
             HandleReminderGesture(gesture);
             return;
         }
-        switch (mode_) {
-        case Mode::Chat:
+        switch (CurrentScreen()) {
+        case ScreenId::Home:
             HandleChatGesture(gesture);
             break;
-        case Mode::FunctionPage:
-            HandleFunctionPageGesture(gesture);
-            break;
-        case Mode::SettingsPage:
+        case ScreenId::Settings:
             HandleSettingsPageGesture(gesture);
             break;
-        case Mode::EmotionLearning:
+        case ScreenId::EmotionLearning:
             HandleEmotionLearningGesture(gesture);
+            break;
+        case ScreenId::ConversationOverlay:
+            // A conversation is a non-Home screen too: any horizontal/up swipe
+            // leaves it (ExitToChat force-stops the dialogue, bug #2).
+            HandleSettingsPageGesture(gesture);
             break;
         }
     }
 
-    void EnterMode(Mode mode)
-    {
-        if (mode_ == mode) {
-            return;
-        }
-        mode_ = mode;
-        ResetModeIdleTimer();
-        // A mode is a high-priority presentation: it must not light-sleep (spec §6.1).
-        UpdatePowerSaveEligibility();
-    }
-
+    // Return to the Home emote pet face from any non-Home screen. If a
+    // conversation overlay is up, SetConversationActive(false) fires the
+    // dialog-gone callback, whose board handler force-stops the voice pipeline
+    // (StopListening + AbortSpeaking) — this is the bug #2 fix: leaving a
+    // conversation by any navigation stops the audio.
     void ExitToChat()
     {
-        if (mode_ == Mode::Chat) {
+        if (CurrentScreen() == ScreenId::Home) {
             return;
         }
-        mode_ = Mode::Chat;
+        if (ui_ != nullptr) {
+            ui_->SetConversationActive(false);  // fires dialog-gone -> force-stop
+            ui_->ShowHome();
+        }
         if (mode_idle_timer_ != nullptr) {
             esp_timer_stop(mode_idle_timer_);
         }
-        // Back in the root Chat state: re-allow light sleep if no reminder is up.
+        // Back in the root Home state: re-allow light sleep if no reminder is up.
         UpdatePowerSaveEligibility();
-        // Return to the standby idle presentation (Chat → idle pet animation).
-        ResetToStandby();
+    }
+
+    // Force-end any active conversation before leaving Home (bug #2). A no-op
+    // when no conversation is active; SetConversationActive(false) then lets the
+    // caller present the target screen.
+    void ForceEndDialogue()
+    {
+        if (ui_ != nullptr) {
+            ui_->SetConversationActive(false);
+        }
+    }
+
+    // Post-screen-change bookkeeping shared by the Enter* navigations.
+    void AfterScreenChange()
+    {
+        ResetModeIdleTimer();
+        UpdatePowerSaveEligibility();
+    }
+
+    // Drive the conversation overlay's listening/speaking state from the device
+    // state machine, on a light periodic poll. Re-locks LVGL only when the sense
+    // actually flips; a no-op while the overlay is not shown.
+    static void state_poll_timer_callback(void* arg)
+    {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self != nullptr) {
+            self->PollSpeakingState();
+        }
+    }
+
+    void PollSpeakingState()
+    {
+        if (ui_ == nullptr) {
+            return;
+        }
+        auto state = Application::GetInstance().GetDeviceState();
+        bool new_state = last_speaking_state_;
+        if (state == kDeviceStateSpeaking) {
+            new_state = true;
+        } else if (state == kDeviceStateListening) {
+            new_state = false;
+        }
+        if (new_state != last_speaking_state_) {
+            last_speaking_state_ = new_state;
+            ui_->SetSpeaking(new_state);
+        }
     }
 
     void ResetModeIdleTimer()
@@ -670,10 +726,10 @@ private:
         esp_timer_start_once(mode_idle_timer_, kModeIdleTimeoutMs * 1000ULL);
     }
 
-    // Return the display to the presentation appropriate for the current mode:
-    // the idle pet animation in Chat, the current emotion/pose inside a mode.
-    // Stops any transient animation and cannot permanently overwrite a mode
-    // or reminder presentation, so feedback layers stay isolated (spec §3.4).
+    // Return the display to the standby idle pet animation on the Home screen.
+    // Non-Home page screens are presented by ShowScreen and are not reset here.
+    // Stops any transient animation and cannot permanently overwrite a reminder
+    // presentation, so feedback layers stay isolated (spec §3.4).
     void ResetToStandby()
     {
         if (display_ == nullptr) {
@@ -682,67 +738,69 @@ private:
         if (emotion_reset_timer_ != nullptr) {
             esp_timer_stop(emotion_reset_timer_);
         }
-        auto* emote = static_cast<emote::EmoteDisplay*>(display_);
-        switch (mode_) {
-        case Mode::Chat:
+        if (CurrentScreen() == ScreenId::Home) {
             presentation_ = Presentation::Standby;
-            emote->RestoreFromReminder();  // restarts the standby idle animation
-            break;
-        case Mode::EmotionLearning:
-            presentation_ = Presentation::Mode;
-            ShowEmotionLearningCurrent();
-            break;
-        case Mode::FunctionPage:
-            presentation_ = Presentation::Mode;
-            emote->ShowFunctionPage();
-            break;
-        case Mode::SettingsPage:
-            presentation_ = Presentation::Mode;
-            emote->ShowSettingsPage(settings_selected_index_, settings_adjusting_,
-                                    CurrentSettingsValue());
-            break;
+            // Restarts the standby idle pet animation.
+            static_cast<emote::EmoteDisplay*>(display_)->RestoreFromReminder();
         }
+        // Non-Home screens (Settings / EmotionLearning / ConversationOverlay) are
+        // owned by the LVGL page presentation; nothing to restore here.
     }
 
-    // Per-mode gesture handlers. Note: Pet and Shake must never change mode_.
+    // Per-screen gesture handlers. Note: Pet and Shake must never change screen.
+    // Gesture matrix (Home = emote pet face; everything else is a non-Home LVGL
+    // screen): Home — LongPress opens a conversation, SwipeLeft → EmotionLearning,
+    // SwipeRight → Settings, Tap/Shake → feedback. Non-Home screens — any
+    // horizontal or up swipe returns Home; on-screen ‹ back also returns Home.
     void HandleChatGesture(Gesture gesture)
     {
         switch (gesture) {
         case Gesture::SwipeLeft:
-            EnterFunctionPage();
+            // An edge-start swipe means "back Home" (already Home) so it does not
+            // accidentally navigate from the round panel's right edge.
+            if (swipe_from_edge_) {
+                break;
+            }
+            EnterEmotionLearningMode();
             break;
         case Gesture::SwipeRight:
+            if (swipe_from_edge_) {
+                break;
+            }
             EnterSettingsPage();
             break;
         case Gesture::LongPress:
-            Application::GetInstance().ToggleChatState();
+            // Open a conversation: show the Siri-style overlay and start voice.
+            StartConversation();
             break;
         case Gesture::Tap:
-            // Light touch feedback without leaving Chat.
+            // Light touch feedback without leaving Home.
             ShowTemporaryEmotion("happy", 1500);
             Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
             break;
         case Gesture::Shake:
-            // "被摇晃" feedback: shake is meaningful only in Chat (spec §1.3).
-            // Other modes' handlers ignore Shake, so it never advances a mode.
+            // "被摇晃" feedback: shake is meaningful only in Home (spec §1.3).
             ShowTemporaryEmotion("confused", 1800);
-            ESP_LOGI(TAG, "Shake feedback (Chat mode)");
+            ESP_LOGI(TAG, "Shake feedback (Home screen)");
             break;
         default:
-            // Ignore mode-only gestures (SwipeUp, SwipeDown, Pet, Shake,
-            // ChatToggle, None). A swipe must never toggle chat.
+            // Ignore gestures not used on Home (SwipeUp, SwipeDown, Pet, ChatToggle,
+            // None). A swipe must never toggle chat.
             break;
         }
     }
 
-    void HandleFunctionPageGesture(Gesture gesture)
+    // Non-Home LVGL screens (Settings / EmotionLearning / ConversationOverlay)
+    // share this matrix: any horizontal or up swipe returns Home. SwipeDown is
+    // ignored. Value changes on Settings and emotion stepping on EmotionLearning
+    // happen through the screens' on-screen controls, not gestures.
+    void HandlePageGesture(Gesture gesture)
     {
         switch (gesture) {
+        case Gesture::SwipeLeft:
+        case Gesture::SwipeRight:
         case Gesture::SwipeUp:
             ExitToChat();
-            break;
-        case Gesture::LongPress:
-            EnterEmotionLearningMode();
             break;
         case Gesture::Tap:
             // Light touch feedback.
@@ -756,63 +814,12 @@ private:
 
     void HandleSettingsPageGesture(Gesture gesture)
     {
-        switch (gesture) {
-        case Gesture::SwipeUp:
-            ExitToChat();
-            break;
-        case Gesture::SwipeLeft:
-        case Gesture::SwipeRight:
-            if (!settings_adjusting_) {
-                // Move the highlight; with two settings rows, either swipe
-                // toggles between brightness and volume.
-                settings_selected_index_ = (settings_selected_index_ + 1) % 2;
-                RenderSettingsPage();
-            } else {
-                // Adjust the active setting's value live (brightness or volume).
-                int delta = (gesture == Gesture::SwipeRight) ? 5 : -5;
-                AdjustSettingsValue(delta);
-            }
-            break;
-        case Gesture::LongPress:
-            settings_adjusting_ = !settings_adjusting_;
-            RenderSettingsPage();
-            break;
-        case Gesture::Tap:
-            // Light touch feedback.
-            ShowTemporaryEmotion("happy", 1500);
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-            break;
-        default:
-            break;
-        }
+        HandlePageGesture(gesture);
     }
 
     void HandleEmotionLearningGesture(Gesture gesture)
     {
-        switch (gesture) {
-        case Gesture::SwipeUp:
-            ExitToChat();
-            break;
-        case Gesture::SwipeLeft:  // previous emotion
-            current_emotion_index_ =
-                (current_emotion_index_ + kEmotionLearningCount - 1) % kEmotionLearningCount;
-            ShowEmotionLearningCurrent();
-            break;
-        case Gesture::SwipeRight:  // next emotion
-            ShowEmotionLearningNext();
-            break;
-        case Gesture::Tap:  // feedback for the current emotion
-            ShowEmotionLearningCurrent();
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-            break;
-        case Gesture::LongPress:
-            // Leave learning mode and start a conversation.
-            ExitEmotionLearningMode();
-            Application::GetInstance().ToggleChatState();
-            break;
-        default:
-            break;
-        }
+        HandlePageGesture(gesture);
     }
 
     // Gesture timing thresholds (ms)
@@ -1217,14 +1224,14 @@ private:
         touch_pad_clear_status();
     }
 
-    // Gate level-2 light sleep to the root Chat mode outside a reminder; the
+    // Gate level-2 light sleep to the root Home screen outside a reminder; the
     // PowerSaveTimer itself additionally requires Application::CanEnterSleepMode().
     void UpdatePowerSaveEligibility()
     {
         if (power_save_timer_ == nullptr) {
             return;
         }
-        bool eligible = (mode_ == Mode::Chat) && !reminder_active_;
+        bool eligible = (CurrentScreen() == ScreenId::Home) && !reminder_active_;
         power_save_timer_->SetEnabled(eligible);
     }
 
@@ -1236,7 +1243,7 @@ private:
         }
     }
 
-    // Level-1 countdown. Only the root Chat mode, with no active reminder and a
+    // Level-1 countdown. Only the root Home screen, with no active reminder and a
     // standby presentation, and only when the application is genuinely idle
     // (kDeviceStateIdle, no audio/protocol activity), may sleep the display.
     void OnDisplaySleepTick()
@@ -1245,7 +1252,7 @@ private:
             return;  // already at level 1
         }
         auto& app = Application::GetInstance();
-        bool eligible = (mode_ == Mode::Chat) && !reminder_active_ &&
+        bool eligible = (CurrentScreen() == ScreenId::Home) && !reminder_active_ &&
                         (presentation_ == Presentation::Standby) && app.CanEnterSleepMode();
         if (!eligible) {
             display_idle_ticks_ = 0;
@@ -1468,6 +1475,13 @@ private:
                                   board.swipe_start_x_, board.swipe_start_y_,
                                   touch_point.x, touch_point.y, delta_x, delta_y, duration_ms);
 
+                        // Edge-start awareness: a horizontal swipe that begins in
+                        // the right-edge zone means "back Home" rather than page
+                        // navigation (round-panel safety against a direction
+                        // misread near the far edge).
+                        board.swipe_from_edge_ =
+                            (board.swipe_start_x_ > DISPLAY_WIDTH - kEdgeZonePx);
+
                         if (duration_ms >= kLongPressThresholdMs) {
                             gesture = Gesture::LongPress;
                         } else if (abs(delta_x) >= kSwipeThreshold && abs(delta_x) > abs(delta_y)) {
@@ -1478,8 +1492,11 @@ private:
                             gesture = Gesture::Tap;
                         }
                         board.swipe_start_recorded_ = false;
+                    } else {
+                        board.swipe_from_edge_ = false;
                     }
                     board.OnGesture(gesture);
+                    board.swipe_from_edge_ = false;
                 }
             }
         }
@@ -1557,119 +1574,85 @@ private:
         self->HandleOuterTouchPet();
     }
 
-    void EnterEmotionLearningMode()
+    // Open a conversation (Siri-style): show the LVGL overlay and start the voice
+    // interaction. Used by the Home LongPress gesture and the EmotionLearning
+    // screen's 开始 button. The overlay is dormant until SetSpeaking drives it.
+    // If a conversation is already running (e.g. started by the physical BOOT
+    // button or a wake word), we only surface the overlay rather than re-toggling
+    // it off.
+    void StartConversation()
     {
-        if (mode_ == Mode::EmotionLearning) {
-            return;
+        if (ui_ != nullptr) {
+            ui_->SetConversationActive(true);
         }
-        EnterMode(Mode::EmotionLearning);
-        current_emotion_index_ = 0;
-        ShowEmotionLearningCurrent();
-        // Play sound to indicate entering learning mode
-        auto& audio = Application::GetInstance().GetAudioService();
-        audio.PlaySound(Lang::Sounds::OGG_POPUP);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        audio.PlaySound(Lang::Sounds::OGG_SUCCESS);
-        ESP_LOGI(TAG, "Entered emotion learning mode");
+        auto state = Application::GetInstance().GetDeviceState();
+        if (state != kDeviceStateListening && state != kDeviceStateSpeaking &&
+            state != kDeviceStateConnecting && state != kDeviceStateActivating) {
+            Application::GetInstance().ToggleChatState();
+        }
+        // A live conversation must not light-sleep (non-Home screen), but unlike
+        // the static page screens it must NOT be auto-closed by the 30s idle timer
+        // while the user is mid-conversation, so only refresh power-save eligibility.
+        UpdatePowerSaveEligibility();
     }
 
-    void ExitEmotionLearningMode()
+    // Cycle the current emotion-learning index and refresh the on-screen name.
+    void AdvanceEmotion(bool forward)
     {
-        if (mode_ != Mode::EmotionLearning) {
+        if (forward) {
+            current_emotion_index_ =
+                (current_emotion_index_ + 1) % kEmotionLearningCount;
+        } else {
+            current_emotion_index_ =
+                (current_emotion_index_ + kEmotionLearningCount - 1) % kEmotionLearningCount;
+        }
+        ShowEmotionLearningCurrent();
+    }
+
+    void EnterEmotionLearningMode()
+    {
+        if (CurrentScreen() == ScreenId::EmotionLearning) {
             return;
         }
-        ExitToChat();
-        ShowTemporaryEmotion("happy", 2000);
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-        ESP_LOGI(TAG, "Exited emotion learning mode");
+        // Entering a non-Home screen force-ends any active conversation (bug #2).
+        ForceEndDialogue();
+        current_emotion_index_ = 0;
+        ShowEmotionLearningCurrent();  // seed the central name before showing
+        if (ui_ != nullptr) {
+            ui_->ShowScreen(ScreenId::EmotionLearning);
+        }
+        AfterScreenChange();
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+        ESP_LOGI(TAG, "Entered emotion learning screen");
     }
 
     void ShowEmotionLearningCurrent()
     {
-        if (display_ != nullptr) {
-            // Emotion-learning is a Mode presentation: it must not be clobbered
-            // by transient feedback or the standby idle animation.
-            presentation_ = Presentation::Mode;
-            const char* emotion = kEmotionLearningEmotions_[current_emotion_index_];
-            display_->SetEmotion(emotion);
-            // Render the emotion name label on the learning page.
-            static_cast<emote::EmoteDisplay*>(display_)->ShowEmotionLearning(
-                kEmotionLearningNames_[current_emotion_index_]);
-            ESP_LOGI(TAG, "Emotion: %s (%s)", emotion,
-                     kEmotionLearningNames_[current_emotion_index_]);
+        if (ui_ != nullptr) {
+            ui_->SetEmotionLearningName(kEmotionLearningNames_[current_emotion_index_]);
         }
-    }
-
-    void ShowEmotionLearningNext()
-    {
-        current_emotion_index_ = (current_emotion_index_ + 1) % kEmotionLearningCount;
-        ShowEmotionLearningCurrent();
-    }
-
-    void EnterFunctionPage()
-    {
-        if (mode_ == Mode::FunctionPage) {
-            return;
-        }
-        EnterMode(Mode::FunctionPage);
-        if (display_ != nullptr) {
-            static_cast<emote::EmoteDisplay*>(display_)->ShowFunctionPage();
-        }
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-        ESP_LOGI(TAG, "Entered function page");
+        ESP_LOGI(TAG, "Emotion learning current: %s",
+                 kEmotionLearningNames_[current_emotion_index_]);
     }
 
     void EnterSettingsPage()
     {
-        if (mode_ == Mode::SettingsPage) {
+        if (CurrentScreen() == ScreenId::Settings) {
             return;
         }
-        settings_selected_index_ = 0;
-        settings_adjusting_ = false;
-        // Seed the cached volume from the codec so the displayed value matches
-        // actual output (the codec default may differ from the initial value).
-        volume_ = Application::GetInstance().GetAudioService().GetOutputVolume();
-        EnterMode(Mode::SettingsPage);
-        RenderSettingsPage();
+        // Entering a non-Home screen force-ends any active conversation (bug #2).
+        ForceEndDialogue();
+        if (ui_ != nullptr) {
+            // Refresh the steppers with the real hardware values, then show the
+            // screen; value changes apply live via the Task 3 callbacks.
+            ui_->SetSettingsValueBrightness(backlight_ != nullptr ? backlight_->brightness() : 50);
+            ui_->SetSettingsValueVolume(
+                Application::GetInstance().GetAudioService().GetOutputVolume());
+            ui_->ShowScreen(ScreenId::Settings);
+        }
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
-        ESP_LOGI(TAG, "Entered settings page");
-    }
-
-    // The active setting's current value: backlight brightness for row 0
-    // (from backlight_), output volume (from the cached volume_) for row 1.
-    int CurrentSettingsValue() const
-    {
-        if (settings_selected_index_ == 0) {
-            return backlight_ != nullptr ? static_cast<int>(backlight_->brightness()) : 0;
-        }
-        return volume_;
-    }
-
-    // Adjust and live-apply the active setting, clamped to 0-100.
-    void AdjustSettingsValue(int delta)
-    {
-        if (settings_selected_index_ == 0) {
-            int value = (backlight_ != nullptr ? static_cast<int>(backlight_->brightness()) : 0) + delta;
-            value = value < 0 ? 0 : (value > 100 ? 100 : value);
-            if (backlight_ != nullptr) {
-                backlight_->SetBrightness(static_cast<uint8_t>(value));
-            }
-        } else {
-            volume_ += delta;
-            volume_ = volume_ < 0 ? 0 : (volume_ > 100 ? 100 : volume_);
-            Application::GetInstance().GetAudioService().SetOutputVolume(volume_);
-        }
-        RenderSettingsPage();
-    }
-
-    // Redraw the settings page from the current state.
-    void RenderSettingsPage()
-    {
-        if (display_ == nullptr) {
-            return;
-        }
-        static_cast<emote::EmoteDisplay*>(display_)->ShowSettingsPage(
-            settings_selected_index_, settings_adjusting_, CurrentSettingsValue());
+        AfterScreenChange();
+        ESP_LOGI(TAG, "Entered settings screen");
     }
 
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
@@ -1857,20 +1840,30 @@ private:
         ui_->SetVolumeChangeCallback([this](int value) {
             Application::GetInstance().GetAudioService().SetOutputVolume(value);
         });
-        ui_->SetBackToHomeCallback([this]() { ui_->ShowHome(); });
+        ui_->SetBackToHomeCallback([this]() {
+            // On-screen back (Settings/EmotionLearning) returns to the Home pet
+            // face, force-ending any active conversation (bug #2).
+            ExitToChat();
+        });
 
-        // The 开始 button on the emotion learning screen fires the board's
-        // existing emotion-learning flow. (EmotionLearning screen navigation
-        // to/from this callback is wired in a later task.)
-        ui_->SetStartLearningCallback([this]() { EnterEmotionLearningMode(); });
+        // The 开始 button on the LVGL emotion learning screen opens a
+        // conversation to practice the currently shown emotion (Siri-style).
+        ui_->SetStartLearningCallback([this]() { StartConversation(); });
 
-        // The conversation overlay fires this when it is left/gone (the leave
-        // mechanism is SetConversationActive(false) -> on_dialog_gone_). This is
-        // a minimal placeholder: return to the Home pet face and log. The full
-        // force-stop of a running dialogue on dialog-gone is wired in a later task.
+        // The on-screen ‹ / › emotion step buttons cycle the current emotion.
+        ui_->SetEmotionPrevCallback([this]() { AdvanceEmotion(false); });
+        ui_->SetEmotionNextCallback([this]() { AdvanceEmotion(true); });
+
+        // The conversation overlay fires this when it is left/gone
+        // (SetConversationActive(false) -> on_dialog_gone_, which already returns
+        // the panel to the Home pet face). This force-stops a running dialogue so
+        // leaving a conversation by any navigation also stops the voice pipeline
+        // — the bug #2 fix.
         ui_->SetDialogGoneCallback([this]() {
-            ESP_LOGI(TAG, "Conversation overlay gone (dialog-gone); returning to Home");
-            ui_->ShowHome();
+            ESP_LOGI(TAG, "Conversation overlay gone: force-stopping dialogue");
+            auto& app = Application::GetInstance();
+            app.StopListening();
+            app.AbortSpeaking(kAbortReasonNone);
         });
 #endif
     }
@@ -1968,6 +1961,11 @@ public:
             esp_timer_delete(mode_idle_timer_);
             mode_idle_timer_ = nullptr;
         }
+        if (state_poll_timer_ != nullptr) {
+            esp_timer_stop(state_poll_timer_);
+            esp_timer_delete(state_poll_timer_);
+            state_poll_timer_ = nullptr;
+        }
         if (reminder_timer_ != nullptr) {
             esp_timer_stop(reminder_timer_);
             esp_timer_delete(reminder_timer_);
@@ -2020,6 +2018,19 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
+
+        // Periodic poll that maps the device listening/speaking state to the
+        // conversation overlay's waveform/status. Drives SetSpeaking only on a
+        // real sense change, so it costs nothing while the overlay is not shown.
+        const esp_timer_create_args_t state_poll_timer_args = {
+            .callback = &EspVocat::state_poll_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "state_poll",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&state_poll_timer_args, &state_poll_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(state_poll_timer_, 200 * 1000));
 
         const esp_timer_create_args_t reminder_restore_timer_args = {
             .callback = &EspVocat::reminder_restore_callback,
