@@ -374,8 +374,11 @@ void EspVocatUi::BuildSettingsScreen() {
         return;
     }
 
-    // Dark iPhone-style grouped list, inset to the round 360x360 panel.
-    lv_obj_t* scr = lv_screen_active();
+    // Dark iPhone-style grouped list, inset to the round 360x360 panel. Each
+    // page owns its own screen object (lv_obj_create(NULL), the LVGL 9 idiom),
+    // never lv_screen_active() — otherwise pages would alias the shared default
+    // screen and stack stale children across reloads.
+    lv_obj_t* scr = lv_obj_create(NULL);
     lv_obj_remove_style_all(scr);
     lv_obj_add_style(scr, &g_style_screen_bg, 0);
 
@@ -534,8 +537,10 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     }
 
     // Dark iPhone-style full-card learning page, inset to the round 360x360
-    // panel. No pet face; this is a pure LVGL page.
-    lv_obj_t* scr = lv_screen_active();
+    // panel. No pet face; this is a pure LVGL page. Own dedicated screen object
+    // (lv_obj_create(NULL)), never lv_screen_active(), so this page's children
+    // never alias another page's children on the shared default screen.
+    lv_obj_t* scr = lv_obj_create(NULL);
     lv_obj_remove_style_all(scr);
     lv_obj_add_style(scr, &g_style_screen_bg, 0);
 
@@ -673,8 +678,9 @@ void EspVocatUi::BuildConversationOverlayScreen() {
     // Full-screen translucent dark scene that entirely replaces the Home pet
     // face while talking (Siri-style). No pet face is composited here. No
     // screen-load animation is used for this overlay so the waveform timer is
-    // never disturbed.
-    lv_obj_t* scr = lv_screen_active();
+    // never disturbed. Own dedicated screen object (lv_obj_create(NULL)) so the
+    // overlay never aliases a page screen's children on the shared default.
+    lv_obj_t* scr = lv_obj_create(NULL);
     lv_obj_remove_style_all(scr);
     lv_obj_add_style(scr, &g_style_overlay_bg, 0);
 
