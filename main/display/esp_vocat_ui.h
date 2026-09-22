@@ -71,3 +71,33 @@ private:
     std::atomic<bool> active_lvgl_{false};
     lv_display_t* lvgl_display_ = nullptr;
 };
+
+// Top-level screen manager for the ESP-VOCAT round panel. Owns a RenderSwitch
+// that hands the shared panel alternately to the emote pet renderer (Home /
+// conversation) and to real LVGL page screens, and tracks which presentation
+// is currently shown. The real page screens arrive in later tasks; for now a
+// non-Home screen renders as a solid-color stand-in via the RenderSwitch.
+class EspVocatUi {
+public:
+    EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
+               int height, emote::EmoteDisplay* emote);
+
+    // Return the panel to the emote pet face (Home). Emotion / idle-animation
+    // driving stays with the board via display_->SetEmotion(...).
+    void ShowHome();
+
+    // Switch to the given LVGL page screen (solid-color stand-in for now).
+    void ShowScreen(ScreenId id);
+
+    // Skeleton: records whether a conversation overlay is active and logs.
+    // Real overlay presentation is deferred to a later task.
+    void SetConversationActive(bool on);
+
+    // The screen currently being presented (Home or a page).
+    ScreenId CurrentScreen() const { return current_; }
+
+private:
+    RenderSwitch render_switch_;
+    ScreenId current_ = ScreenId::Home;
+    bool conversation_active_ = false;
+};
