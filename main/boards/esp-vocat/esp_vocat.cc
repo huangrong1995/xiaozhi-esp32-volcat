@@ -1863,6 +1863,15 @@ private:
         // existing emotion-learning flow. (EmotionLearning screen navigation
         // to/from this callback is wired in a later task.)
         ui_->SetStartLearningCallback([this]() { EnterEmotionLearningMode(); });
+
+        // The conversation overlay fires this when it is left/gone (the leave
+        // mechanism is SetConversationActive(false) -> on_dialog_gone_). This is
+        // a minimal placeholder: return to the Home pet face and log. The full
+        // force-stop of a running dialogue on dialog-gone is wired in a later task.
+        ui_->SetDialogGoneCallback([this]() {
+            ESP_LOGI(TAG, "Conversation overlay gone (dialog-gone); returning to Home");
+            ui_->ShowHome();
+        });
 #endif
     }
 

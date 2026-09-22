@@ -179,6 +179,8 @@ void EspVocatUi::ShowScreen(ScreenId id) {
         render_switch_.ShowLvgl(id, [this]() { BuildSettingsScreen(); });
     } else if (id == ScreenId::EmotionLearning) {
         render_switch_.ShowLvgl(id, [this]() { BuildEmotionLearningScreen(); });
+    } else if (id == ScreenId::ConversationOverlay) {
+        render_switch_.ShowLvgl(id, [this]() { BuildConversationOverlayScreen(); });
     } else {
         render_switch_.ShowLvgl(id);
     }
@@ -186,8 +188,41 @@ void EspVocatUi::ShowScreen(ScreenId id) {
 }
 
 void EspVocatUi::SetConversationActive(bool on) {
+    if (conversation_active_ == on) {
+        return;  // no state change; keep the current presentation and callback
+    }
     conversation_active_ = on;
-    ESP_LOGI(TAG, "EspVocatUi: conversation overlay %s", on ? "on" : "off");
+    if (on) {
+        // Siri-style: the full-screen overlay replaces the Home pet face and is
+        // the sole owner while a conversation is active.
+        ShowScreen(ScreenId::ConversationOverlay);
+        lvgl_port_lock(-1);
+        if (conversation_timer_ != nullptr) {
+            lv_timer_resume(conversation_timer_);
+        }
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "EspVocatUi: conversation overlay on");
+    } else {
+        // Any leave returns to the Home pet face and fires the dialog-gone
+        // callback so esp-vocat can force-stop the running dialogue.
+        lvgl_port_lock(-1);
+        if (conversation_timer_ != nullptr) {
+            lv_timer_pause(conversation_timer_);
+        }
+        lvgl_port_unlock();
+        ShowHome();
+        if (dialog_gone_cb_) {
+            dialog_gone_cb_();
+        }
+        ESP_LOGI(TAG, "EspVocatUi: conversation overlay off (dialog gone fired)");
+    }
+}
+
+void EspVocatUi::SetSpeaking(bool speaking) {
+    lvgl_port_lock(-1);
+    speaking_ = speaking;
+    ApplyConversationState();
+    lvgl_port_unlock();
 }
 
 // ---- Settings screen -------------------------------------------------------
@@ -456,4 +491,101 @@ void EspVocatUi::RefreshEmotionLearningName() {
     lvgl_port_lock(-1);
     lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
     lvgl_port_unlock();
+}
+
+// ---- Conversation overlay (Siri-style, pure LVGL, no pet face) --------------
+
+void EspVocatUi::ConversationWaveformTimerCb(lv_timer_t* timer) {
+    auto* self = static_cast<EspVocatUi*>(lv_timer_get_user_data(timer));
+    if (self == nullptr) {
+        return;
+    }
+    self->AnimateConversationWaveform();
+}
+
+void EspVocatUi::AnimateConversationWaveform() {
+    // Listening uses short, calm bars; speaking uses taller/faster bars. Purely
+    // visual pseudorandom squiggle - no audio energy is sampled here.
+    const int min_h = speaking_ ? 8 : 4;
+    const int max_h = speaking_ ? 32 : 16;
+    const uint32_t range = static_cast<uint32_t>(max_h - min_h);
+    ++waveform_phase_;
+    for (int i = 0; i < kWaveBarCount; ++i) {
+        lv_obj_t* bar = waveform_bars_[i];
+        if (bar == nullptr) {
+            continue;
+        }
+        // Deterministic scatter so neighbouring bars differ at each tick.
+        const uint32_t r = (waveform_phase_ * 2654435761u) + static_cast<uint32_t>(i) * 40321u;
+        lv_obj_set_height(bar, static_cast<lv_coord_t>(min_h + (r % (range + 1))));
+    }
+}
+
+void EspVocatUi::ApplyConversationState() {
+    // The caller holds the LVGL lock when called from outside the LVGL task.
+    if (conversation_status_label_ != nullptr) {
+        lv_label_set_text(conversation_status_label_, speaking_ ? "正在说" : "正在听");
+    }
+    if (conversation_timer_ != nullptr) {
+        // Speaking animates faster (100ms) than listening (200ms).
+        lv_timer_set_period(conversation_timer_, speaking_ ? 100 : 200);
+    }
+}
+
+void EspVocatUi::BuildConversationOverlayScreen() {
+    // Build the object tree once and reuse it for the device lifetime; a later
+    // ShowScreen just reloads and reapplies the cached speaking state.
+    if (conversation_screen_ != nullptr) {
+        lv_screen_load(conversation_screen_);
+        ApplyConversationState();
+        return;
+    }
+
+    // Full-screen translucent dark scene that entirely replaces the Home pet
+    // face while talking (Siri-style). No pet face is composited here.
+    lv_obj_t* scr = lv_screen_active();
+    lv_obj_remove_style_all(scr);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_90, 0);
+
+    // Translucent bottom card holding the status label and the waveform.
+    lv_obj_t* card = lv_obj_create(scr);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 324, 140);
+    lv_obj_align(card, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x2A2A40), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_60, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_shadow_width(card, 14, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
+
+    // Status label: 正在听 (listening) / 正在说 (speaking), toggled by SetSpeaking.
+    lv_obj_t* label = lv_label_create(card);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(label, &font_puhui_20_4, 0);
+    lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -24);
+    conversation_status_label_ = label;
+
+    // Waveform: a row of short rounded bars whose heights the timer varies.
+    const int mid = kWaveBarCount / 2;
+    for (int i = 0; i < kWaveBarCount; ++i) {
+        lv_obj_t* bar = lv_obj_create(card);
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 8, 12);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0xFFA94D), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(bar, 4, 0);
+        lv_obj_align(bar, LV_ALIGN_CENTER, (i - mid) * 14, -10);
+        waveform_bars_[i] = bar;
+    }
+
+    // Drive the waveform with a periodic LVGL timer (starts paused; resumed by
+    // SetConversationActive(true), paused again on leave).
+    conversation_timer_ = lv_timer_create(EspVocatUi::ConversationWaveformTimerCb, 200, this);
+    lv_timer_pause(conversation_timer_);
+
+    conversation_screen_ = scr;
+    lv_screen_load(conversation_screen_);
+    ApplyConversationState();
+    ESP_LOGI(TAG, "EspVocatUi: conversation overlay built");
 }

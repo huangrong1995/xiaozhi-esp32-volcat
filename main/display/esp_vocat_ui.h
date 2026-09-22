@@ -94,8 +94,11 @@ public:
     // Switch to the given LVGL page screen (solid-color stand-in for now).
     void ShowScreen(ScreenId id);
 
-    // Skeleton: records whether a conversation overlay is active and logs.
-    // Real overlay presentation is deferred to a later task.
+    // Show/hide the conversation overlay. on = ShowScreen(ConversationOverlay) +
+    // active=true (Siri-style full-screen scene that replaces the Home pet face
+    // while talking). off = ShowHome() + active=false + fire the dialog-gone
+    // callback (this is the leave/dialog-gone mechanism; when esp-vocat calls
+    // off, the force-stop of the running dialogue is handled downstream).
     void SetConversationActive(bool on);
 
     // The screen currently being presented (Home or a page).
@@ -130,6 +133,17 @@ public:
     // Register the callback invoked when the user presses the 开始 button.
     // The board wires this to its existing emotion-learning flow.
     void SetStartLearningCallback(StartCb cb) { start_learning_cb_ = std::move(cb); }
+
+    // --- Conversation overlay (Siri-style, pure LVGL, no pet face) ----------
+    // Fired when the conversation overlay is left/gone (SetConversationActive
+    // off); the board force-stops the running dialogue (bug #2 fix basis).
+    using DialogGoneCb = std::function<void()>;
+    void SetDialogGoneCallback(DialogGoneCb cb) { dialog_gone_cb_ = std::move(cb); }
+
+    // Toggle the live status label (正在听/正在说) and the waveform intensity:
+    // listening = gentle waveform, speaking = taller/faster. Safe to call
+    // before the overlay is built (the state is cached and applied on build).
+    void SetSpeaking(bool speaking);
 
 private:
     RenderSwitch render_switch_;
@@ -184,4 +198,27 @@ private:
     lv_obj_t* emotion_name_label_ = nullptr;
     std::string emotion_name_;  // cached; applied to the label once built
     StartCb start_learning_cb_;
+
+    // ---- Conversation overlay implementation --------------------------------
+    static constexpr int kWaveBarCount = 9;  // short bars in the waveform
+
+    // lv_timer_cb_t: animates the waveform bar heights. Runs inside the LVGL
+    // task's handler (already under the port lock), so it must NOT lock again.
+    static void ConversationWaveformTimerCb(lv_timer_t* timer);
+
+    // Build (once) and show the conversation overlay; reused across shows.
+    void BuildConversationOverlayScreen();
+    // One waveform tick: pseudo-randomize each bar height by speaking_ state.
+    void AnimateConversationWaveform();
+    // Apply the cached speaking_ state (status text + timer period). The caller
+    // is responsible for holding the LVGL lock when called from outside it.
+    void ApplyConversationState();
+
+    lv_obj_t* conversation_screen_ = nullptr;
+    lv_obj_t* conversation_status_label_ = nullptr;
+    lv_obj_t* waveform_bars_[kWaveBarCount] = {};
+    lv_timer_t* conversation_timer_ = nullptr;
+    bool speaking_ = false;   // cached; 0 listening / 1 speaking
+    uint32_t waveform_phase_ = 0;  // monotonically increasing timer tick counter
+    DialogGoneCb dialog_gone_cb_;
 };
