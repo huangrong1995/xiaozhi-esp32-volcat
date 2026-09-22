@@ -1,0 +1,14 @@
+# ESP-IDF Partition Table (esp-vocat)
+# This is a variant of 16m.csv with the two OTA slots enlarged from 0x3f0000
+# to 0x400000 so each can hold the esp-vocat app that links the full CJK font
+# (font_puhui_20_4, ~1.19 MB) used by the LVGL screens. The OTA region grows by
+# 0x40000; the assets partition moves up to 0x820000 and shrinks to 0x7e0000
+# (~7.87 MB) to keep the total at 16 MB. assets still fits expression_assets.bin
+# (~2.6 MB) plus network-loadable fonts/themes/wake-words.
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,    0x4000,
+otadata,  data, ota,     0xd000,    0x2000,
+phy_init, data, phy,     0xf000,    0x1000,
+ota_0,    app,  ota_0,   0x20000,   0x400000,
+ota_1,    app,  ota_1,   ,          0x400000,
+assets,   data, spiffs,  0x820000,  0x7e0000,
