@@ -25,17 +25,17 @@
 
 ### 渲染所有权
 
-同一个 ST77916 面板同一时刻只能由一个渲染器驱动。选择**首选与回退**两级：
+同一个 ST77916 面板同一时刻只能由一个渲染器驱动。经源码核实（`InitializeEmote`，`emote_display.cc:81`），emote 引擎是**自含全屏渲染器**：`emote_init` 自建渲染任务 + 双缓冲，`flush_cb` 直接写面板，**无 canvas/容器 API**（只有 anim/label/img/qrcode），无法把宠物脸渲染进 LVGL 子控件。故**首选 P 不可行**，采用**回退 F**：
 
-- **首选（P）：LVGL 独占面板，宠物脸渲染进 LVGL**。用 `esp_lvgl_port` 初始化面板为 LVGL 显示（照搬 `LvglDisplay`），表情宠物脸由 emote gfx 渲染进一个 LVGL 子容器/canvas，作为 Home 屏中央子控件。统一在 LVGL 一棵对象树里，无双渲染器抢面板问题，卡片/波形/表情/动画无缝共存。
-- **回退（F)：渲染器切换器**。若 spike 证明 emote 无法离屏渲染进 LVGL canvas，则实现一个 RenderSwitch：页面/覆盖层时暂停 emote、LVGL 接管面板；回 Home 时反之。可行但更脆弱（需保证帧连续、无闪烁）。
+- **架构 F（渲染器切换器，已定）**：Home / 对话时 emote 引擎独占面板（保留可爱宠物动画）；情绪学习 / 设置 / 说话覆盖层时 LVGL 接管同一面板渲染真 iPhone 风页面。两者在屏幕边界通过一个 `RenderSwitch` 切换所有权（暂停一方渲染任务、激活另一方）。QSPI 面板操作不可重入，需保证同一时刻只有一个渲染器在写面板、且切换无闪烁。
 
-> **Spike 门槛**：架构 P 是否能落地，取决于 emote gfx 能否把表情渲染进一个 LVGL canvas/容器（而非独占全屏）。实施计划第一条任务必须是这个 spike，产出一个可运行的最小演示（LVGL 背景 + 中央一块 canvas 跑 emote 表情动画）。spike 不通过则回退到 F。**涉及渲染器选择的结论不允许在计划里悬空**。
+> **Spike 门槛**：架构 F 能否顺畅落地，取决于 emote 与 LVGL 能否在**同一块 ST77916** 上交替接管且无闪烁、无冲突。实施计划第一条任务必须是这个 spike，产出可运行最小演示：初始化两套渲染做**有效交接**，证明 Home↔页面 往返干净。**涉及渲染器接管的结论不允许在计划里悬空**。若 F 也失败，则需重估全盘 LVGL（F2）——不在本 spec 假定范围。
 
 ### 组件归属（规划中的文件层级）
 
-- 新 `LvglPageUi` 层（或并入一个 `EspVocatUi`）：持有 LVGL 对象树（Home 屏、说话覆盖层、情绪学习屏、设置屏），响应屏幕切换。
-- 现有 `emote::EmoteDisplay`：继续负责宠物表情/动画；若走 P，被重构成渲染进 LVGL canvas。
+- 新 `EspVocatUi`（含 `RenderSwitch`）：接管屏切换决策。Home / 对话时把面板交给 emote、由现有 `EmoteDisplay` 驱动；情绪学习 / 设置 / 说话覆盖层时把面板交给 LVGL、渲染页面对象树。
+- 现有 `emote::EmoteDisplay`：Home / 对话时独占面板渲染宠物表情/动画（保持不变）。
+- LVGL 页面层（新，照搬 `LvglDisplay`/`lcd_display.cc` 的 `lv_init`+`lvgl_port_init` 集成）：情绪学习、设置、说话覆盖层的对象树。
 - `esp_vocat.cc`：`OnGesture`/`mode_` 表单机继续存在，但 `mode_` 含义与屏切换统一为「当前屏」，且**每次进非对话屏都强制结束对话**。
 
 ## 屏与交互映射
