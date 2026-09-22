@@ -617,6 +617,13 @@ private:
         if (self == nullptr || self->CurrentScreen() == ScreenId::Home || self->reminder_active_) {
             return;
         }
+        // A live conversation (overlay up) is active interaction: never auto-close
+        // it via the idle-to-Home timer. It ends only by navigation. The timer is
+        // one-shot, so re-arm it to keep this gate armed until the user leaves.
+        if (self->CurrentScreen() == ScreenId::ConversationOverlay) {
+            self->ResetModeIdleTimer();
+            return;
+        }
         self->ExitToChat();
     }
 
@@ -626,9 +633,12 @@ private:
         // and wake the display if it had fallen to level-1 sleep (spec §6.2).
         TouchPowerSaveActivity();
         ResetModeIdleTimer();
-        // Reminder-first routing: while a reminder is active, its acknowledgement
-        // owns all screen gestures; navigation is blocked until handled.
-        if (reminder_active_) {
+        // Reminder-first routing: a visible reminder owns screen gestures so it
+        // can be acknowledged. Reminders only present on the Home pet-cat screen;
+        // if one stays active while a non-Home page is up, never hijack that
+        // page's navigation — let the swipe return Home first, then the reminder
+        // re-engages there (avoids an invisible reminder blocking the way back).
+        if (reminder_active_ && CurrentScreen() == ScreenId::Home) {
             HandleReminderGesture(gesture);
             return;
         }
@@ -671,13 +681,24 @@ private:
         UpdatePowerSaveEligibility();
     }
 
-    // Force-end any active conversation before leaving Home (bug #2). A no-op
-    // when no conversation is active; SetConversationActive(false) then lets the
-    // caller present the target screen.
+    // Force-end any active conversation before leaving Home (bug #2). Covers both
+    // the LVGL overlay conversation (LongPress: SetConversationActive(false)
+    // fires dialog-gone → force-stop) and conversations started by the BOOT
+    // button / wake word, which run directly on the voice pipeline without the
+    // overlay. In that second case the overlay was never up, so also stop a
+    // device that is currently listening/speaking explicitly — this is
+    // idempotent with the dialog-gone path and guarantees navigation away can
+    // never leave the audio running over a page screen.
     void ForceEndDialogue()
     {
         if (ui_ != nullptr) {
-            ui_->SetConversationActive(false);
+            ui_->SetConversationActive(false);  // fires dialog-gone if overlay up
+        }
+        auto& app = Application::GetInstance();
+        auto state = app.GetDeviceState();
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            app.StopListening();
+            app.AbortSpeaking(kAbortReasonNone);
         }
     }
 
@@ -803,7 +824,11 @@ private:
             ExitToChat();
             break;
         case Gesture::Tap:
-            // Light touch feedback.
+            // Light touch feedback — but not during a live conversation overlay,
+            // where an audible blip would distract from the ongoing dialogue.
+            if (CurrentScreen() == ScreenId::ConversationOverlay) {
+                break;
+            }
             ShowTemporaryEmotion("happy", 1500);
             Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
             break;
