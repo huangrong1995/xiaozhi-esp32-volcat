@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -51,7 +52,10 @@ public:
 
     // Hand the panel to the emote renderer (Home / conversation pet face).
     void ShowEmote();
-    // Hand the panel to LVGL and show the given page screen.
+    // Hand the panel to LVGL and show the given page screen. When build is
+    // non-empty it runs under the LVGL lock (in place of the solid-color
+    // stand-in) so EspVocatUi can assemble a real screen on the active scr.
+    void ShowLvgl(ScreenId id, const std::function<void()>& build);
     void ShowLvgl(ScreenId id);
 
     // True while LVGL owns the panel (ShowLvgl active); false while emote does.
@@ -96,8 +100,56 @@ public:
     // The screen currently being presented (Home or a page).
     ScreenId CurrentScreen() const { return current_; }
 
+    // --- Settings screen (pure LVGL, no pet face) --------------------------
+    // Value-change callback signature. EspVocatUi stays decoupled from the
+    // backlight / audio service; the board registers these to apply changes.
+    using ChangeCb = std::function<void(int)>;
+    using BackToHomeCb = std::function<void()>;
+
+    // Inject the current hardware value so the stepper displays reality
+    // (esp-vocat calls these at startup). Values clamp to 0-100.
+    void SetSettingsValueBrightness(int value);
+    void SetSettingsValueVolume(int value);
+
+    // Register callbacks invoked when the user changes a stepper value (only
+    // when the value actually changed). Called with the new clamped 0-100 value.
+    void SetBrightnessChangeCallback(ChangeCb cb) { brightness_change_cb_ = std::move(cb); }
+    void SetVolumeChangeCallback(ChangeCb cb) { volume_change_cb_ = std::move(cb); }
+
+    // Invoked when the settings screen's upper-left back button is pressed.
+    void SetBackToHomeCallback(BackToHomeCb cb) { back_to_home_cb_ = std::move(cb); }
+
 private:
     RenderSwitch render_switch_;
     ScreenId current_ = ScreenId::Home;
     bool conversation_active_ = false;
+
+    // ---- Settings screen implementation ------------------------------------
+    // Identifies which stepper was pressed (brightness/volume + direction).
+    struct SettingsStepTarget {
+        EspVocatUi* ui;
+        bool is_brightness;
+        int delta;
+    };
+
+    static void SettingsStepperEventCb(lv_event_t* e);
+    static void SettingsBackEventCb(lv_event_t* e);
+
+    // Build (once) and show the settings screen; reused across ShowScreen calls.
+    void BuildSettingsScreen();
+    // Build a single grouped row: name label + value label + −/＋ steppers.
+    void BuildSettingsRow(lv_obj_t* scr, const char* name, lv_obj_t** value_label_out,
+                          bool is_brightness, int y_offset);
+    // Clamp, refresh the value label, and fire the change callback if changed.
+    void ApplySettingsValue(bool is_brightness, int delta);
+    void RefreshSettingsValueLabel(bool is_brightness);
+
+    lv_obj_t* settings_screen_ = nullptr;
+    lv_obj_t* brightness_value_label_ = nullptr;
+    lv_obj_t* volume_value_label_ = nullptr;
+    int brightness_ = 50;  // cached stepper values (0-100), shown on the screen
+    int volume_ = 50;
+    ChangeCb brightness_change_cb_;
+    ChangeCb volume_change_cb_;
+    BackToHomeCb back_to_home_cb_;
 };

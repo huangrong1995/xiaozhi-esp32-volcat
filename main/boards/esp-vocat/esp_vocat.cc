@@ -1842,6 +1842,22 @@ private:
         ui_ = new EspVocatUi(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                              static_cast<emote::EmoteDisplay*>(display_));
         ui_->ShowHome();
+
+        // Wire the LVGL settings screen's steppers to the real hardware. The
+        // EspVocatUi stays decoupled from these services; the board injects the
+        // current values and registers change callbacks (applied only on an
+        // actual value change, clamped 0-100). Back returns to the Home face.
+        ui_->SetSettingsValueBrightness(backlight_ != nullptr ? backlight_->brightness() : 50);
+        ui_->SetSettingsValueVolume(Application::GetInstance().GetAudioService().GetOutputVolume());
+        ui_->SetBrightnessChangeCallback([this](int value) {
+            if (backlight_ != nullptr) {
+                backlight_->SetBrightness(static_cast<uint8_t>(value));
+            }
+        });
+        ui_->SetVolumeChangeCallback([this](int value) {
+            Application::GetInstance().GetAudioService().SetOutputVolume(value);
+        });
+        ui_->SetBackToHomeCallback([this]() { ui_->ShowHome(); });
 #endif
     }
 
