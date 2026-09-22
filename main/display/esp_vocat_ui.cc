@@ -16,6 +16,119 @@ LV_FONT_DECLARE(font_puhui_20_4);
 // Log tag shared by RenderSwitch and EspVocatUi.
 static const char* TAG = "esp-vocat";
 
+// ===== Shared visual language (one place; applied by all three screens and the
+// conversation overlay). Unified palette + rounded-corner card language tuned to
+// the 360x360 round panel. Typography hierarchy (title > content > action) is
+// expressed with the existing font_puhui_20_4 via color / weight / spacing -
+// the OTA slot has no room for a larger CJK font, so sizes are not scaled. ====
+namespace {
+// Palette constants from the binding design spec (deep bg + multicolor accents).
+constexpr uint32_t kDeepBg = 0x1A1A2E;
+constexpr uint32_t kPink = 0xFF8FB1;
+constexpr uint32_t kOrange = 0xFFA94D;
+[[maybe_unused]] constexpr uint32_t kMint = 0x63E6BE;
+constexpr uint32_t kLavender = 0x9775FA;
+[[maybe_unused]] constexpr uint32_t kSoftYellow = 0xFFD43B;
+constexpr uint32_t kWhite = 0xFFFFFF;
+constexpr uint32_t kCardBg = 0x2A2A40;  // layered card surface on the deep bg
+
+// Rounded-corner language matching the panel curvature.
+constexpr lv_coord_t kRadiusCard = 22;           // cards
+constexpr lv_coord_t kRadiusPrimaryBtn = 36;     // large accent buttons
+constexpr lv_coord_t kRadiusRoundBtn = 22;       // back / ‹› / stepper buttons
+constexpr lv_coord_t kRadiusBar = 4;             // waveform bars
+
+// Screen-transition animation budget (lightweight, keeps within frame budget on
+// the RGB565 round panel; deliberately not applied to the conversation overlay
+// so its waveform timer is never disturbed).
+constexpr uint32_t kScreenFadeMs = 200;
+
+// Shared style objects, constructed once via EnsureSharedStyles() (LVGL v9
+// pointer API), then attached to widgets with lv_obj_add_style.
+lv_style_t g_style_screen_bg;    // 0x1A1A2E opaque page background
+lv_style_t g_style_overlay_bg;   // translucent page background (conversation)
+lv_style_t g_style_card;         // rounded, softly shadowed card
+lv_style_t g_style_overlay_card; // translucent card (conversation)
+lv_style_t g_style_title;        // white full-opacity heading
+lv_style_t g_style_body;         // white 80% body/content
+lv_style_t g_style_primary_btn;  // pink accent (主按钮 / 开始)
+lv_style_t g_style_accent_btn;   // lavender accent (back / ‹› / −)
+lv_style_t g_style_stepper_btn;  // pink accent stepper (＋)
+lv_style_t g_style_accent_text;  // pink value / highlight text
+lv_style_t g_style_emotion_name; // lavender central emotion label
+lv_style_t g_style_btn_label;    // white on-button glyph
+
+void InitSharedStyles() {
+    lv_style_init(&g_style_screen_bg);
+    lv_style_set_bg_color(&g_style_screen_bg, lv_color_hex(kDeepBg));
+    lv_style_set_bg_opa(&g_style_screen_bg, LV_OPA_COVER);
+
+    lv_style_init(&g_style_overlay_bg);
+    lv_style_set_bg_color(&g_style_overlay_bg, lv_color_hex(kDeepBg));
+    lv_style_set_bg_opa(&g_style_overlay_bg, LV_OPA_90);
+
+    lv_style_init(&g_style_card);
+    lv_style_set_bg_color(&g_style_card, lv_color_hex(kCardBg));
+    lv_style_set_bg_opa(&g_style_card, LV_OPA_COVER);
+    lv_style_set_radius(&g_style_card, kRadiusCard);
+    lv_style_set_shadow_width(&g_style_card, 16);
+    lv_style_set_shadow_opa(&g_style_card, LV_OPA_30);
+    lv_style_set_shadow_color(&g_style_card, lv_color_hex(0x000000));
+
+    lv_style_init(&g_style_overlay_card);
+    lv_style_set_bg_color(&g_style_overlay_card, lv_color_hex(kCardBg));
+    lv_style_set_bg_opa(&g_style_overlay_card, LV_OPA_60);
+    lv_style_set_radius(&g_style_overlay_card, kRadiusCard);
+    lv_style_set_shadow_width(&g_style_overlay_card, 16);
+    lv_style_set_shadow_opa(&g_style_overlay_card, LV_OPA_30);
+    lv_style_set_shadow_color(&g_style_overlay_card, lv_color_hex(0x000000));
+
+    lv_style_init(&g_style_title);
+    lv_style_set_text_color(&g_style_title, lv_color_hex(kWhite));
+    lv_style_set_text_font(&g_style_title, &font_puhui_20_4);
+
+    lv_style_init(&g_style_body);
+    lv_style_set_text_color(&g_style_body, lv_color_hex(kWhite));
+    lv_style_set_text_opa(&g_style_body, LV_OPA_80);
+    lv_style_set_text_font(&g_style_body, &font_puhui_20_4);
+
+    lv_style_init(&g_style_primary_btn);
+    lv_style_set_bg_color(&g_style_primary_btn, lv_color_hex(kPink));
+    lv_style_set_bg_opa(&g_style_primary_btn, LV_OPA_COVER);
+    lv_style_set_radius(&g_style_primary_btn, kRadiusPrimaryBtn);
+
+    lv_style_init(&g_style_accent_btn);
+    lv_style_set_bg_color(&g_style_accent_btn, lv_color_hex(kLavender));
+    lv_style_set_bg_opa(&g_style_accent_btn, LV_OPA_COVER);
+    lv_style_set_radius(&g_style_accent_btn, kRadiusRoundBtn);
+
+    lv_style_init(&g_style_stepper_btn);
+    lv_style_set_bg_color(&g_style_stepper_btn, lv_color_hex(kPink));
+    lv_style_set_bg_opa(&g_style_stepper_btn, LV_OPA_COVER);
+    lv_style_set_radius(&g_style_stepper_btn, kRadiusRoundBtn);
+
+    lv_style_init(&g_style_accent_text);
+    lv_style_set_text_color(&g_style_accent_text, lv_color_hex(kPink));
+    lv_style_set_text_font(&g_style_accent_text, &font_puhui_20_4);
+
+    lv_style_init(&g_style_emotion_name);
+    lv_style_set_text_color(&g_style_emotion_name, lv_color_hex(kLavender));
+    lv_style_set_text_font(&g_style_emotion_name, &font_puhui_20_4);
+
+    lv_style_init(&g_style_btn_label);
+    lv_style_set_text_color(&g_style_btn_label, lv_color_hex(kWhite));
+    lv_style_set_text_font(&g_style_btn_label, &font_puhui_20_4);
+}
+
+void EnsureSharedStyles() {
+    static bool inited = false;
+    if (!inited) {
+        InitSharedStyles();
+        inited = true;
+    }
+}
+}  // namespace
+
 // Solid-color stand-in for a real LVGL page, per ScreenId. Replaced by the real
 // page screens in a later task; kept so a non-Home screen renders something.
 static lv_color_t SpikePageColor(ScreenId id) {
@@ -165,6 +278,8 @@ void RenderSwitch::ShowLvgl(ScreenId id) { ShowLvgl(id, {}); }
 EspVocatUi::EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
                        int height, emote::EmoteDisplay* emote)
     : render_switch_(panel, panel_io, width, height, emote) {
+    // Build the shared style set once (RenderSwitch has already run lv_init).
+    EnsureSharedStyles();
     // The panel starts owned by emote; land on the Home pet face.
     ShowHome();
 }
@@ -252,7 +367,8 @@ void EspVocatUi::BuildSettingsScreen() {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
     if (settings_screen_ != nullptr) {
-        lv_screen_load(settings_screen_);
+        lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0,
+                            false);
         RefreshSettingsValueLabel(true);
         RefreshSettingsValueLabel(false);
         return;
@@ -261,28 +377,23 @@ void EspVocatUi::BuildSettingsScreen() {
     // Dark iPhone-style grouped list, inset to the round 360x360 panel.
     lv_obj_t* scr = lv_screen_active();
     lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A2E), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_add_style(scr, &g_style_screen_bg, 0);
 
     // Title 设置.
     lv_obj_t* title = lv_label_create(scr);
     lv_label_set_text(title, "设置");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(title, &font_puhui_20_4, 0);
+    lv_obj_add_style(title, &g_style_title, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 26);
 
     // Upper-left back button. '<' is guaranteed in the CJK font's Latin range.
     lv_obj_t* back = lv_button_create(scr);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x9775FA), 0);
-    lv_obj_set_style_bg_opa(back, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(back, 20, 0);
+    lv_obj_add_style(back, &g_style_accent_btn, 0);
     lv_obj_set_size(back, 40, 40);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
     lv_obj_add_event_cb(back, EspVocatUi::SettingsBackEventCb, LV_EVENT_CLICKED, this);
     lv_obj_t* back_label = lv_label_create(back);
     lv_label_set_text(back_label, "<");
-    lv_obj_set_style_text_color(back_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(back_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(back_label, &g_style_btn_label, 0);
     lv_obj_center(back_label);
 
     // Two grouped rows: 亮度 (brightness) and 音量 (volume).
@@ -290,7 +401,7 @@ void EspVocatUi::BuildSettingsScreen() {
     BuildSettingsRow(scr, "音量", &volume_value_label_, false, 180);
 
     settings_screen_ = scr;
-    lv_screen_load(settings_screen_);
+    lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
     RefreshSettingsValueLabel(true);
     RefreshSettingsValueLabel(false);
     ESP_LOGI(TAG, "EspVocatUi: settings screen built");
@@ -303,54 +414,42 @@ void EspVocatUi::BuildSettingsRow(lv_obj_t* scr, const char* name, lv_obj_t** va
     lv_obj_remove_style_all(card);
     lv_obj_set_size(card, 324, 84);
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, y_offset);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x2A2A40), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 18, 0);
-    lv_obj_set_style_shadow_width(card, 14, 0);
-    lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
+    lv_obj_add_style(card, &g_style_card, 0);
 
-    // Row name.
+    // Row name (content tier: white 80%).
     lv_obj_t* name_label = lv_label_create(card);
     lv_label_set_text(name_label, name);
-    lv_obj_set_style_text_color(name_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(name_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(name_label, &g_style_body, 0);
     lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 18, 0);
 
-    // Center value label (refreshed on change).
+    // Center value label (refreshed on change), pink accent.
     lv_obj_t* value_label = lv_label_create(card);
-    lv_obj_set_style_text_color(value_label, lv_color_hex(0xFF8FB1), 0);
-    lv_obj_set_style_text_font(value_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(value_label, &g_style_accent_text, 0);
     lv_obj_align(value_label, LV_ALIGN_CENTER, 0, 0);
     *value_label_out = value_label;
 
-    // Minus (−) stepper.
+    // Minus (−) stepper (lavender accent).
     lv_obj_t* minus = lv_button_create(card);
     lv_obj_set_size(minus, 44, 44);
     lv_obj_align(minus, LV_ALIGN_LEFT_MID, 66, 0);
-    lv_obj_set_style_bg_color(minus, lv_color_hex(0x9775FA), 0);
-    lv_obj_set_style_bg_opa(minus, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(minus, 22, 0);
+    lv_obj_add_style(minus, &g_style_accent_btn, 0);
     lv_obj_add_event_cb(minus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
                         new SettingsStepTarget{this, is_brightness, -1});
     lv_obj_t* minus_label = lv_label_create(minus);
     lv_label_set_text(minus_label, "-");
-    lv_obj_set_style_text_color(minus_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(minus_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(minus_label, &g_style_btn_label, 0);
     lv_obj_center(minus_label);
 
-    // Plus (+) stepper.
+    // Plus (+) stepper (pink accent).
     lv_obj_t* plus = lv_button_create(card);
     lv_obj_set_size(plus, 44, 44);
     lv_obj_align(plus, LV_ALIGN_RIGHT_MID, -18, 0);
-    lv_obj_set_style_bg_color(plus, lv_color_hex(0xFF8FB1), 0);
-    lv_obj_set_style_bg_opa(plus, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(plus, 22, 0);
+    lv_obj_add_style(plus, &g_style_stepper_btn, 0);
     lv_obj_add_event_cb(plus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
                         new SettingsStepTarget{this, is_brightness, +1});
     lv_obj_t* plus_label = lv_label_create(plus);
     lv_label_set_text(plus_label, "+");
-    lv_obj_set_style_text_color(plus_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(plus_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(plus_label, &g_style_btn_label, 0);
     lv_obj_center(plus_label);
 }
 
@@ -428,7 +527,8 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
     if (emotion_screen_ != nullptr) {
-        lv_screen_load(emotion_screen_);
+        lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0,
+                            false);
         RefreshEmotionLearningName();
         return;
     }
@@ -437,67 +537,55 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     // panel. No pet face; this is a pure LVGL page.
     lv_obj_t* scr = lv_screen_active();
     lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A2E), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_add_style(scr, &g_style_screen_bg, 0);
 
     // Title 情绪学习.
     lv_obj_t* title = lv_label_create(scr);
     lv_label_set_text(title, "情绪学习");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(title, &font_puhui_20_4, 0);
+    lv_obj_add_style(title, &g_style_title, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 26);
 
     // Upper-left back button. Reuses the shared SettingsBackEventCb, which
     // fires back_to_home_cb_ (defaulting to ShowHome) - no second back hook.
     lv_obj_t* back = lv_button_create(scr);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x9775FA), 0);
-    lv_obj_set_style_bg_opa(back, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(back, 20, 0);
+    lv_obj_add_style(back, &g_style_accent_btn, 0);
     lv_obj_set_size(back, 40, 40);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
     lv_obj_add_event_cb(back, EspVocatUi::SettingsBackEventCb, LV_EVENT_CLICKED, this);
     lv_obj_t* back_label = lv_label_create(back);
     lv_label_set_text(back_label, "<");
-    lv_obj_set_style_text_color(back_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(back_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(back_label, &g_style_btn_label, 0);
     lv_obj_center(back_label);
 
     // Left ‹ / right › round emotion-step buttons flanking the current name.
     // Each fires the board's prev/next callback (which cycles the emotion index
     // and calls SetEmotionLearningName). Round buttons avoid the panel's edge.
     lv_obj_t* prev = lv_button_create(scr);
-    lv_obj_set_style_bg_color(prev, lv_color_hex(0x9775FA), 0);
-    lv_obj_set_style_bg_opa(prev, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(prev, 32, 0);
+    lv_obj_add_style(prev, &g_style_accent_btn, 0);
     lv_obj_set_size(prev, 64, 64);
     lv_obj_align(prev, LV_ALIGN_LEFT_MID, 12, -30);
     lv_obj_add_event_cb(prev, EspVocatUi::EmotionLearningStepEventCb, LV_EVENT_CLICKED,
                         new EmotionStepTarget{this, false});
     lv_obj_t* prev_label = lv_label_create(prev);
     lv_label_set_text(prev_label, "<");
-    lv_obj_set_style_text_color(prev_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(prev_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(prev_label, &g_style_btn_label, 0);
     lv_obj_center(prev_label);
 
     lv_obj_t* next = lv_button_create(scr);
-    lv_obj_set_style_bg_color(next, lv_color_hex(0x9775FA), 0);
-    lv_obj_set_style_bg_opa(next, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(next, 32, 0);
+    lv_obj_add_style(next, &g_style_accent_btn, 0);
     lv_obj_set_size(next, 64, 64);
     lv_obj_align(next, LV_ALIGN_RIGHT_MID, -12, -30);
     lv_obj_add_event_cb(next, EspVocatUi::EmotionLearningStepEventCb, LV_EVENT_CLICKED,
                         new EmotionStepTarget{this, true});
     lv_obj_t* next_label = lv_label_create(next);
     lv_label_set_text(next_label, ">");
-    lv_obj_set_style_text_color(next_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(next_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(next_label, &g_style_btn_label, 0);
     lv_obj_center(next_label);
 
-    // Central current-emotion name label (large, lavender default; a full
+    // Central current-emotion name label (lavender accent; a full
     // emotion->color map is deferred to a later task).
     lv_obj_t* name_label = lv_label_create(scr);
-    lv_obj_set_style_text_color(name_label, lv_color_hex(0x9775FA), 0);
-    lv_obj_set_style_text_font(name_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(name_label, &g_style_emotion_name, 0);
     lv_obj_align(name_label, LV_ALIGN_CENTER, 0, -30);
     emotion_name_label_ = name_label;
     RefreshEmotionLearningName();  // apply any name cached before the screen built
@@ -506,19 +594,16 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     lv_obj_t* start = lv_button_create(scr);
     lv_obj_set_size(start, 220, 72);
     lv_obj_align(start, LV_ALIGN_CENTER, 0, 90);
-    lv_obj_set_style_bg_color(start, lv_color_hex(0xFF8FB1), 0);
-    lv_obj_set_style_bg_opa(start, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(start, 36, 0);
+    lv_obj_add_style(start, &g_style_primary_btn, 0);
     lv_obj_add_event_cb(start, EspVocatUi::EmotionLearningStartEventCb, LV_EVENT_CLICKED,
                         new StartLearningTarget{this});
     lv_obj_t* start_label = lv_label_create(start);
     lv_label_set_text(start_label, "开始");
-    lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(start_label, &font_puhui_20_4, 0);
+    lv_obj_add_style(start_label, &g_style_btn_label, 0);
     lv_obj_center(start_label);
 
     emotion_screen_ = scr;
-    lv_screen_load(emotion_screen_);
+    lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
     ESP_LOGI(TAG, "EspVocatUi: emotion learning screen built");
 }
 
@@ -586,27 +671,23 @@ void EspVocatUi::BuildConversationOverlayScreen() {
     }
 
     // Full-screen translucent dark scene that entirely replaces the Home pet
-    // face while talking (Siri-style). No pet face is composited here.
+    // face while talking (Siri-style). No pet face is composited here. No
+    // screen-load animation is used for this overlay so the waveform timer is
+    // never disturbed.
     lv_obj_t* scr = lv_screen_active();
     lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A2E), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_90, 0);
+    lv_obj_add_style(scr, &g_style_overlay_bg, 0);
 
     // Translucent bottom card holding the status label and the waveform.
     lv_obj_t* card = lv_obj_create(scr);
     lv_obj_remove_style_all(card);
     lv_obj_set_size(card, 324, 140);
     lv_obj_align(card, LV_ALIGN_BOTTOM_MID, 0, -40);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x2A2A40), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_60, 0);
-    lv_obj_set_style_radius(card, 18, 0);
-    lv_obj_set_style_shadow_width(card, 14, 0);
-    lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
+    lv_obj_add_style(card, &g_style_overlay_card, 0);
 
     // Status label: 正在听 (listening) / 正在说 (speaking), toggled by SetSpeaking.
     lv_obj_t* label = lv_label_create(card);
-    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(label, &font_puhui_20_4, 0);
+    lv_obj_add_style(label, &g_style_title, 0);
     lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -24);
     conversation_status_label_ = label;
 
@@ -616,9 +697,9 @@ void EspVocatUi::BuildConversationOverlayScreen() {
         lv_obj_t* bar = lv_obj_create(card);
         lv_obj_remove_style_all(bar);
         lv_obj_set_size(bar, 8, 12);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(0xFFA94D), 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(kOrange), 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(bar, 4, 0);
+        lv_obj_set_style_radius(bar, kRadiusBar, 0);
         lv_obj_align(bar, LV_ALIGN_CENTER, (i - mid) * 14, -10);
         waveform_bars_[i] = bar;
     }
