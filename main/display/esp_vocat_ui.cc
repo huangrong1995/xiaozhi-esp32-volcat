@@ -177,6 +177,8 @@ void EspVocatUi::ShowHome() {
 void EspVocatUi::ShowScreen(ScreenId id) {
     if (id == ScreenId::Settings) {
         render_switch_.ShowLvgl(id, [this]() { BuildSettingsScreen(); });
+    } else if (id == ScreenId::EmotionLearning) {
+        render_switch_.ShowLvgl(id, [this]() { BuildEmotionLearningScreen(); });
     } else {
         render_switch_.ShowLvgl(id);
     }
@@ -359,4 +361,99 @@ void EspVocatUi::SetSettingsValueBrightness(int value) {
 void EspVocatUi::SetSettingsValueVolume(int value) {
     volume_ = value < 0 ? 0 : (value > 100 ? 100 : value);
     RefreshSettingsValueLabel(false);
+}
+
+// ---- Emotion learning screen -----------------------------------------------
+
+void EspVocatUi::EmotionLearningStartEventCb(lv_event_t* e) {
+    auto* target = static_cast<StartLearningTarget*>(lv_event_get_user_data(e));
+    if (target == nullptr || target->ui == nullptr) {
+        return;
+    }
+    ESP_LOGI(TAG, "EspVocatUi: emotion learning 开始 pressed");
+    if (target->ui->start_learning_cb_) {
+        target->ui->start_learning_cb_();
+    }
+}
+
+void EspVocatUi::BuildEmotionLearningScreen() {
+    // Build the object tree once and reuse it for the device lifetime; a later
+    // ShowScreen just reloads and refreshes the cached labels.
+    if (emotion_screen_ != nullptr) {
+        lv_screen_load(emotion_screen_);
+        RefreshEmotionLearningName();
+        return;
+    }
+
+    // Dark iPhone-style full-card learning page, inset to the round 360x360
+    // panel. No pet face; this is a pure LVGL page.
+    lv_obj_t* scr = lv_screen_active();
+    lv_obj_remove_style_all(scr);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    // Title 情绪学习.
+    lv_obj_t* title = lv_label_create(scr);
+    lv_label_set_text(title, "情绪学习");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(title, &font_puhui_20_4, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 26);
+
+    // Upper-left back button. Reuses the shared SettingsBackEventCb, which
+    // fires back_to_home_cb_ (defaulting to ShowHome) - no second back hook.
+    lv_obj_t* back = lv_button_create(scr);
+    lv_obj_set_style_bg_color(back, lv_color_hex(0x9775FA), 0);
+    lv_obj_set_style_bg_opa(back, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(back, 20, 0);
+    lv_obj_set_size(back, 40, 40);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
+    lv_obj_add_event_cb(back, EspVocatUi::SettingsBackEventCb, LV_EVENT_CLICKED, this);
+    lv_obj_t* back_label = lv_label_create(back);
+    lv_label_set_text(back_label, "<");
+    lv_obj_set_style_text_color(back_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(back_label, &font_puhui_20_4, 0);
+    lv_obj_center(back_label);
+
+    // Central current-emotion name label (large, lavender default; a full
+    // emotion->color map is deferred to a later task).
+    lv_obj_t* name_label = lv_label_create(scr);
+    lv_obj_set_style_text_color(name_label, lv_color_hex(0x9775FA), 0);
+    lv_obj_set_style_text_font(name_label, &font_puhui_20_4, 0);
+    lv_obj_align(name_label, LV_ALIGN_CENTER, 0, -30);
+    emotion_name_label_ = name_label;
+    RefreshEmotionLearningName();  // apply any name cached before the screen built
+
+    // Large 开始 button.
+    lv_obj_t* start = lv_button_create(scr);
+    lv_obj_set_size(start, 220, 72);
+    lv_obj_align(start, LV_ALIGN_CENTER, 0, 90);
+    lv_obj_set_style_bg_color(start, lv_color_hex(0xFF8FB1), 0);
+    lv_obj_set_style_bg_opa(start, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(start, 36, 0);
+    lv_obj_add_event_cb(start, EspVocatUi::EmotionLearningStartEventCb, LV_EVENT_CLICKED,
+                        new StartLearningTarget{this});
+    lv_obj_t* start_label = lv_label_create(start);
+    lv_label_set_text(start_label, "开始");
+    lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(start_label, &font_puhui_20_4, 0);
+    lv_obj_center(start_label);
+
+    emotion_screen_ = scr;
+    lv_screen_load(emotion_screen_);
+    ESP_LOGI(TAG, "EspVocatUi: emotion learning screen built");
+}
+
+void EspVocatUi::SetEmotionLearningName(const char* name) {
+    // Cache unconditionally; the label only exists once the screen is built.
+    emotion_name_ = name != nullptr ? name : "";
+    RefreshEmotionLearningName();
+}
+
+void EspVocatUi::RefreshEmotionLearningName() {
+    if (emotion_name_label_ == nullptr) {
+        return;  // screen not built yet; name cached in emotion_name_
+    }
+    lvgl_port_lock(-1);
+    lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
+    lvgl_port_unlock();
 }

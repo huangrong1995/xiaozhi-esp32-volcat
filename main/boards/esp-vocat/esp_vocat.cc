@@ -1858,6 +1858,11 @@ private:
             Application::GetInstance().GetAudioService().SetOutputVolume(value);
         });
         ui_->SetBackToHomeCallback([this]() { ui_->ShowHome(); });
+
+        // The 开始 button on the emotion learning screen fires the board's
+        // existing emotion-learning flow. (EmotionLearning screen navigation
+        // to/from this callback is wired in a later task.)
+        ui_->SetStartLearningCallback([this]() { EnterEmotionLearningMode(); });
 #endif
     }
 

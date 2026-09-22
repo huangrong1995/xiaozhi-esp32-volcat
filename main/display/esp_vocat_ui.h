@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <functional>
+#include <string>
 
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -119,6 +120,17 @@ public:
     // Invoked when the settings screen's upper-left back button is pressed.
     void SetBackToHomeCallback(BackToHomeCb cb) { back_to_home_cb_ = std::move(cb); }
 
+    // --- Emotion learning screen (pure LVGL, no pet face) --------------------
+    using StartCb = std::function<void()>;
+
+    // Set the central "current emotion" name shown on the learning screen.
+    // If the screen is not yet built, the string is cached and applied on build.
+    void SetEmotionLearningName(const char* name);
+
+    // Register the callback invoked when the user presses the 开始 button.
+    // The board wires this to its existing emotion-learning flow.
+    void SetStartLearningCallback(StartCb cb) { start_learning_cb_ = std::move(cb); }
+
 private:
     RenderSwitch render_switch_;
     ScreenId current_ = ScreenId::Home;
@@ -152,4 +164,24 @@ private:
     ChangeCb brightness_change_cb_;
     ChangeCb volume_change_cb_;
     BackToHomeCb back_to_home_cb_;
+
+    // ---- Emotion learning screen implementation ------------------------------
+    // Identifies the 开始 button press; heap-allocated once when the screen is
+    // built (mirrors Task 3's per-button SettingsStepTarget pattern).
+    struct StartLearningTarget {
+        EspVocatUi* ui;
+    };
+
+    static void EmotionLearningStartEventCb(lv_event_t* e);
+
+    // Build (once) and show the emotion learning screen; reused across
+    // ShowScreen calls. Its back button reuses the shared back_to_home_cb_.
+    void BuildEmotionLearningScreen();
+    // Apply the cached emotion name to the central label if the screen is built.
+    void RefreshEmotionLearningName();
+
+    lv_obj_t* emotion_screen_ = nullptr;
+    lv_obj_t* emotion_name_label_ = nullptr;
+    std::string emotion_name_;  // cached; applied to the label once built
+    StartCb start_learning_cb_;
 };
