@@ -68,9 +68,18 @@ static bool OnFlushIoReady(const esp_lcd_panel_io_handle_t panel_io,
 // Flush callback for emote
 static void OnFlushCallback(int x_start, int y_start, int x_end, int y_end, const void* data,
                             emote_handle_t handle) {
-    esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)emote_get_user_data(handle);
-    if (panel != nullptr) {
-        esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
+    EmoteDisplay* self = static_cast<EmoteDisplay*>(emote_get_user_data(handle));
+    if (self == nullptr) {
+        return;
+    }
+    if (self->PanelWritesEnabled()) {
+        esp_lcd_panel_draw_bitmap(self->PanelHandle(), x_start, y_start, x_end, y_end, data);
+    } else {
+        // The panel is currently owned by another renderer (LVGL). Drop the
+        // frame but keep the emote render loop alive by acknowledging the
+        // flush ourselves (the real draw's io-complete will not occur since
+        // nothing was written to the panel).
+        emote_notify_flush_finished(handle);
     }
 }
 
@@ -78,10 +87,9 @@ static void OnFlushCallback(int x_start, int y_start, int x_end, int y_end, cons
 // Graphics Initialization Functions
 // ============================================================================
 
-static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const int width,
-                                      const int height) {
-    if (!panel) {
-        ESP_LOGE(TAG, "Invalid panel");
+static emote_handle_t InitializeEmote(EmoteDisplay* self, const int width, const int height) {
+    if (self == nullptr) {
+        ESP_LOGE(TAG, "Invalid EmoteDisplay");
         return nullptr;
     }
 
@@ -110,7 +118,7 @@ static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const 
                 .task_stack_in_ext = false,
             },
         .flush_cb = OnFlushCallback,
-        .user_data = (void*)panel,
+        .user_data = (void*)self,
     };
 
     emote_handle_t emote_handle = emote_init(&emote_cfg);
@@ -136,7 +144,8 @@ EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
       idle_emotions_({"happy", "confused", "angry", "shocked"}) {
     width_ = width;
     height_ = height;
-    emote_handle_ = InitializeEmote(panel, width, height);
+    panel_ = panel;
+    emote_handle_ = InitializeEmote(this, width, height);
 
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = OnFlushIoReady,

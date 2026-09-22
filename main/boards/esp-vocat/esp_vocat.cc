@@ -2,6 +2,8 @@
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
 #include "display/emote_display.h"
+#include "display/esp_vocat_ui.h"
+#include "esp_lvgl_port.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
@@ -472,6 +474,9 @@ private:
     Charge* charge_;
     Button boot_button_;
     Display* display_ = nullptr;
+    // SPIKE (Task 1): render-switch feasibility demo. Owns the LVGL display on
+    // the same panel/io that EmoteDisplay uses and hands the panel to each.
+    RenderSwitch* render_switch_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
     esp_timer_handle_t touchpad_timer_;
     esp_lcd_touch_handle_t tp;   // LCD touch handle
@@ -1826,6 +1831,24 @@ private:
 #endif
         backlight_ = new PwmBacklight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         backlight_->RestoreBrightness();
+
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        // ---- SPIKE (Task 1): prove emote and LVGL can alternate on the same
+        // ST77916 panel. RenderSwitch initializes LVGL on the same panel/io
+        // handles that EmoteDisplay owns, then the boot path demonstrates a
+        // round-trip: emote 2s -> LVGL Settings 2s -> emote. See
+        // main/display/esp_vocat_ui.h for the gate model.
+        render_switch_ = new RenderSwitch(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                          static_cast<emote::EmoteDisplay*>(display_));
+        render_switch_->ShowEmote();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        render_switch_->ShowLvgl(ScreenId::Settings);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        render_switch_->ShowEmote();
+        // Spike demo done. The RenderSwitch stays alive (LVGL dormant) so the
+        // app continues on the emote pet face exactly as before. Visual
+        // tear/flicker is deferred to the real-device acceptance (Task 8).
+#endif
     }
 
     void InitializeButtons()
@@ -2061,5 +2084,149 @@ const EspVocat::ScheduleEntry EspVocat::kScheduleReminders_[] = {
     {18, 0, "该吃晚饭了~", "happy"},
     {21, 0, "该睡觉了~", "sleepy"},
 };
+
+// ============================================================================
+// SPIKE (Task 1): RenderSwitch implementation.
+// Proof-of-concept only - Task 2 re-homes these methods into their own .cc.
+// The gate model is documented in main/display/esp_vocat_ui.h.
+// ============================================================================
+
+// Solid-color stand-in for a real page, per ScreenId.
+static lv_color_t SpikePageColor(ScreenId id) {
+    switch (id) {
+        case ScreenId::EmotionLearning:
+            return lv_color_hex(0xFF8FB1);  // pink
+        case ScreenId::Settings:
+            return lv_color_hex(0x63E6BE);  // mint
+        case ScreenId::ConversationOverlay:
+            return lv_color_hex(0xFFA94D);  // orange
+        case ScreenId::Home:
+        default:
+            return lv_color_hex(0x1A1A2E);  // dark
+    }
+}
+
+bool RenderSwitch::IoReadyCallback(esp_lcd_panel_io_handle_t panel_io,
+                                   esp_lcd_panel_io_event_data_t* edata, void* user_ctx) {
+    (void)panel_io;
+    (void)edata;
+    auto* self = static_cast<RenderSwitch*>(user_ctx);
+    if (self == nullptr) {
+        return false;
+    }
+    // Route the transfer-done signal to whichever renderer is the active owner.
+    if (self->active_lvgl_.load() && self->lvgl_display_ != nullptr) {
+        lvgl_port_flush_ready(self->lvgl_display_);
+    } else if (self->emote_ != nullptr) {
+        emote_notify_flush_finished(self->emote_->GetEmoteHandle());
+    }
+    return true;
+}
+
+RenderSwitch::RenderSwitch(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io,
+                           int width, int height, emote::EmoteDisplay* emote)
+    : panel_(panel), panel_io_(panel_io), width_(width), height_(height), emote_(emote) {
+    ESP_LOGI(TAG, "RenderSwitch: init LVGL on emote-owned panel");
+
+    lv_init();
+    lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    port_cfg.task_priority = 1;
+#if CONFIG_SOC_CPU_CORES_NUM > 1
+    port_cfg.task_affinity = 1;
+#endif
+    lvgl_port_init(&port_cfg);
+
+    // The SPI panel_io stores exactly one on_color_trans_done callback and
+    // silently overwrites the previous one (both emote and esp_lvgl_port each
+    // want that slot). Claim it with our fan-out so emote keeps getting its
+    // flush completion even before/after esp_lvgl_port registers its own.
+    const esp_lcd_panel_io_callbacks_t io_cbs = {
+        .on_color_trans_done = RenderSwitch::IoReadyCallback,
+    };
+    esp_lcd_panel_io_register_event_callbacks(panel_io_, &io_cbs, this);
+
+    const lvgl_port_display_cfg_t display_cfg = {
+        .io_handle = panel_io_,
+        .panel_handle = panel_,
+        .control_handle = nullptr,
+        .buffer_size = static_cast<uint32_t>(width_ * 20),
+        .double_buffer = false,
+        .trans_size = 0,
+        .hres = static_cast<uint32_t>(width_),
+        .vres = static_cast<uint32_t>(height_),
+        .monochrome = false,
+        .rotation =
+            {
+                .swap_xy = false,
+                .mirror_x = false,
+                .mirror_y = false,
+            },
+        .color_format = LV_COLOR_FORMAT_RGB565,
+        .flags =
+            {
+                .buff_dma = 1,
+                .buff_spiram = 0,
+                .sw_rotate = 0,
+                .swap_bytes = 1,
+                .full_refresh = 0,
+                .direct_mode = 0,
+            },
+    };
+    lvgl_display_ = lvgl_port_add_disp(&display_cfg);
+    if (lvgl_display_ == nullptr) {
+        ESP_LOGE(TAG, "RenderSwitch: esp_lvgl_port_add_disp failed to attach existing panel");
+        return;
+    }
+
+    // esp_lvgl_port registered its own io callback during add_disp; reclaim the
+    // slot so our fan-out is the stable owner for both renderers.
+    esp_lcd_panel_io_register_event_callbacks(panel_io_, &io_cbs, this);
+
+    // LVGL starts stopped: emote owns the panel until ShowLvgl().
+    lvgl_port_stop();
+    active_lvgl_.store(false);
+    ESP_LOGI(TAG, "RenderSwitch: ready; LVGL display %p attached to emote-owned panel",
+             (void*)lvgl_display_);
+}
+
+RenderSwitch::~RenderSwitch() {
+    // Return the panel to emote ownership before the switch goes away. LVGL is
+    // left dormant (its io fan-out is intentionally kept registered for the
+    // emote renderer, so the object must outlive any subsequent emote flush).
+    ShowEmote();
+}
+
+void RenderSwitch::ShowEmote() {
+    // 1) Stop LVGL first so it produces no further flushes.
+    lvgl_port_stop();
+    // 2) Return the panel to the emote renderer.
+    active_lvgl_.store(false);
+    if (emote_ != nullptr) {
+        emote_->SetPanelWritesEnabled(true);
+    }
+    ESP_LOGI(TAG, "RenderSwitch: ShowEmote -> panel owned by emote");
+}
+
+void RenderSwitch::ShowLvgl(ScreenId id) {
+    // 1) Gate emote's panel writes first. Emote keeps rendering into its own
+    //    buffer but drops panel flushes, so no emote write can race LVGL.
+    if (emote_ != nullptr) {
+        emote_->SetPanelWritesEnabled(false);
+    }
+    active_lvgl_.store(true);
+
+    // 2) Build the requested page as a solid-color screen and load it.
+    lvgl_port_lock(-1);
+    lv_obj_t* scr = lv_screen_active();
+    lv_obj_remove_style_all(scr);
+    lv_obj_set_style_bg_color(scr, SpikePageColor(id), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_screen_load(scr);
+    lvgl_port_unlock();
+
+    // 3) Resume LVGL so it renders and flushes the page.
+    lvgl_port_resume();
+    ESP_LOGI(TAG, "RenderSwitch: ShowLvgl(%d) -> panel owned by LVGL", static_cast<int>(id));
+}
 
 DECLARE_BOARD(EspVocat);

@@ -47,6 +47,14 @@ public:
     // Get emote handle for internal use
     emote_handle_t GetEmoteHandle() const { return emote_handle_; }
 
+    // Panel-write gate used by RenderSwitch. When disabled, the emote flush
+    // callback drops panel flushes (acknowledging them itself) so another
+    // renderer (LVGL) can own the panel. When re-enabled, emote resumes
+    // writing to the panel.
+    void SetPanelWritesEnabled(bool enabled) { panel_writes_enabled_.store(enabled); }
+    bool PanelWritesEnabled() const { return panel_writes_enabled_.load(); }
+    esp_lcd_panel_handle_t PanelHandle() const { return panel_; }
+
 private:
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
@@ -61,6 +69,8 @@ private:
     void SetPageUiVisible(bool visible);
 
     emote_handle_t emote_handle_ = nullptr;
+    esp_lcd_panel_handle_t panel_ = nullptr;
+    std::atomic<bool> panel_writes_enabled_{true};
     esp_timer_handle_t idle_anim_timer_ = nullptr;
     bool is_idle_ = false;
     size_t current_idle_index_ = 0;
