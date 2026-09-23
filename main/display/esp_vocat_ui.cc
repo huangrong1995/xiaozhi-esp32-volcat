@@ -153,10 +153,39 @@ bool RenderSwitch::IoReadyCallback(esp_lcd_panel_io_handle_t panel_io,
     if (self == nullptr) {
         return false;
     }
-    // Route the transfer-done signal to whichever renderer is the active owner.
-    if (self->active_lvgl_.load() && self->lvgl_display_ != nullptr) {
-        lvgl_port_flush_ready(self->lvgl_display_);
-    } else if (self->emote_ != nullptr) {
+    // This callback runs in the SPI ISR. It is shared by emote and esp_lvgl_port
+    // for the panel's single on_color_trans_done slot.
+    //
+    // ALWAYS clear LVGL's pending flush first. taskLVGL is a tight loop that
+    // paints the default screen as soon as add_disp creates it — i.e. before
+    // active_lvgl_ is set true — and its SPI transfer relies on this callback to
+    // release disp->flushing. If this were gated on active_lvgl_, that first
+    // render would leave flushing latched and taskLVGL would spin in
+    // wait_for_flushing forever (holding the LVGL lock, so ShowLvgl then blocks
+    // and every swipe/long-press to a non-Home screen freezes). lv_disp_flush_ready
+    // is idempotent and a safe no-op when LVGL is idle, so clearing it for an
+    // emote-owned transfer is harmless.
+    lv_display_t* lvgl_disp = self->lvgl_display_;
+    if (lvgl_disp == nullptr) {
+        // The very first boot render can land before add_disp's return has been
+        // stored into lvgl_display_; fall back to the display being rendered.
+        lvgl_disp = lv_display_get_default();
+    }
+    if (lvgl_disp != nullptr) {
+        lvgl_port_flush_ready(lvgl_disp);
+    }
+    // Acknowledge emote's flush completion on EVERY color transfer, regardless of
+    // which renderer owns the panel. emote_notify_flush_finished only sets the
+    // gfx WAIT_FLUSH_DONE event bit (gfx_render_part_area clears it before each
+    // real flush), so a spurious ack when emote has no pending flush is a
+    // harmless no-op. We call it unconditionally because gfx_core pends on
+    // WAIT_FLUSH_DONE with the gfx mutex held; gating the ack on active_lvgl_
+    // let an emote write that was in flight across an ownership flip (SetPanelWritesEnabled
+    // committed a real draw_bitmap, then active_lvgl_ turned true before its
+    // ISR) go forever unacked -> gfx_core hung on the mutex -> every subsequent
+    // SetEmotion (idle animation on the esp_timer task) blocked -> clock_timer
+    // never fired -> the whole app froze (SystemInfo/SetEmotion logs went silent).
+    if (self->emote_ != nullptr) {
         emote_notify_flush_finished(self->emote_->GetEmoteHandle());
     }
     return true;
@@ -166,6 +195,14 @@ RenderSwitch::RenderSwitch(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle
                            int width, int height, emote::EmoteDisplay* emote)
     : panel_(panel), panel_io_(panel_io), width_(width), height_(height), emote_(emote) {
     ESP_LOGI(TAG, "RenderSwitch: init LVGL on emote-owned panel");
+
+    // Prevent emote from starting a panel transfer while esp_lvgl_port is
+    // attaching LVGL to the same SPI panel. add_disp starts taskLVGL before it
+    // returns, so leaving emote enabled here creates a boot-time bus race that
+    // can corrupt the ST77916 address window and produce full-screen stripes.
+    if (emote_ != nullptr) {
+        emote_->SetPanelWritesEnabled(false);
+    }
 
     lv_init();
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
@@ -242,6 +279,10 @@ void RenderSwitch::ShowEmote() {
     active_lvgl_.store(false);
     if (emote_ != nullptr) {
         emote_->SetPanelWritesEnabled(true);
+        // LVGL may have repainted only its damaged regions before ownership
+        // changed. Force emote to redraw the complete frame so the round panel
+        // cannot retain LVGL pixels as a white halo around the pet expression.
+        emote_->RefreshAll();
     }
     ESP_LOGI(TAG, "RenderSwitch: ShowEmote -> panel owned by emote");
 }
@@ -266,6 +307,18 @@ void RenderSwitch::ShowLvgl(ScreenId id, const std::function<void()>& build) {
         lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
         lv_screen_load(scr);
     }
+
+    // 3) Force a full repaint of the freshly-claimed panel. The page screens are
+    //    cached: on reload a cached widget tree that hasn't changed since LVGL
+    //    last drew it is NOT re-invalidated by LVGL, so when ownership cycles
+    //    back from emote (whose full-frame round pet face overwrote the panel)
+    //    LVGL would repaint nothing and leave emote's pixels as residue ("一些
+    //    区域没有刷新"). Clearing the whole active screen on every LVGL handoff
+    //    ensures the new owner repaints 100% of the round panel. One-shot per
+    //    transition (only the screen, not continuous full-refresh), so it does
+    //    not add per-frame flush cost.
+    lv_obj_invalidate(lv_screen_active());
+
     lvgl_port_unlock();
 
     // 3) Resume LVGL so it renders and flushes the page.
@@ -532,7 +585,9 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     if (emotion_screen_ != nullptr) {
         lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0,
                             false);
-        RefreshEmotionLearningName();
+        if (emotion_name_label_ != nullptr) {
+            lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
+        }
         return;
     }
 
@@ -593,7 +648,9 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     lv_obj_add_style(name_label, &g_style_emotion_name, 0);
     lv_obj_align(name_label, LV_ALIGN_CENTER, 0, -30);
     emotion_name_label_ = name_label;
-    RefreshEmotionLearningName();  // apply any name cached before the screen built
+    if (!emotion_name_.empty()) {
+        lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
+    }
 
     // Large 开始 button.
     lv_obj_t* start = lv_button_create(scr);

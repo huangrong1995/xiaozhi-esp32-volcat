@@ -562,7 +562,11 @@ private:
     int64_t touch_press_time_ms_ = 0;
     int swipe_start_x_ = 0;
     int swipe_start_y_ = 0;
-    static constexpr int kSwipeThreshold = 80;  // Minimum swipe distance
+    // Minimum swipe distance. Was 80px; on the 360px round panel a natural flick
+    // that lands at ~70px was being dropped as a Tap, leaving a borderline swipe
+    // feeling dead ("进入页面后没反应"). 60px still sits comfortably above tap
+    // jitter (~0-25px) so taps stay taps, while an intentional swipe navigates.
+    static constexpr int kSwipeThreshold = 60;  // Minimum swipe distance
 
     // Outer capacitive "pet" surface feedback cooldown (moved from a hidden
     // static local so it is not hidden state).
