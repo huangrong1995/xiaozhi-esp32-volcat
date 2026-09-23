@@ -333,6 +333,10 @@ EspVocatUi::EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t p
     : render_switch_(panel, panel_io, width, height, emote) {
     // Build the shared style set once (RenderSwitch has already run lv_init).
     EnsureSharedStyles();
+    // Bind a pointer input device to the LVGL display so the page screens'
+    // on-screen controls receive taps (fed by the board's touch task). LVGL is
+    // still stopped here (emote owns the panel), so creating the indev is safe.
+    SetupTouchInput();
     // The panel starts owned by emote; land on the Home pet face.
     ShowHome();
 }
@@ -340,6 +344,45 @@ EspVocatUi::EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t p
 void EspVocatUi::ShowHome() {
     render_switch_.ShowEmote();
     current_ = ScreenId::Home;
+}
+
+// Create a pointer input device so the page screens' on-screen controls can be
+// clicked. The read callback returns the last point fed by the board's touch
+// task (FeedTouch). LVGL polls this indev only while it owns the panel; while
+// the Home emote face owns it, the LVGL task is stopped and nothing reads it.
+void EspVocatUi::SetupTouchInput() {
+    lv_display_t* disp = render_switch_.lvgl_display();
+    if (disp == nullptr) {
+        ESP_LOGE(TAG, "SetupTouchInput: no LVGL display to bind indev to");
+        return;
+    }
+    touch_indev_ = lv_indev_create();
+    lv_indev_set_type(touch_indev_, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(touch_indev_, EspVocatUi::TouchInputReadCallback);
+    lv_indev_set_user_data(touch_indev_, this);
+    lv_indev_set_display(touch_indev_, disp);
+    ESP_LOGI(TAG, "SetupTouchInput: pointer indev %p bound to display %p", (void*)touch_indev_,
+             (void*)disp);
+}
+
+void EspVocatUi::TouchInputReadCallback(lv_indev_t* indev, lv_indev_data_t* data) {
+    auto* self = static_cast<EspVocatUi*>(lv_indev_get_user_data(indev));
+    if (self == nullptr) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    // Atomics: each read is current (seq_cst). A press/release boundary update
+    // is only off by the latency of the two latch fields updating in sequence,
+    // which never splits a point+state pair into a torn, unclickable one.
+    data->point.x = self->touch_x_.load();
+    data->point.y = self->touch_y_.load();
+    data->state = self->touch_pressed_.load() ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+void EspVocatUi::FeedTouch(int x, int y, bool pressed) {
+    touch_x_.store(x);
+    touch_y_.store(y);
+    touch_pressed_.store(pressed);
 }
 
 void EspVocatUi::ShowScreen(ScreenId id) {

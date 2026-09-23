@@ -62,6 +62,10 @@ public:
     // True while LVGL owns the panel (ShowLvgl active); false while emote does.
     bool IsLvglActive() const { return active_lvgl_.load(); }
 
+    // The LVGL display this switch attached, so the screen manager can bind its
+    // touch input device to it.
+    lv_display_t* lvgl_display() const { return lvgl_display_; }
+
 private:
     // Routes the shared panel_io transfer-done signal to the active renderer.
     static bool IoReadyCallback(esp_lcd_panel_io_handle_t panel_io,
@@ -152,10 +156,33 @@ public:
     // before the overlay is built (the state is cached and applied on build).
     void SetSpeaking(bool speaking);
 
+    // --- Touch input (LVGL page screens) --------------------------------------
+    // Feed a CST816S press/release point into the LVGL pointer input device so
+    // the on-screen controls (Settings steppers / back, EmotionLearning step /
+    // start) receive click events. The board's touch task calls this on every
+    // press and release. LVGL only polls this indev while it owns the panel
+    // (a page screen is shown); on the Home emote face the LVGL task is stopped
+    // and these writes are ignored, so Home gestures are unaffected. Coordinates
+    // are panel-native and map 1:1 to LVGL pixels (360x360, no swap/mirror).
+    void FeedTouch(int x, int y, bool pressed);
+
 private:
     RenderSwitch render_switch_;
     ScreenId current_ = ScreenId::Home;
     bool conversation_active_ = false;
+
+    // ---- Touch input (LVGL page screens) -------------------------------------
+    // Pointer input device that delivers CST816S taps to the page screens'
+    // on-screen controls. Its read callback returns the latched point; the board
+    // writes the latch via FeedTouch() from its touch task (another core), so
+    // the latch fields are atomics. LVGL polls this only while it owns the panel.
+    void SetupTouchInput();
+    static void TouchInputReadCallback(lv_indev_t* indev, lv_indev_data_t* data);
+
+    lv_indev_t* touch_indev_ = nullptr;
+    std::atomic<int> touch_x_{0};
+    std::atomic<int> touch_y_{0};
+    std::atomic<bool> touch_pressed_{false};
 
     // ---- Settings screen implementation ------------------------------------
     // Identifies which stepper was pressed (brightness/volume + direction).

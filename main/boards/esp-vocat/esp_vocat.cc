@@ -1483,6 +1483,12 @@ private:
                     board.swipe_start_x_ = touch_point.x;
                     board.swipe_start_y_ = touch_point.y;
                     board.swipe_start_recorded_ = true;
+                    // Feed the press point to LVGL so a tap on a page screen's
+                    // on-screen control can be delivered (no-op while Home/emote
+                    // owns the panel, where LVGL is stopped).
+                    if (board.ui_ != nullptr) {
+                        board.ui_->FeedTouch(touch_point.x, touch_point.y, true);
+                    }
                 }
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
@@ -1491,6 +1497,12 @@ private:
                         board.swipe_start_recorded_ = false;
                         board.EnterWifiConfigMode();
                         continue;
+                    }
+
+                    // Feed the release point so LVGL completes the press->release
+                    // cycle into a click on the control under the finger.
+                    if (board.ui_ != nullptr) {
+                        board.ui_->FeedTouch(touch_point.x, touch_point.y, false);
                     }
 
                     // Normalize the release into a single screen gesture and route it.
