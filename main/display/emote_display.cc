@@ -11,6 +11,7 @@
 // Standard C headers
 #include <sys/time.h>
 #include <time.h>
+#include <math.h>
 
 // ESP-IDF headers
 #include <esp_lcd_panel_io.h>
@@ -45,6 +46,31 @@ static const gfx_color_t kColorLavender = GFX_COLOR_HEX(0x9775FA);
 static const gfx_color_t kColorSoftYellow = GFX_COLOR_HEX(0xFFD43B);
 static const gfx_color_t kColorWhite = GFX_COLOR_HEX(0xFFFFFF);
 static const gfx_color_t kColorDarkBg = GFX_COLOR_HEX(0x1A1A2E);
+
+// Conversation "voice ripple" palette. Each ring is a single color that gets
+// cooler as it moves outward: warm pink nearest the pet -> magenta -> cyan at
+// the edge, so the ripple reads as sound energy fading as it travels.
+static const gfx_color_t kRippleColor[kRippleRings] = {
+    GFX_COLOR_HEX(0xFF8FB1),  // pink   (inner ring, near the pet)
+    GFX_COLOR_HEX(0xE06BFA),  // magenta (mid ring)
+    GFX_COLOR_HEX(0x64E3FF),  // cyan   (outer ring)
+};
+
+// "Voice ripple" geometry. kRippleCenterY is the shared ring center just below
+// the pet's face; line segments are only placed on the lower arc (y >= center)
+// so they never climb over the pet above. Each ring has a base radius plus a
+// voice-driven outward surge that grows stronger toward the outside
+// (kRippleTravel), so ripples visibly 泛开 (spread from inner to outer). Each
+// ring's lower arc is tiled from kRippleSegCounts[r] small squares, spaced to
+// overlap by ~1px so the row joins into smooth continuous ripple lines. Angles
+// are degrees from the right axis (0 = right, 90 = straight down).
+static constexpr int kRippleSquareSize = 3;
+static constexpr int kRippleCenterY = 268;
+static constexpr int kRippleBaseRadius[kRippleRings] = {28, 48, 68};
+static constexpr float kRippleTravel[kRippleRings] = {1.0f, 1.3f, 1.6f};
+static constexpr int kRippleMinAngle = 25;
+static constexpr int kRippleMaxAngle = 155;
+static constexpr int kRippleMaxRadius = 88;  // cap so the bottom arc stays on screen
 
 // ============================================================================
 // Forward Declarations
@@ -168,6 +194,11 @@ EmoteDisplay::~EmoteDisplay() {
         esp_timer_stop(idle_anim_timer_);
         esp_timer_delete(idle_anim_timer_);
         idle_anim_timer_ = nullptr;
+    }
+    if (conversation_timer_) {
+        esp_timer_stop(conversation_timer_);
+        esp_timer_delete(conversation_timer_);
+        conversation_timer_ = nullptr;
     }
     if (emote_handle_) {
         emote_deinit(emote_handle_);
@@ -370,6 +401,251 @@ void EmoteDisplay::ShowEmotionLearning(const char* emotion_name) {
     emote_unlock(emote_handle_);
     // Face emotion is applied by the caller via SetEmotion(); just stop idle.
     StopIdleAnimation();
+}
+
+// Conversation "voice ripple" overlay: concentric rings fanning outward from a
+// point just below the pet, composited over the live pet face (panel stays
+// owned by emote, so the pet keeps animating). Emote can't draw arcs, so each
+// ring's lower arc is tiled from small overlapping squares (kRippleSegCounts[r]
+// per ring), colored by radius and rippling outward with the voice (see
+// AnimateConversationRipple). The squares are named labels with a solid
+// background, created once and cached. Only the lower arc is drawn (y >= center)
+// so the ripples never climb over the pet's face above.
+void EmoteDisplay::EnsureConversationUi() {
+    if (!emote_handle_ || conversation_ui_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    const int cx = width_ / 2;
+    int flat = 0;
+    for (int r = 0; r < kRippleRings; ++r) {
+        for (int s = 0; s < kRippleSegCounts[r]; ++s, ++flat) {
+            char name[24];
+            snprintf(name, sizeof(name), "vocat_rip_r%d_s%d", r, s);
+            gfx_obj_t* sq =
+                emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name);
+            if (sq) {
+                gfx_label_set_text(sq, "");
+                gfx_label_set_bg_enable(sq, true);
+                gfx_label_set_bg_color(sq, kRippleColor[r]);
+                // Park each square at its ring's bottom until the first tick.
+                gfx_obj_set_size(sq, kRippleSquareSize, kRippleSquareSize);
+                gfx_obj_set_pos(sq, cx - kRippleSquareSize / 2,
+                                kRippleCenterY + kRippleBaseRadius[r] - kRippleSquareSize / 2);
+            }
+            conversation_segs_[flat] = sq;
+        }
+    }
+    gfx_obj_t* status =
+        emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "vocat_conv_status");
+    if (status) {
+        gfx_label_set_text(status, "");
+        gfx_label_set_color(status, kColorWhite);
+        gfx_label_set_text_align(status, GFX_TEXT_ALIGN_CENTER);
+        gfx_label_set_long_mode(status, GFX_LABEL_LONG_CLIP);
+        gfx_label_set_bg_enable(status, true);
+        gfx_label_set_bg_color(status, kColorDarkBg);
+        gfx_obj_set_size(status, 120, 28);
+        gfx_obj_align(status, GFX_ALIGN_BOTTOM_MID, 0, -6);
+        gfx_obj_set_visible(status, false);
+    }
+    conversation_status_ = status;
+    conversation_ui_ready_ = true;
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::ShowConversationOverlay(bool speaking) {
+    ESP_LOGI(TAG, "ShowConversationOverlay: speaking=%d", speaking);
+    EnsureConversationUi();
+    conversation_active_ = true;
+    conversation_speaking_ = speaking;
+    if (!conversation_ui_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    if (conversation_status_) {
+        gfx_label_set_text(conversation_status_, speaking ? "正在说" : "正在听");
+        gfx_obj_set_visible(conversation_status_, true);
+    }
+    for (int i = 0; i < kRippleSegTotal; ++i) {
+        if (conversation_segs_[i]) {
+            gfx_obj_set_visible(conversation_segs_[i], true);
+        }
+    }
+    emote_unlock(emote_handle_);
+    // Prime the ripple immediately so it isn't empty on the first frame.
+    AnimateConversationRipple();
+    // Drive the glow with a periodic esp_timer (created lazily on first show).
+    if (conversation_timer_ == nullptr) {
+        esp_timer_create_args_t args = {
+            .callback = &EmoteDisplay::ConversationTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "conv_glow",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&args, &conversation_timer_);
+    }
+    esp_timer_start_periodic(conversation_timer_, speaking ? 100000 : 200000);
+}
+
+void EmoteDisplay::HideConversationOverlay() {
+    ESP_LOGI(TAG, "HideConversationOverlay");
+    conversation_active_ = false;
+    if (conversation_timer_ != nullptr) {
+        esp_timer_stop(conversation_timer_);
+    }
+    if (!conversation_ui_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    if (conversation_status_) {
+        gfx_obj_set_visible(conversation_status_, false);
+    }
+    for (int i = 0; i < kRippleSegTotal; ++i) {
+        if (conversation_segs_[i]) {
+            gfx_obj_set_visible(conversation_segs_[i], false);
+        }
+    }
+    emote_unlock(emote_handle_);
+}
+
+// Emotion-learning flashcard lesson. The board drives the advance timing; here
+// we just pause idle, play the demonstrated emotion's expression, and show a
+// "name · index/total" caption over the pet face so the user can follow the
+// sequence. Mirrors the conversation-overlay label pattern (solid dark caption
+// over the pet; the round panel clips nothing at the bottom strip).
+void EmoteDisplay::EnsureLessonUi() {
+    if (!emote_handle_ || lesson_ui_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_t* status = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                                 "vocat_lesson_status");
+    if (status) {
+        gfx_label_set_text(status, "");
+        gfx_label_set_color(status, kColorWhite);
+        gfx_label_set_text_align(status, GFX_TEXT_ALIGN_CENTER);
+        gfx_label_set_long_mode(status, GFX_LABEL_LONG_CLIP);
+        gfx_label_set_bg_enable(status, true);
+        gfx_label_set_bg_color(status, kColorDarkBg);
+        gfx_obj_set_size(status, 220, 30);
+        gfx_obj_align(status, GFX_ALIGN_BOTTOM_MID, 0, -12);
+        gfx_obj_set_visible(status, false);
+    }
+    lesson_status_ = status;
+    lesson_ui_ready_ = true;
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::ShowEmotionLesson(const char* name, int index, int total, const char* emotion) {
+    EnsureLessonUi();
+    // Pause idle so it does not overwrite the demonstrated emotion (mirrors
+    // ShowReminder), then present the emotion and the name/progress caption.
+    StopIdleAnimation();
+    if (emotion && strlen(emotion) > 0) {
+        SetEmotion(emotion);
+    }
+    if (!lesson_ui_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    if (lesson_status_) {
+        char caption[64];
+        snprintf(caption, sizeof(caption), "%s · %d/%d", name ? name : "", index, total);
+        gfx_label_set_text(lesson_status_, caption);
+        gfx_obj_set_visible(lesson_status_, true);
+    }
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::HideEmotionLesson() {
+    if (!lesson_ui_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    if (lesson_status_) {
+        gfx_obj_set_visible(lesson_status_, false);
+    }
+    emote_unlock(emote_handle_);
+    // Return to the standby/mode presentation and restart the idle pet.
+    RestoreFromReminder();
+}
+
+void EmoteDisplay::SetConversationSpeaking(bool speaking) {
+    if (!conversation_active_ || !conversation_ui_ready_) {
+        return;
+    }
+    conversation_speaking_ = speaking;
+    emote_lock(emote_handle_);
+    if (conversation_status_) {
+        gfx_label_set_text(conversation_status_, speaking ? "正在说" : "正在听");
+    }
+    emote_unlock(emote_handle_);
+    if (conversation_timer_ != nullptr) {
+        esp_timer_stop(conversation_timer_);
+        esp_timer_start_periodic(conversation_timer_, speaking ? 100000 : 200000);
+    }
+}
+
+void EmoteDisplay::ConversationTimerCallback(void* arg) {
+    auto* self = static_cast<EmoteDisplay*>(arg);
+    if (self != nullptr) {
+        self->AnimateConversationRipple();
+    }
+}
+
+void EmoteDisplay::AnimateConversationRipple() {
+    if (!conversation_active_ || !conversation_ui_ready_) {
+        return;
+    }
+    const float t = static_cast<float>(conversation_phase_++);
+    const bool speaking = conversation_speaking_;
+    // Ripple energy per mode: how far the rings surge outward and how fast the
+    // wave rolls. Speaking = strong + lively outward 泛开; listening = gentle.
+    float amp, speed;
+    if (speaking) {
+        amp = 22.0f;
+        speed = 0.65f;
+    } else {
+        amp = 9.0f;
+        speed = 0.35f;
+    }
+    constexpr float kD2R = 0.01745329252f;  // pi / 180
+    const int w = width_;
+    const int cx = w / 2;
+    const float a_min = static_cast<float>(kRippleMinAngle) * kD2R;
+    emote_lock(emote_handle_);
+    int flat = 0;
+    for (int r = 0; r < kRippleRings; ++r) {
+        // Outward-traveling wave: outer rings lag the inner ones (phase offset)
+        // and surge further (kRippleTravel), so the ripples read as spreading
+        // out from the pet instead of swelling all at once (从里到外泛开).
+        const float wave = 0.5f + 0.5f * sinf(t * speed + r * 1.15f);
+        float radius = static_cast<float>(kRippleBaseRadius[r]) + amp * kRippleTravel[r] * wave;
+        if (radius > static_cast<float>(kRippleMaxRadius)) {
+            radius = static_cast<float>(kRippleMaxRadius);
+        }
+        const int count = kRippleSegCounts[r];
+        const float a_step = static_cast<float>(kRippleMaxAngle - kRippleMinAngle) * kD2R /
+                             static_cast<float>(count - 1);
+        for (int s = 0; s < count; ++s, ++flat) {
+            gfx_obj_t* sq = conversation_segs_[flat];
+            if (sq == nullptr) {
+                continue;
+            }
+            // Place equal-size squares along the arc. Each ring's count is sized
+            // so adjacent squares overlap by ~1px even at max surge, so the row
+            // reads as a smooth continuous line rather than separate dots.
+            const float a = a_min + a_step * static_cast<float>(s);
+            const int x = static_cast<int>(static_cast<float>(cx) + radius * cosf(a)) -
+                          kRippleSquareSize / 2;
+            const int y = static_cast<int>(static_cast<float>(kRippleCenterY) + radius * sinf(a)) -
+                          kRippleSquareSize / 2;
+            gfx_obj_set_pos(sq, x, y);
+        }
+    }
+    emote_unlock(emote_handle_);
 }
 
 void EmoteDisplay::SetChatMessage(const char* const role, const char* const content) {

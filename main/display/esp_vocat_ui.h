@@ -66,6 +66,10 @@ public:
     // touch input device to it.
     lv_display_t* lvgl_display() const { return lvgl_display_; }
 
+    // The emote pet renderer (Home / conversation face), so the screen manager
+    // can composite the conversation overlay over the live pet.
+    emote::EmoteDisplay* emote() const { return emote_; }
+
 private:
     // Routes the shared panel_io transfer-done signal to the active renderer.
     static bool IoReadyCallback(esp_lcd_panel_io_handle_t panel_io,
@@ -98,11 +102,13 @@ public:
     // Switch to the given LVGL page screen (solid-color stand-in for now).
     void ShowScreen(ScreenId id);
 
-    // Show/hide the conversation overlay. on = ShowScreen(ConversationOverlay) +
-    // active=true (Siri-style full-screen scene that replaces the Home pet face
-    // while talking). off = ShowHome() + active=false + fire the dialog-gone
-    // callback (this is the leave/dialog-gone mechanism; when esp-vocat calls
-    // off, the force-stop of the running dialogue is handled downstream).
+    // Show/hide the conversation. on = keep the panel on the emote pet face and
+    // composite the "Siri-style" waveform + status overlay over the live pet
+    // (current_ = ConversationOverlay, so gestures/routing treat us as in
+    // conversation while the pet stays visible and live). off = hide the overlay
+    // and return the pet to idle + fire the dialog-gone callback (this is the
+    // leave/dialog-gone mechanism; the force-stop of the running dialogue is
+    // handled downstream).
     void SetConversationActive(bool on);
 
     // The screen currently being presented (Home or a page).
@@ -145,15 +151,24 @@ public:
     void SetEmotionPrevCallback(EmotionStepCb cb) { emotion_prev_cb_ = std::move(cb); }
     void SetEmotionNextCallback(EmotionStepCb cb) { emotion_next_cb_ = std::move(cb); }
 
-    // --- Conversation overlay (Siri-style, pure LVGL, no pet face) ----------
-    // Fired when the conversation overlay is left/gone (SetConversationActive
-    // off); the board force-stops the running dialogue (bug #2 fix basis).
+    // Flashcard lesson: hand the panel to the emote pet face so the pet can
+    // demonstrate each emotion (expression + name/progress caption), while
+    // keeping CurrentScreen() == EmotionLearning so gestures/routing and the 30s
+    // idle timeout still treat the lesson as part of the learning screen. The
+    // board drives the advance timing; call ShowScreen(ScreenId::EmotionLearning)
+    // to return to the browsing card afterwards.
+    void ShowEmotionLessonFace();
+
+    // --- Conversation overlay (emote-composited over the live pet) -----------
+    // Fired when the conversation is left/gone (SetConversationActive off); the
+    // board force-stops the running dialogue (bug #2 fix basis).
     using DialogGoneCb = std::function<void()>;
     void SetDialogGoneCallback(DialogGoneCb cb) { dialog_gone_cb_ = std::move(cb); }
 
-    // Toggle the live status label (正在听/正在说) and the waveform intensity:
-    // listening = gentle waveform, speaking = taller/faster. Safe to call
-    // before the overlay is built (the state is cached and applied on build).
+    // Toggle the live status (正在听/正在说) and the waveform intensity on the
+    // emote-composited conversation overlay: listening = gentle waveform,
+    // speaking = taller/faster. Forwards to the emote overlay and caches the
+    // state so SetConversationActive(true) can apply the latest desired state.
     void SetSpeaking(bool speaking);
 
     // --- Touch input (LVGL page screens) --------------------------------------
@@ -197,9 +212,10 @@ private:
 
     // Build (once) and show the settings screen; reused across ShowScreen calls.
     void BuildSettingsScreen();
-    // Build a single grouped row: name label + value label + −/＋ steppers.
-    void BuildSettingsRow(lv_obj_t* scr, const char* name, lv_obj_t** value_label_out,
-                          bool is_brightness, int y_offset);
+    // Build one row inside the grouped card: name label + blue value + iOS
+    // UIStepper pill, with an optional hairline separator above.
+    void BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** value_label_out,
+                          bool is_brightness, int y_offset, bool has_separator_above);
     // Clamp, refresh the value label, and fire the change callback if changed.
     void ApplySettingsValue(bool is_brightness, int delta);
     void RefreshSettingsValueLabel(bool is_brightness);
@@ -243,26 +259,8 @@ private:
     EmotionStepCb emotion_prev_cb_;
     EmotionStepCb emotion_next_cb_;
 
-    // ---- Conversation overlay implementation --------------------------------
-    static constexpr int kWaveBarCount = 9;  // short bars in the waveform
-
-    // lv_timer_cb_t: animates the waveform bar heights. Runs inside the LVGL
-    // task's handler (already under the port lock), so it must NOT lock again.
-    static void ConversationWaveformTimerCb(lv_timer_t* timer);
-
-    // Build (once) and show the conversation overlay; reused across shows.
-    void BuildConversationOverlayScreen();
-    // One waveform tick: pseudo-randomize each bar height by speaking_ state.
-    void AnimateConversationWaveform();
-    // Apply the cached speaking_ state (status text + timer period). The caller
-    // is responsible for holding the LVGL lock when called from outside it.
-    void ApplyConversationState();
-
-    lv_obj_t* conversation_screen_ = nullptr;
-    lv_obj_t* conversation_status_label_ = nullptr;
-    lv_obj_t* waveform_bars_[kWaveBarCount] = {};
-    lv_timer_t* conversation_timer_ = nullptr;
-    bool speaking_ = false;   // cached; 0 listening / 1 speaking
-    uint32_t waveform_phase_ = 0;  // monotonically increasing timer tick counter
+    // ---- Conversation overlay (emote-composited) ------------------------------
+    // Cached desired state, forwarded to the emote overlay on SetConversationActive.
+    bool speaking_ = false;  // 0 listening / 1 speaking
     DialogGoneCb dialog_gone_cb_;
 };

@@ -507,6 +507,30 @@ private:
     static const char* kEmotionLearningNames_[];
     static constexpr size_t kEmotionLearningCount = 8;
 
+    // Emotion-learning flashcard lesson state. When lesson_active_, the pet
+    // demonstrates each emotion on its face and auto-advances; timers drive the
+    // per-card advance and the completion pause. current_emotion_index_ is reused
+    // to track which emotion the lesson is demonstrating.
+    bool lesson_active_ = false;
+    esp_timer_handle_t lesson_timer_ = nullptr;
+    esp_timer_handle_t lesson_end_timer_ = nullptr;
+    // Defers StartEmotionLesson off the LVGL task. The 开始 button is an LVGL
+    // click event (runs under the LVGL lock inside the esp_lvgl_port timer
+    // handler); starting the lesson there calls render_switch_.ShowEmote() ->
+    // lvgl_port_stop(), which stops the LVGL timer from within its own dispatch
+    // and freezes the device. Firing on the esp_timer task (no LVGL lock) avoids
+    // that self-deadlock; a tiny delay lets the click dispatch finish first.
+    esp_timer_handle_t lesson_start_defer_timer_ = nullptr;
+    static constexpr int64_t kLessonStartDeferUs = 20000;  // 20ms
+    static constexpr int64_t kLessonCardMs = 2500;  // per-emotion demo hold
+    static constexpr int64_t kLessonEndMs = 1800;   // completion pause before returning
+    // Grace window after the lesson starts during which a gesture Tap is ignored.
+    // Pressing the on-screen 开始 also emits a Gesture::Tap (fed to LVGL and to
+    // the gesture layer on two cores), so this swallows that start-tap so it can
+    // never accidentally skip the first demonstrated emotion.
+    static constexpr int64_t kLessonStartGraceMs = 500;
+    int64_t lesson_start_ms_ = 0;
+
     // Habit tracking state (persisted fields).
     struct HabitState {
         int64_t last_drink_time;  // Unix timestamp of last drink
@@ -848,6 +872,30 @@ private:
 
     void HandleEmotionLearningGesture(Gesture gesture)
     {
+        // Mid-lesson the panel is on the pet face and LVGL is stopped, so the
+        // only interaction is gestures. Tap skips to the next emotion; any swipe
+        // cancels the lesson back to the browsing card (instead of kicking
+        // straight to Chat).
+        if (lesson_active_) {
+            if (gesture == Gesture::Tap) {
+                // Swallow the tap that pressed 开始 (it may arrive as a gesture
+                // either before or after the LVGL click starts the lesson) so the
+                // first demonstrated emotion is never skipped.
+                if (esp_timer_get_time() / 1000 - lesson_start_ms_ < kLessonStartGraceMs) {
+                    return;
+                }
+                ++current_emotion_index_;
+                if (current_emotion_index_ >= kEmotionLearningCount) {
+                    EndEmotionLesson();
+                } else {
+                    PresentLessonEmotion();
+                }
+            } else if (gesture == Gesture::SwipeLeft || gesture == Gesture::SwipeRight ||
+                       gesture == Gesture::SwipeUp) {
+                CancelEmotionLesson();
+            }
+            return;
+        }
         HandlePageGesture(gesture);
     }
 
@@ -1676,6 +1724,138 @@ private:
                  kEmotionLearningNames_[current_emotion_index_]);
     }
 
+    // ---- Emotion-learning flashcard lesson ------------------------------------
+
+    // Started by the library screen's 开始 button. Hands the panel to the emote
+    // pet face (kept inside the EmotionLearning screen for routing) and begins
+    // demonstrating the emotions one by one, auto-advancing via lesson_timer_.
+    void StartEmotionLesson()
+    {
+        if (lesson_active_ || ui_ == nullptr || display_ == nullptr) {
+            return;
+        }
+        lesson_active_ = true;
+        current_emotion_index_ = 0;
+        lesson_start_ms_ = esp_timer_get_time() / 1000;
+        // A running lesson is active interaction: never let the 30s idle timer
+        // auto-close it mid-sequence. It ends by completion or an explicit cancel
+        // (swipe). The idle timer is re-armed on return to the browsing card.
+        if (mode_idle_timer_ != nullptr) {
+            esp_timer_stop(mode_idle_timer_);
+        }
+        ui_->ShowEmotionLessonFace();
+        PresentLessonEmotion();
+        ESP_LOGI(TAG, "Emotion lesson started");
+    }
+
+    // Play the current emotion on the pet face (expression + name/progress
+    // caption), cue the transition, and arm the advance timer.
+    void PresentLessonEmotion()
+    {
+        if (display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(display_)->ShowEmotionLesson(
+                kEmotionLearningNames_[current_emotion_index_],
+                static_cast<int>(current_emotion_index_ + 1),
+                static_cast<int>(kEmotionLearningCount),
+                kEmotionLearningEmotions_[current_emotion_index_]);
+        }
+        ESP_LOGI(TAG, "Emotion lesson card %d/%d: %s",
+                 static_cast<int>(current_emotion_index_ + 1),
+                 static_cast<int>(kEmotionLearningCount),
+                 kEmotionLearningEmotions_[current_emotion_index_]);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+        if (lesson_timer_ != nullptr) {
+            esp_timer_start_once(lesson_timer_, kLessonCardMs * 1000ULL);
+        }
+    }
+
+    // The last emotion was shown: celebrate on the pet face, then a brief pause
+    // before returning to the browsing card (handled by lesson_end_timer_).
+    void EndEmotionLesson()
+    {
+        if (lesson_timer_ != nullptr) {
+            esp_timer_stop(lesson_timer_);
+        }
+        lesson_active_ = false;
+        if (display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(display_)->ShowEmotionLesson(
+                "学完啦", static_cast<int>(kEmotionLearningCount),
+                static_cast<int>(kEmotionLearningCount), "happy");
+        }
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+        if (lesson_end_timer_ != nullptr) {
+            esp_timer_start_once(lesson_end_timer_, kLessonEndMs * 1000ULL);
+        }
+    }
+
+    // Cancel a running lesson (swipe during the lesson) and return to the
+    // browsing card at a fresh index.
+    void CancelEmotionLesson()
+    {
+        if (lesson_timer_ != nullptr) {
+            esp_timer_stop(lesson_timer_);
+        }
+        if (lesson_end_timer_ != nullptr) {
+            esp_timer_stop(lesson_end_timer_);
+        }
+        lesson_active_ = false;
+        if (display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(display_)->HideEmotionLesson();
+        }
+        current_emotion_index_ = 0;
+        ShowEmotionLearningCurrent();
+        if (ui_ != nullptr) {
+            ui_->ShowScreen(ScreenId::EmotionLearning);
+        }
+        AfterScreenChange();
+        ESP_LOGI(TAG, "Emotion lesson cancelled, back to library");
+    }
+
+    static void lesson_start_defer_callback(void* arg)
+    {
+        // Runs on the esp_timer task (not the LVGL task), so the render handoff
+        // in StartEmotionLesson is safe. Guarded by lesson_active_ so a re-fire
+        // (or a double-tap on 开始) never starts two overlapping lessons.
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+        self->StartEmotionLesson();
+    }
+
+    static void lesson_timer_callback(void* arg)
+    {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr || !self->lesson_active_) {
+            return;
+        }
+        if (self->current_emotion_index_ + 1 >= kEmotionLearningCount) {
+            self->EndEmotionLesson();
+        } else {
+            ++self->current_emotion_index_;
+            self->PresentLessonEmotion();
+        }
+    }
+
+    static void lesson_end_timer_callback(void* arg)
+    {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+        // Lesson finished: return to the browsing card at a fresh index.
+        if (self->display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(self->display_)->HideEmotionLesson();
+        }
+        self->current_emotion_index_ = 0;
+        self->ShowEmotionLearningCurrent();
+        if (self->ui_ != nullptr) {
+            self->ui_->ShowScreen(ScreenId::EmotionLearning);
+        }
+        self->AfterScreenChange();
+        ESP_LOGI(TAG, "Emotion lesson completed");
+    }
+
     void EnterSettingsPage()
     {
         if (CurrentScreen() == ScreenId::Settings) {
@@ -1887,9 +2067,15 @@ private:
             ExitToChat();
         });
 
-        // The 开始 button on the LVGL emotion learning screen opens a
-        // conversation to practice the currently shown emotion (Siri-style).
-        ui_->SetStartLearningCallback([this]() { StartConversation(); });
+        // The 开始 button on the LVGL emotion learning screen starts the flashcard
+        // lesson: the pet demonstrates each emotion on its face, one by one. The
+        // click event runs under the LVGL lock, so the actual lesson start is
+        // deferred off the LVGL task (see lesson_start_defer_callback).
+        ui_->SetStartLearningCallback([this]() {
+            if (lesson_start_defer_timer_ != nullptr) {
+                esp_timer_start_once(lesson_start_defer_timer_, kLessonStartDeferUs);
+            }
+        });
 
         // The on-screen ‹ / › emotion step buttons cycle the current emotion.
         ui_->SetEmotionPrevCallback([this]() { AdvanceEmotion(false); });
@@ -2002,6 +2188,21 @@ public:
             esp_timer_delete(mode_idle_timer_);
             mode_idle_timer_ = nullptr;
         }
+        if (lesson_timer_ != nullptr) {
+            esp_timer_stop(lesson_timer_);
+            esp_timer_delete(lesson_timer_);
+            lesson_timer_ = nullptr;
+        }
+        if (lesson_end_timer_ != nullptr) {
+            esp_timer_stop(lesson_end_timer_);
+            esp_timer_delete(lesson_end_timer_);
+            lesson_end_timer_ = nullptr;
+        }
+        if (lesson_start_defer_timer_ != nullptr) {
+            esp_timer_stop(lesson_start_defer_timer_);
+            esp_timer_delete(lesson_start_defer_timer_);
+            lesson_start_defer_timer_ = nullptr;
+        }
         if (state_poll_timer_ != nullptr) {
             esp_timer_stop(state_poll_timer_);
             esp_timer_delete(state_poll_timer_);
@@ -2059,6 +2260,37 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
+
+        // Emotion-learning lesson timers: per-card advance + completion pause.
+        const esp_timer_create_args_t lesson_timer_args = {
+            .callback = &EspVocat::lesson_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lesson_adv",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&lesson_timer_args, &lesson_timer_));
+
+        const esp_timer_create_args_t lesson_end_timer_args = {
+            .callback = &EspVocat::lesson_end_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lesson_end",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&lesson_end_timer_args, &lesson_end_timer_));
+
+        // Deferred lesson start: fires StartEmotionLesson on the esp_timer task,
+        // out of the LVGL event callback's lock (see kLessonStartDeferUs notes).
+        const esp_timer_create_args_t lesson_start_defer_timer_args = {
+            .callback = &EspVocat::lesson_start_defer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lesson_start",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(
+            esp_timer_create(&lesson_start_defer_timer_args, &lesson_start_defer_timer_));
 
         // Periodic poll that maps the device listening/speaking state to the
         // conversation overlay's waveform/status. Drives SetSpeaking only on a
