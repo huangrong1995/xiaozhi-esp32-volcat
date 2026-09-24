@@ -23,6 +23,7 @@
 #include <string_view>
 
 #include <driver/i2c_master.h>
+#include <cmath>
 #include <cstdlib>
 #include <string.h>
 #include "i2c_device.h"
@@ -592,6 +593,29 @@ private:
     // jitter (~0-25px) so taps stay taps, while an intentional swipe navigates.
     static constexpr int kSwipeThreshold = 60;  // Minimum swipe distance
 
+    // Emotion-learning dial rotation (drag a finger around the dial to choose an
+    // emotion). Center/radius match the LVGL dial in esp_vocat_ui.cc
+    // (BuildEmotionLearningScreen): 236x236 dial centered at LV_ALIGN_CENTER with
+    // a +10 y offset on the 360x360 panel -> center (180, 190), radius ~118. The
+    // capture radius is a little generous so rotations starting just outside the
+    // ring still register. The 开始 button occupies the lower-centre arc; presses
+    // landing on it must stay button clicks, so its bounding box is excluded.
+    static constexpr float kEmotionDialCenterX = 180.0f;
+    static constexpr float kEmotionDialCenterY = 190.0f;
+    static constexpr float kEmotionDialCaptureRadius = 130.0f;
+    static constexpr int kStartBtnMinX = 106;
+    static constexpr int kStartBtnMaxX = 254;
+    static constexpr int kStartBtnMinY = 286;
+    static constexpr int kStartBtnMaxY = 332;
+    // Poll interval (ms) while a dial rotation drag is held. CST816S only pulses
+    // INT on press/release, so the touch task re-reads the position register at
+    // this rate to track the finger's angular motion. Kept moderate (not too
+    // aggressive) so the extra reads don't crowd the shared I2C bus (touch,
+    // charge and IMU all share it) and provoke transient timeouts.
+    static constexpr int kEmotionDialPollMs = 30;
+    bool emotion_dial_drag_ = false;        // a dial rotation is being tracked
+    float emotion_dial_last_angle_ = 0.0f;  // last finger angle (deg) around the dial
+
     // Outer capacitive "pet" surface feedback cooldown (moved from a hidden
     // static local so it is not hidden state).
     static constexpr int64_t kOuterTouchCooldownUs = 1200000;  // 1200 ms
@@ -870,6 +894,11 @@ private:
         HandlePageGesture(gesture);
     }
 
+    // The learning screen's dial is rotated by swiping, not by arrow buttons:
+    // a left swipe turns to the previous emotion, a right swipe to the next
+    // (the same direction the old ‹ / › controls stepped). A vertical swipe up
+    // leaves the screen back to Home, keeping a distinct exit gesture apart
+    // from dial rotation.
     void HandleEmotionLearningGesture(Gesture gesture)
     {
         // Mid-lesson the panel is on the pet face and LVGL is stopped, so the
@@ -896,7 +925,88 @@ private:
             }
             return;
         }
-        HandlePageGesture(gesture);
+
+        // Browsing the dial: choosing an emotion is a finger rotation around the
+        // dial, tracked as a continuous drag in the touch task (not a swipe). The
+        // gestures reaching this layer are therefore touches that started outside
+        // the dial (or taps): a vertical swipe up/down leaves the page to Home and
+        // a tap gives light feedback, while stray horizontal swipes do nothing
+        // (they must never navigate or exit — rotation is the only selector).
+        if (gesture == Gesture::SwipeUp || gesture == Gesture::SwipeDown) {
+            ExitToChat();
+            return;
+        }
+        if (gesture == Gesture::SwipeLeft || gesture == Gesture::SwipeRight) {
+            return;
+        }
+        if (gesture == Gesture::Tap) {
+            ShowTemporaryEmotion("happy", 1500);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+            return;
+        }
+    }
+
+    // ---- Emotion-learning dial rotation (touch drag) ---------------------------
+    // Finger angle (degrees, clockwise positive) around the dial centre, using
+    // screen coordinates (y down).
+    float EmotionDialAngle(int x, int y) const
+    {
+        return atan2f(static_cast<float>(y - static_cast<int>(kEmotionDialCenterY)),
+                      static_cast<float>(x - static_cast<int>(kEmotionDialCenterX)))
+               * 180.0f / 3.14159265f;
+    }
+
+    // Whether a touch press at (x,y) should begin a dial-rotation drag: only on
+    // the browsing emotion-learning screen (not mid-lesson), inside the dial
+    // capture circle, and not on the 开始 button (which stays a button click).
+    bool ShouldBeginEmotionDialDrag(int x, int y) const
+    {
+        if (CurrentScreen() != ScreenId::EmotionLearning || lesson_active_) {
+            return false;
+        }
+        float dx = static_cast<float>(x) - kEmotionDialCenterX;
+        float dy = static_cast<float>(y) - kEmotionDialCenterY;
+        if (dx * dx + dy * dy > kEmotionDialCaptureRadius * kEmotionDialCaptureRadius) {
+            return false;
+        }
+        if (x >= kStartBtnMinX && x <= kStartBtnMaxX && y >= kStartBtnMinY && y <= kStartBtnMaxY) {
+            return false;
+        }
+        return true;
+    }
+
+    void BeginEmotionDialDrag(int x, int y)
+    {
+        emotion_dial_drag_ = true;
+        emotion_dial_last_angle_ = EmotionDialAngle(x, y);
+        // A held drag is interaction too: keep the display awake and the mode idle
+        // timer reset so a long rotation is not treated as inactivity.
+        TouchPowerSaveActivity();
+        ResetModeIdleTimer();
+    }
+
+    void UpdateEmotionDialDrag(int x, int y)
+    {
+        if (!emotion_dial_drag_) {
+            return;
+        }
+        float angle = EmotionDialAngle(x, y);
+        float delta = angle - emotion_dial_last_angle_;
+        emotion_dial_last_angle_ = angle;
+        // Wrap the signed angular step into [-180, 180]; positive = clockwise.
+        while (delta > 180.0f) delta -= 360.0f;
+        while (delta < -180.0f) delta += 360.0f;
+        if (fabsf(delta) > 0.05f && ui_ != nullptr) {
+            ui_->RotateEmotionDial(delta);
+        }
+    }
+
+    void EndEmotionDialDrag()
+    {
+        emotion_dial_drag_ = false;
+        if (ui_ != nullptr) {
+            ui_->EndEmotionDialDrag();
+        }
     }
 
     // Gesture timing thresholds (ms)
@@ -1537,6 +1647,29 @@ private:
                     if (board.ui_ != nullptr) {
                         board.ui_->FeedTouch(touch_point.x, touch_point.y, true);
                     }
+
+                    // Emotion-learning dial rotation: if the press lands on the
+                    // dial in the browsing screen, take over the touch with a
+                    // continuous rotation drag (the dial follows the finger's
+                    // angular motion) until release. CST816S only pulses INT on
+                    // press/release, so re-read the position register here while
+                    // the finger is held instead of waiting for another edge.
+                    if (board.ShouldBeginEmotionDialDrag(touch_point.x, touch_point.y)) {
+                        board.BeginEmotionDialDrag(touch_point.x, touch_point.y);
+                        while (true) {
+                            vTaskDelay(pdMS_TO_TICKS(kEmotionDialPollMs));
+                            touchpad->UpdateTouchPoint();
+                            auto hold_event = touchpad->CheckTouchEvent();
+                            auto& hold_point = touchpad->GetTouchPoint();
+                            if (hold_event == Cst816s::TOUCH_RELEASE) {
+                                break;
+                            }
+                            board.UpdateEmotionDialDrag(hold_point.x, hold_point.y);
+                        }
+                        board.EndEmotionDialDrag();
+                        board.swipe_start_recorded_ = false;
+                        continue;  // rotation fully handled; skip release routing below
+                    }
                 }
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
@@ -1683,19 +1816,6 @@ private:
         // the static page screens it must NOT be auto-closed by the 30s idle timer
         // while the user is mid-conversation, so only refresh power-save eligibility.
         UpdatePowerSaveEligibility();
-    }
-
-    // Cycle the current emotion-learning index and refresh the on-screen name.
-    void AdvanceEmotion(bool forward)
-    {
-        if (forward) {
-            current_emotion_index_ =
-                (current_emotion_index_ + 1) % kEmotionLearningCount;
-        } else {
-            current_emotion_index_ =
-                (current_emotion_index_ + kEmotionLearningCount - 1) % kEmotionLearningCount;
-        }
-        ShowEmotionLearningCurrent();
     }
 
     void EnterEmotionLearningMode()
@@ -2077,9 +2197,13 @@ private:
             }
         });
 
-        // The on-screen ‹ / › emotion step buttons cycle the current emotion.
-        ui_->SetEmotionPrevCallback([this]() { AdvanceEmotion(false); });
-        ui_->SetEmotionNextCallback([this]() { AdvanceEmotion(true); });
+        // The dial settles on a chosen emotion at the end of a rotation drag; keep
+        // current_emotion_index_ in sync so the flashcard lesson starts from the
+        // emotion the user left the dial on.
+        ui_->SetEmotionDialSettledCallback([this](int index) {
+            current_emotion_index_ = static_cast<size_t>(index);
+            ESP_LOGI(TAG, "Emotion dial settled -> %s", kEmotionLearningNames_[current_emotion_index_]);
+        });
 
         // The conversation overlay fires this when it is left/gone
         // (SetConversationActive(false) -> on_dialog_gone_, which already returns

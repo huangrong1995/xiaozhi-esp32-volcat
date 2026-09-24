@@ -1,5 +1,6 @@
 #include "display/esp_vocat_ui.h"
 
+#include <cmath>
 #include <cstdio>
 
 #include <esp_log.h>
@@ -16,25 +17,24 @@ LV_FONT_DECLARE(font_puhui_20_4);
 // Log tag shared by RenderSwitch and EspVocatUi.
 static const char* TAG = "esp-vocat";
 
-// ===== Shared visual language (one place; applied by the page screens). A light
-// iOS System-Settings aesthetic tuned to the 360x360 round panel: light-grey
-// grouped background, white inset rounded cards, iOS-blue (#0A84FF) accents,
-// plain blue text chevrons, and hairline dividers. Typography hierarchy (title >
-// content > action) is expressed with the existing font_puhui_20_4 via color /
-// weight / spacing - the OTA slot has no room for a larger CJK font, so sizes
-// are not scaled.
+// ===== Shared visual language (one place; applied by the page screens). A Peak-
+// inspired dark instrument face tuned to the 360x360 round panel: near-black
+// cockpit background, cyan instrument arcs, dim tick marks, and coral only for
+// the emotion under study. Typography hierarchy (title > content > action) is
+// expressed with the existing font_puhui_20_4 via color / weight / spacing - the
+// OTA slot has no room for a larger CJK font, so sizes are not scaled.
 namespace {
-// Light iOS palette.
-constexpr uint32_t kScreenBg = 0xF2F2F7;       // grouped list background
-constexpr uint32_t kCardBg = 0xFFFFFF;          // white inset card
-constexpr uint32_t kPrimaryText = 0x1C1C1E;     // iOS primary label
-constexpr uint32_t kSecondaryText = 0x8E8E93;   // iOS secondary label
-constexpr uint32_t kSeparator = 0x3C3C43;       // iOS hairline divider
-constexpr uint32_t kIosBlue = 0x0A84FF;         // iOS accent (chevrons, values)
-constexpr uint32_t kPink = 0xFF8FB1;            // pet-tie accent (emotion name)
-constexpr uint32_t kLavender = 0x9775FA;        // pet-tie accent (emotion name)
-constexpr uint32_t kWhite = 0xFFFFFF;
-constexpr uint32_t kEmotionPillBg = 0xFFE3EC;    // soft pink tint behind the name
+// Peak instrument palette.
+constexpr uint32_t kScreenBg = 0x080D12;        // cockpit background
+constexpr uint32_t kCardBg = 0x10181E;          // recessed instrument well
+constexpr uint32_t kPrimaryText = 0xE8FFF9;     // instrument readout
+constexpr uint32_t kSecondaryText = 0x6F8D91;   // scale labels
+constexpr uint32_t kSeparator = 0x1D2A31;       // dim tick / track
+constexpr uint32_t kIosBlue = 0x35F5D0;         // cyan instrument accent
+constexpr uint32_t kPink = 0xFF8A68;            // coral emotion readout
+constexpr uint32_t kLavender = 0x54A8FF;        // cold-blue secondary accent
+constexpr uint32_t kWhite = 0x081014;
+constexpr uint32_t kEmotionPillBg = 0x10181E;   // recessed readout well
 
 // Rounded-corner language matching the panel curvature.
 constexpr lv_coord_t kRadiusCard = 20;          // white grouped card
@@ -82,10 +82,9 @@ void InitSharedStyles() {
     lv_style_set_bg_color(&g_style_card, lv_color_hex(kCardBg));
     lv_style_set_bg_opa(&g_style_card, LV_OPA_COVER);
     lv_style_set_radius(&g_style_card, kRadiusCard);
-    // A faint drop shadow separates the white card from the F2F2F7 background.
-    lv_style_set_shadow_width(&g_style_card, 8);
-    lv_style_set_shadow_opa(&g_style_card, LV_OPA_10);
-    lv_style_set_shadow_color(&g_style_card, lv_color_hex(0x000000));
+    lv_style_set_border_color(&g_style_card, lv_color_hex(kIosBlue));
+    lv_style_set_border_width(&g_style_card, 1);
+    lv_style_set_border_opa(&g_style_card, LV_OPA_30);
 
     lv_style_init(&g_style_title);
     lv_style_set_text_color(&g_style_title, lv_color_hex(kPrimaryText));
@@ -113,7 +112,7 @@ void InitSharedStyles() {
     lv_style_set_radius(&g_style_primary_btn, kRadiusPrimaryBtn);
 
     lv_style_init(&g_style_btn_label);
-    lv_style_set_text_color(&g_style_btn_label, lv_color_hex(kWhite));
+    lv_style_set_text_color(&g_style_btn_label, lv_color_hex(0x081014));
     lv_style_set_text_font(&g_style_btn_label, &font_puhui_20_4);
 
     lv_style_init(&g_style_chevron_btn);
@@ -485,7 +484,7 @@ void EspVocatUi::BuildSettingsScreen() {
         return;
     }
 
-    // Light iOS System-Settings grouped list, inset to the round 360x360 panel.
+    // Peak-style instrument face, inset to the round 360x360 panel.
     // Each page owns its own screen object (lv_obj_create(NULL), the LVGL 9
     // idiom), never lv_screen_active() — otherwise pages would alias the shared
     // default screen and stack stale children across reloads.
@@ -493,8 +492,7 @@ void EspVocatUi::BuildSettingsScreen() {
     lv_obj_remove_style_all(scr);
     lv_obj_add_style(scr, &g_style_screen_bg, 0);
 
-    // iOS back chevron: a plain blue text glyph, no filled circle. Kept inside
-    // the round panel's visible circle (see kNavBack*).
+    // Thin instrument back chevron, kept inside the visible circle.
     lv_obj_t* back = lv_button_create(scr);
     lv_obj_add_style(back, &g_style_chevron_btn, 0);
     lv_obj_set_size(back, kNavBackSize, kNavBackSize);
@@ -505,22 +503,21 @@ void EspVocatUi::BuildSettingsScreen() {
     lv_obj_add_style(back_label, &g_style_accent_text, 0);
     lv_obj_center(back_label);
 
-    // Title 设置, centred in the nav bar.
+    // Title 设置, centred above the two gauges.
     lv_obj_t* title = lv_label_create(scr);
     lv_label_set_text(title, "设置");
     lv_obj_add_style(title, &g_style_title, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, kNavTitleY);
 
-    // One grouped white card holding the two rows (亮度, 音量). Inset to kCardWidth
-    // so the round glass never clips its top corners.
+    // One recessed instrument well holding the brightness and volume gauges.
     lv_obj_t* card = lv_obj_create(scr);
     lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, kCardWidth, 168);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, kCardTopSettings);
+    lv_obj_set_size(card, kCardWidth, 228);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 92);
     lv_obj_add_style(card, &g_style_card, 0);
 
-    BuildSettingsRow(card, "亮度", &brightness_value_label_, true, 0, false);
-    BuildSettingsRow(card, "音量", &volume_value_label_, false, 84, true);
+    BuildSettingsRow(card, "亮度", &brightness_value_label_, true, -72);
+    BuildSettingsRow(card, "音量", &volume_value_label_, false, 72);
 
     settings_screen_ = scr;
     lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
@@ -530,38 +527,56 @@ void EspVocatUi::BuildSettingsScreen() {
 }
 
 void EspVocatUi::BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** value_label_out,
-                                  bool is_brightness, int y_offset, bool has_separator_above) {
-    // Row name (dark primary), top-left within the 84px row.
-    lv_obj_t* name_label = lv_label_create(card);
-    lv_label_set_text(name_label, name);
-    lv_obj_add_style(name_label, &g_style_body, 0);
-    lv_obj_align(name_label, LV_ALIGN_TOP_LEFT, 18, y_offset + 32);
+                                  bool is_brightness, int x_offset) {
+    lv_obj_t* gauge = lv_obj_create(card);
+    lv_obj_remove_style_all(gauge);
+    lv_obj_set_size(gauge, 132, 184);
+    lv_obj_align(gauge, LV_ALIGN_CENTER, x_offset, 0);
 
-    // Value label (iOS blue accent), directly beside the row name.
-    lv_obj_t* value_label = lv_label_create(card);
+    // Dim full-scale track.
+    lv_obj_t* track = lv_arc_create(gauge);
+    lv_obj_remove_style_all(track);
+    lv_obj_set_size(track, 116, 116);
+    lv_obj_align(track, LV_ALIGN_TOP_MID, 0, 4);
+    lv_arc_set_rotation(track, 135);
+    lv_arc_set_bg_angles(track, 0, 270);
+    lv_arc_set_value(track, 100);
+    lv_obj_set_style_arc_width(track, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(track, lv_color_hex(kSeparator), LV_PART_INDICATOR);
+    lv_obj_remove_flag(track, LV_OBJ_FLAG_CLICKABLE);
+
+    // Cyan value arc. The indicator is refreshed whenever the cached value changes.
+    lv_obj_t* arc = lv_arc_create(gauge);
+    lv_obj_remove_style_all(arc);
+    lv_obj_set_size(arc, 116, 116);
+    lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 4);
+    lv_arc_set_rotation(arc, 135);
+    lv_arc_set_bg_angles(arc, 0, 270);
+    lv_arc_set_range(arc, 0, 100);
+    lv_obj_set_style_arc_width(arc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(kIosBlue), LV_PART_INDICATOR);
+    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    if (is_brightness) {
+        brightness_arc_ = arc;
+    } else {
+        volume_arc_ = arc;
+    }
+
+    lv_obj_t* name_label = lv_label_create(gauge);
+    lv_label_set_text(name_label, name);
+    lv_obj_add_style(name_label, &g_style_subtitle, 0);
+    lv_obj_align(name_label, LV_ALIGN_TOP_MID, 0, 42);
+
+    lv_obj_t* value_label = lv_label_create(gauge);
     lv_obj_add_style(value_label, &g_style_accent_text, 0);
-    lv_obj_align(value_label, LV_ALIGN_TOP_LEFT, 72, y_offset + 32);
+    lv_obj_align(value_label, LV_ALIGN_TOP_MID, 0, 70);
     *value_label_out = value_label;
 
-    // iOS UIStepper pill: a bordered rounded control with − left, ＋ right and a
-    // hairline vertical divider between the halves. Both halves are transparent
-    // hit-areas whose glyphs are iOS-blue accent text.
-    lv_obj_t* pill = lv_obj_create(card);
-    lv_obj_remove_style_all(pill);
-    lv_obj_set_size(pill, kStepperPillWidth, 32);
-    lv_obj_align(pill, LV_ALIGN_TOP_RIGHT, -18, y_offset + 26);
-    lv_obj_set_style_bg_opa(pill, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(pill, lv_color_hex(kIosBlue), 0);
-    lv_obj_set_style_border_width(pill, 1, 0);
-    lv_obj_set_style_border_opa(pill, LV_OPA_50, 0);
-    lv_obj_set_style_radius(pill, kRadiusStepperPill, 0);
-
-    // Left − half.
-    lv_obj_t* minus = lv_button_create(pill);
+    // Transparent − / ＋ hit areas flanking the readout.
+    lv_obj_t* minus = lv_button_create(gauge);
     lv_obj_remove_style_all(minus);
-    lv_obj_set_size(minus, kStepperPillWidth / 2, 32);
-    lv_obj_align(minus, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_set_style_bg_opa(minus, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(minus, 48, 40);
+    lv_obj_align(minus, LV_ALIGN_BOTTOM_LEFT, 4, -4);
     lv_obj_add_event_cb(minus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
                         new SettingsStepTarget{this, is_brightness, -1});
     lv_obj_t* minus_label = lv_label_create(minus);
@@ -569,36 +584,16 @@ void EspVocatUi::BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** v
     lv_obj_add_style(minus_label, &g_style_accent_text, 0);
     lv_obj_center(minus_label);
 
-    // Hairline vertical divider inside the pill.
-    lv_obj_t* divider = lv_obj_create(pill);
-    lv_obj_remove_style_all(divider);
-    lv_obj_set_size(divider, 1, 20);
-    lv_obj_align(divider, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(divider, lv_color_hex(kIosBlue), 0);
-    lv_obj_set_style_bg_opa(divider, LV_OPA_30, 0);
-
-    // Right + half.
-    lv_obj_t* plus = lv_button_create(pill);
+    lv_obj_t* plus = lv_button_create(gauge);
     lv_obj_remove_style_all(plus);
-    lv_obj_set_size(plus, kStepperPillWidth / 2, 32);
-    lv_obj_align(plus, LV_ALIGN_RIGHT_MID, 0, 0);
-    lv_obj_set_style_bg_opa(plus, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(plus, 48, 40);
+    lv_obj_align(plus, LV_ALIGN_BOTTOM_RIGHT, -4, -4);
     lv_obj_add_event_cb(plus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
                         new SettingsStepTarget{this, is_brightness, +1});
     lv_obj_t* plus_label = lv_label_create(plus);
     lv_label_set_text(plus_label, "+");
     lv_obj_add_style(plus_label, &g_style_accent_text, 0);
     lv_obj_center(plus_label);
-
-    // Hairline separator above the second row (iOS divider between rows).
-    if (has_separator_above) {
-        lv_obj_t* sep = lv_obj_create(card);
-        lv_obj_remove_style_all(sep);
-        lv_obj_set_size(sep, 288, 1);
-        lv_obj_align(sep, LV_ALIGN_TOP_LEFT, 18, y_offset);
-        lv_obj_set_style_bg_color(sep, lv_color_hex(kSeparator), 0);
-        lv_obj_set_style_bg_opa(sep, LV_OPA_30, 0);
-    }
 }
 
 void EspVocatUi::ApplySettingsValue(bool is_brightness, int delta) {
@@ -631,8 +626,12 @@ void EspVocatUi::RefreshSettingsValueLabel(bool is_brightness) {
         return;  // screen not built yet; SetSettingsValue* just caches
     }
     char buf[16];
-    snprintf(buf, sizeof(buf), "%d", value);
+    snprintf(buf, sizeof(buf), "%03d", value);
     lv_label_set_text(label, buf);
+    lv_obj_t* arc = is_brightness ? brightness_arc_ : volume_arc_;
+    if (arc != nullptr) {
+        lv_arc_set_value(arc, value);
+    }
 }
 
 void EspVocatUi::SetSettingsValueBrightness(int value) {
@@ -647,6 +646,15 @@ void EspVocatUi::SetSettingsValueVolume(int value) {
 
 // ---- Emotion learning screen -----------------------------------------------
 
+// Radius (px) of the 8 scale ticks around the dial. Shared by the tick builder
+// and RefreshEmotionDial() so the rotation re-positions on the same circle.
+static constexpr int kEmotionTickRadius = 84;
+// The 8 emotion names, ordered clockwise around the dial (tick 0 at 12 o'clock).
+static const char* const kEmotionUiNames[8] = {"开心", "伤心", "生气", "惊讶",
+                                               "困惑", "困了", "喜欢", "平静"};
+// Degrees per tick (360/8); used to convert dial rotation into a selection.
+static constexpr float kEmotionTickDeg = 45.0f;
+
 void EspVocatUi::EmotionLearningStartEventCb(lv_event_t* e) {
     auto* target = static_cast<StartLearningTarget*>(lv_event_get_user_data(e));
     if (target == nullptr || target->ui == nullptr) {
@@ -655,19 +663,6 @@ void EspVocatUi::EmotionLearningStartEventCb(lv_event_t* e) {
     ESP_LOGI(TAG, "EspVocatUi: emotion learning 开始 pressed");
     if (target->ui->start_learning_cb_) {
         target->ui->start_learning_cb_();
-    }
-}
-
-void EspVocatUi::EmotionLearningStepEventCb(lv_event_t* e) {
-    auto* target = static_cast<EmotionStepTarget*>(lv_event_get_user_data(e));
-    if (target == nullptr || target->ui == nullptr) {
-        return;
-    }
-    ESP_LOGI(TAG, "EspVocatUi: emotion step %s pressed", target->is_next ? "next" : "prev");
-    if (target->is_next && target->ui->emotion_next_cb_) {
-        target->ui->emotion_next_cb_();
-    } else if (!target->is_next && target->ui->emotion_prev_cb_) {
-        target->ui->emotion_prev_cb_();
     }
 }
 
@@ -683,7 +678,7 @@ void EspVocatUi::BuildEmotionLearningScreen() {
         return;
     }
 
-    // Light iOS learning page, inset to the round 360x360 panel. No pet face;
+    // Peak-style emotion instrument, inset to the round 360x360 panel. No pet face;
     // this is a pure LVGL page. Own dedicated screen object (lv_obj_create(NULL)),
     // never lv_screen_active(), so this page's children never alias another
     // page's children on the shared default screen.
@@ -691,8 +686,6 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     lv_obj_remove_style_all(scr);
     lv_obj_add_style(scr, &g_style_screen_bg, 0);
 
-    // iOS back chevron: a plain blue text glyph, no filled circle. Kept inside
-    // the round panel's visible circle (see kNavBack*).
     lv_obj_t* back = lv_button_create(scr);
     lv_obj_add_style(back, &g_style_chevron_btn, 0);
     lv_obj_set_size(back, kNavBackSize, kNavBackSize);
@@ -703,69 +696,55 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     lv_obj_add_style(back_label, &g_style_accent_text, 0);
     lv_obj_center(back_label);
 
-    // Title 情绪学习, centred in the nav bar.
     lv_obj_t* title = lv_label_create(scr);
     lv_label_set_text(title, "情绪学习");
     lv_obj_add_style(title, &g_style_title, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, kNavTitleY);
 
-    // One white card holding the current emotion name flanked by the step
-    // chevrons. Inset to kCardWidth so the round glass never clips its corners.
-    lv_obj_t* card = lv_obj_create(scr);
-    lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, kCardWidth, 144);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, kCardTopEmotion);
-    lv_obj_add_style(card, &g_style_card, 0);
+    lv_obj_t* dial = lv_obj_create(scr);
+    lv_obj_remove_style_all(dial);
+    lv_obj_set_size(dial, 236, 236);
+    lv_obj_align(dial, LV_ALIGN_CENTER, 0, 10);
 
-    // Left ‹ / right › blue text-chevron step buttons flanking the current name.
-    // Each fires the board's prev/next callback (which cycles the emotion index
-    // and calls SetEmotionLearningName).
-    lv_obj_t* prev = lv_button_create(card);
-    lv_obj_add_style(prev, &g_style_chevron_btn, 0);
-    lv_obj_set_size(prev, 56, 56);
-    lv_obj_align(prev, LV_ALIGN_LEFT_MID, 8, 0);
-    lv_obj_add_event_cb(prev, EspVocatUi::EmotionLearningStepEventCb, LV_EVENT_CLICKED,
-                        new EmotionStepTarget{this, false});
-    lv_obj_t* prev_label = lv_label_create(prev);
-    lv_label_set_text(prev_label, "<");
-    lv_obj_add_style(prev_label, &g_style_accent_text, 0);
-    lv_obj_center(prev_label);
+    lv_obj_t* ring = lv_arc_create(dial);
+    lv_obj_remove_style_all(ring);
+    lv_obj_set_size(ring, 220, 220);
+    lv_obj_center(ring);
+    lv_arc_set_bg_angles(ring, 0, 360);
+    lv_arc_set_value(ring, 100);
+    lv_obj_set_style_arc_width(ring, 2, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(ring, lv_color_hex(kIosBlue), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(ring, LV_OPA_40, LV_PART_INDICATOR);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t* next = lv_button_create(card);
-    lv_obj_add_style(next, &g_style_chevron_btn, 0);
-    lv_obj_set_size(next, 56, 56);
-    lv_obj_align(next, LV_ALIGN_RIGHT_MID, -8, 0);
-    lv_obj_add_event_cb(next, EspVocatUi::EmotionLearningStepEventCb, LV_EVENT_CLICKED,
-                        new EmotionStepTarget{this, true});
-    lv_obj_t* next_label = lv_label_create(next);
-    lv_label_set_text(next_label, ">");
-    lv_obj_add_style(next_label, &g_style_accent_text, 0);
-    lv_obj_center(next_label);
-
-    // Central current-emotion name: the page's hero. Pink pet-tie accent text on
-    // a soft rounded tinted pill carries the emotion's colour to the edge of the
-    // card (a full emotion->color map is deferred to a later task, so all names
-    // share this warm tint for now).
-    lv_obj_t* name_label = lv_label_create(card);
+    lv_obj_t* name_label = lv_label_create(dial);
     lv_obj_add_style(name_label, &g_style_emotion_name, 0);
-    lv_obj_set_style_bg_color(name_label, lv_color_hex(kEmotionPillBg), 0);
-    lv_obj_set_style_bg_opa(name_label, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(name_label, 40, 0);
-    lv_obj_set_style_pad_left(name_label, 26, 0);
-    lv_obj_set_style_pad_right(name_label, 26, 0);
-    lv_obj_set_style_pad_top(name_label, 12, 0);
-    lv_obj_set_style_pad_bottom(name_label, 12, 0);
-    lv_obj_align(name_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(name_label, LV_ALIGN_CENTER, 0, -8);
     emotion_name_label_ = name_label;
     if (!emotion_name_.empty()) {
         lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
     }
 
-    // Filled iOS-blue 开始 primary button, low enough inside the circle that its
-    // bottom corners stay on the round glass (centre y = 180 + 106).
+    // Eight scale ticks around the dial; the active emotion (nearest the top) is
+    // coral. Created here once; RefreshEmotionDial() re-positions them around the
+    // dial and re-highlights as the dial rotates with the finger.
+    for (int i = 0; i < 8; ++i) {
+        lv_obj_t* tick = lv_obj_create(dial);
+        lv_obj_remove_style_all(tick);
+        lv_obj_set_size(tick, 10, 10);
+        lv_obj_set_style_radius(tick, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(tick, lv_color_hex(kSeparator), 0);
+        lv_obj_set_style_bg_opa(tick, LV_OPA_COVER, 0);
+        emotion_ticks_[i] = tick;
+    }
+
+    // Selection is made by rotating the dial with a finger (the board feeds the
+    // angular deltas); no arrow buttons are drawn here.
+
+    // Compact cyan START control, kept inside the lower arc of the round panel.
     lv_obj_t* start = lv_button_create(scr);
-    lv_obj_set_size(start, 220, 72);
-    lv_obj_align(start, LV_ALIGN_CENTER, 0, 106);
+    lv_obj_set_size(start, 148, 46);
+    lv_obj_align(start, LV_ALIGN_BOTTOM_MID, 0, -28);
     lv_obj_add_style(start, &g_style_primary_btn, 0);
     lv_obj_add_event_cb(start, EspVocatUi::EmotionLearningStartEventCb, LV_EVENT_CLICKED,
                         new StartLearningTarget{this});
@@ -775,6 +754,8 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     lv_obj_center(start_label);
 
     emotion_screen_ = scr;
+    // Apply the cached/initial rotation and highlight once all ticks exist.
+    RefreshEmotionDial();
     lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
     ESP_LOGI(TAG, "EspVocatUi: emotion learning screen built");
 }
@@ -782,16 +763,80 @@ void EspVocatUi::BuildEmotionLearningScreen() {
 void EspVocatUi::SetEmotionLearningName(const char* name) {
     // Cache unconditionally; the label only exists once the screen is built.
     emotion_name_ = name != nullptr ? name : "";
-    RefreshEmotionLearningName();
+    // Park the dial so the named emotion sits at the top (12 o'clock), then
+    // refresh. This is the non-drag path (explicit set / lesson return); a live
+    // drag drives emotion_dial_rotation_ directly instead.
+    int index = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (emotion_name_ == kEmotionUiNames[i]) {
+            index = i;
+            break;
+        }
+    }
+    // Park the dial so the named emotion's tick sits at the top: rotation = index*45.
+    emotion_dial_rotation_ = index * kEmotionTickDeg;
+    RefreshEmotionDial();
 }
 
-void EspVocatUi::RefreshEmotionLearningName() {
+int EspVocatUi::SelectedEmotionIndex() const {
+    // Tick i sits at rotation - i*45 - 90; it is at the top (-90) when
+    // rotation - i*45 = 0 (mod 360), i.e. i = round(rotation/45) (mod 8).
+    // Clockwise finger rotation raises rotation -> the next emotion comes to the
+    // top, and the ring turns with the finger.
+    int sel = static_cast<int>(roundf(emotion_dial_rotation_ / kEmotionTickDeg));
+    return ((sel % 8) + 8) % 8;
+}
+
+void EspVocatUi::RefreshEmotionDial() {
     if (emotion_name_label_ == nullptr) {
-        return;  // screen not built yet; name cached in emotion_name_
+        return;  // screen not built yet; rotation applied on build
     }
+    int sel = SelectedEmotionIndex();
+    emotion_name_ = kEmotionUiNames[sel];
     lvgl_port_lock(-1);
     lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
+    for (int i = 0; i < 8; ++i) {
+        if (emotion_ticks_[i] == nullptr) {
+            continue;
+        }
+        // Place tick i at angle rotation - i*45 - 90 degrees, measured from the
+        // dial centre with 0 at 3 o'clock and clockwise positive (screen y down).
+        // Increasing i runs counterclockwise so that a clockwise ring rotation
+        // (which follows the finger) brings the next emotion under the top marker.
+        float angle_deg = emotion_dial_rotation_ - static_cast<float>(i) * kEmotionTickDeg - 90.0f;
+        float rad = angle_deg * 3.14159265f / 180.0f;
+        lv_obj_align(emotion_ticks_[i], LV_ALIGN_CENTER,
+                     static_cast<lv_coord_t>(kEmotionTickRadius * cosf(rad)),
+                     static_cast<lv_coord_t>(kEmotionTickRadius * sinf(rad)));
+        lv_obj_set_style_bg_color(emotion_ticks_[i],
+                                  lv_color_hex(i == sel ? kPink : kSeparator), 0);
+    }
     lvgl_port_unlock();
+}
+
+void EspVocatUi::RotateEmotionDial(float clockwise_deg) {
+    // Clockwise (positive) turns the ring clockwise with the finger and steps to
+    // the next emotion (see SelectedEmotionIndex). Called from the touch task
+    // under a held drag.
+    if (!lv_obj_is_valid(emotion_screen_)) {
+        return;
+    }
+    emotion_dial_rotation_ += clockwise_deg;
+    RefreshEmotionDial();
+}
+
+void EspVocatUi::EndEmotionDialDrag() {
+    // Snap the dial to the nearest tick so the chosen emotion sits at the top,
+    // then tell the board which index was settled (it keeps current_emotion_index_
+    // in sync for the flashcard lesson).
+    int sel = SelectedEmotionIndex();
+    emotion_dial_rotation_ = sel * kEmotionTickDeg;
+    RefreshEmotionDial();
+    ESP_LOGI(TAG, "EspVocatUi: emotion dial settled on index %d (%s)", sel,
+             kEmotionUiNames[sel]);
+    if (emotion_dial_settled_cb_) {
+        emotion_dial_settled_cb_(sel);
+    }
 }
 
 // ---- Conversation overlay ----------------------------------------------------

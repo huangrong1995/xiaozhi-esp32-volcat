@@ -144,12 +144,23 @@ public:
     // The board wires this to its existing emotion-learning flow.
     void SetStartLearningCallback(StartCb cb) { start_learning_cb_ = std::move(cb); }
 
-    // Register the callbacks invoked when the user presses the on-screen ‹ / ›
-    // emotion step buttons. The board cycles the current emotion index and calls
-    // SetEmotionLearningName with the new name.
-    using EmotionStepCb = std::function<void()>;
-    void SetEmotionPrevCallback(EmotionStepCb cb) { emotion_prev_cb_ = std::move(cb); }
-    void SetEmotionNextCallback(EmotionStepCb cb) { emotion_next_cb_ = std::move(cb); }
+    // --- Dial selection (rotate to choose an emotion) --------------------------
+    // The learning screen's dial is rotated by dragging a finger around it, not
+    // by arrow buttons. The board drives this continuously while a touch is held:
+    //   RotateEmotionDial(deg)  adds a clockwise(+)/counterclockwise(-) angular
+    //                            step in degrees, re-positioning the ticks so the
+    //                            dial follows the finger.
+    //   EndEmotionDialDrag()     snaps the dial to the nearest emotion, then fires
+    //                            the settled callback with the chosen index.
+    // The chosen index callback lets the board keep current_emotion_index_ in sync
+    // (it drives the flashcard lesson). Registered once at startup.
+    using EmotionDialSettledCb = std::function<void(int)>;
+    void SetEmotionDialSettledCallback(EmotionDialSettledCb cb)
+    {
+        emotion_dial_settled_cb_ = std::move(cb);
+    }
+    void RotateEmotionDial(float clockwise_deg);
+    void EndEmotionDialDrag();
 
     // Flashcard lesson: hand the panel to the emote pet face so the pet can
     // demonstrate each emotion (expression + name/progress caption), while
@@ -212,10 +223,10 @@ private:
 
     // Build (once) and show the settings screen; reused across ShowScreen calls.
     void BuildSettingsScreen();
-    // Build one row inside the grouped card: name label + blue value + iOS
-    // UIStepper pill, with an optional hairline separator above.
+    // Build one circular instrument inside the settings face: a dim arc track, a
+    // cyan value arc, a central readout, and − / ＋ hit areas.
     void BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** value_label_out,
-                          bool is_brightness, int y_offset, bool has_separator_above);
+                          bool is_brightness, int x_offset);
     // Clamp, refresh the value label, and fire the change callback if changed.
     void ApplySettingsValue(bool is_brightness, int delta);
     void RefreshSettingsValueLabel(bool is_brightness);
@@ -223,6 +234,8 @@ private:
     lv_obj_t* settings_screen_ = nullptr;
     lv_obj_t* brightness_value_label_ = nullptr;
     lv_obj_t* volume_value_label_ = nullptr;
+    lv_obj_t* brightness_arc_ = nullptr;
+    lv_obj_t* volume_arc_ = nullptr;
     int brightness_ = 50;  // cached stepper values (0-100), shown on the screen
     int volume_ = 50;
     ChangeCb brightness_change_cb_;
@@ -236,28 +249,30 @@ private:
         EspVocatUi* ui;
     };
 
-    // Identifies which ‹/› emotion step button was pressed (reused as the
-    // user-data for both buttons; the flag selects prev vs next).
-    struct EmotionStepTarget {
-        EspVocatUi* ui;
-        bool is_next;  // false = previous (‹), true = next (›)
-    };
-
     static void EmotionLearningStartEventCb(lv_event_t* e);
-    static void EmotionLearningStepEventCb(lv_event_t* e);
 
     // Build (once) and show the emotion learning screen; reused across
     // ShowScreen calls. Its back button reuses the shared back_to_home_cb_.
     void BuildEmotionLearningScreen();
-    // Apply the cached emotion name to the central label if the screen is built.
-    void RefreshEmotionLearningName();
+    // Re-position the 8 scale ticks to the current dial rotation and highlight
+    // the tick nearest the top (12 o'clock), updating the central label to the
+    // emotion under it. Single render path for both explicit sets and drags.
+    void RefreshEmotionDial();
+    // Index of the emotion whose tick is nearest the top for the current rotation.
+    int SelectedEmotionIndex() const;
 
     lv_obj_t* emotion_screen_ = nullptr;
     lv_obj_t* emotion_name_label_ = nullptr;
+    lv_obj_t* emotion_ticks_[8] = {};
     std::string emotion_name_;  // cached; applied to the label once built
+    // Current dial rotation in degrees. Ticks sit at rotation - i*45 - 90, so the
+    // tick selected (at the top, -90) is round(rotation/45) mod 8. Clockwise
+    // finger rotation raises it (the ring turns with the finger) and steps to the
+    // next emotion. Set implicitly by SetEmotionLearningName / EndEmotionDialDrag;
+    // tracked live during a drag.
+    float emotion_dial_rotation_ = 0.0f;
     StartCb start_learning_cb_;
-    EmotionStepCb emotion_prev_cb_;
-    EmotionStepCb emotion_next_cb_;
+    EmotionDialSettledCb emotion_dial_settled_cb_;
 
     // ---- Conversation overlay (emote-composited) ------------------------------
     // Cached desired state, forwarded to the emote overlay on SetConversationActive.
