@@ -864,6 +864,19 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
     models_list_ = models_list;
 }
 
+void AudioService::SetOutputVolume(int volume) {
+    if (codec_ != nullptr) {
+        codec_->SetOutputVolume(volume);
+    }
+}
+
+int AudioService::GetOutputVolume() const {
+    if (codec_ != nullptr) {
+        return codec_->output_volume();
+    }
+    return 0;
+}
+
 bool AudioService::IsAfeWakeWord() {
     return audio_engine_initialized_ && audio_engine_->IsAfeWakeWord();
 }

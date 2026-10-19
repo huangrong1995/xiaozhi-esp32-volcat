@@ -6,6 +6,7 @@
 #include "codecs/box_audio_codec.h"
 #include "config.h"
 #include "display/emote_display.h"
+#include "display/esp_vocat_ui.h"
 #include "display/lcd_display.h"
 #include "esp_video.h"
 #include "power_save_timer.h"
@@ -16,6 +17,7 @@
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <math.h>
 #include <time.h>
 #include <cinttypes>
 #include <mutex>
@@ -507,7 +509,7 @@ enum class Gesture {
 };
 
 // Device interaction modes.
-enum class Mode { Chat, EmotionLearning, Yoga };
+enum class Mode { Chat, EmotionLearning, Settings };
 
 class EspVocat : public WifiBoard {
 private:
@@ -517,6 +519,16 @@ private:
     Charge* charge_;
     Button boot_button_;
     Display* display_ = nullptr;
+    // Screen manager that alternates the shared panel between the emote pet
+    // renderer (Home) and LVGL page screens (Settings / EmotionLearning).
+    // Owns the RenderSwitch and tracks which presentation is currently shown;
+    // see main/display/esp_vocat_ui.h for the gating model.
+    EspVocatUi* ui_ = nullptr;
+    // The screen currently presented. Falls back to Home before ui_ is built so
+    // the interaction timers can run safely during boot.
+    ScreenId CurrentScreen() const {
+        return (ui_ != nullptr) ? ui_->CurrentScreen() : ScreenId::Home;
+    }
     PwmBacklight* backlight_ = nullptr;
     esp_timer_handle_t touchpad_timer_;
     esp_lcd_touch_handle_t tp;  // LCD touch handle
@@ -551,6 +563,31 @@ private:
     static const char* kEmotionLearningEmotions_[];
     static const char* kEmotionLearningNames_[];
     static constexpr size_t kEmotionLearningCount = 8;
+
+    // Emotion-learning flashcard lesson state. When lesson_active_, the pet
+    // demonstrates each emotion on its face and auto-advances; timers drive the
+    // per-card advance and the completion pause. current_emotion_index_ is reused
+    // to track which emotion the lesson is demonstrating.
+    bool lesson_active_ = false;
+    esp_timer_handle_t lesson_timer_ = nullptr;
+    esp_timer_handle_t lesson_end_timer_ = nullptr;
+    // Defers StartEmotionLesson off the LVGL task. The 开始 button is an LVGL
+    // click event (runs under the LVGL lock inside the esp_lvgl_port timer
+    // handler); starting the lesson there hands the panel back to emote via
+    // render_switch_.ShowEmote() -> lvgl_port_stop(), which stops the LVGL timer
+    // from within its own dispatch and freezes the device. Firing on the
+    // esp_timer task (no LVGL lock) avoids that self-deadlock; a tiny delay lets
+    // the click dispatch finish first.
+    esp_timer_handle_t lesson_start_defer_timer_ = nullptr;
+    static constexpr int64_t kLessonStartDeferUs = 20000;  // 20ms
+    static constexpr int64_t kLessonCardMs = 2500;         // per-emotion demo hold
+    static constexpr int64_t kLessonEndMs = 1800;          // completion pause before returning
+    // Grace window after the lesson starts during which a gesture Tap is ignored.
+    // Pressing the on-screen 开始 also emits a Gesture::Tap (fed to LVGL and to
+    // the gesture layer on two cores), so this swallows that start-tap so it can
+    // never accidentally skip the first demonstrated emotion.
+    static constexpr int64_t kLessonStartGraceMs = 500;
+    int64_t lesson_start_ms_ = 0;
 
     // Habit tracking state (persisted fields).
     struct HabitState {
@@ -609,23 +646,35 @@ private:
     int swipe_start_y_ = 0;
     static constexpr int kSwipeThreshold = 80;  // Minimum swipe distance
 
-    // Yoga challenge mode
-    size_t current_pose_index_ = 0;
-    static const char* kYogaPoseNames_[];
-    static const char* kYogaPoseDirections_[];
-    static constexpr size_t kYogaPoseCount = 6;
-
-    // Yoga success feedback window: tilt matches for the same pose are ignored
-    // during the success animation so a pose is not completed twice (spec §2.3).
-    int64_t yoga_success_until_ms_ = 0;
-    static constexpr uint32_t kYogaSuccessDurationMs = 1000;
+    // Emotion-learning dial rotation (drag a finger around the dial to choose an
+    // emotion). Center/radius match the LVGL dial in esp_vocat_ui.cc
+    // (BuildEmotionLearningScreen): 236x236 dial centered at LV_ALIGN_CENTER with
+    // a +10 y offset on the 360x360 panel -> center (180, 190), radius ~118. The
+    // capture radius is a little generous so rotations starting just outside the
+    // ring still register. The 开始 button occupies the lower-centre arc; presses
+    // landing on it must stay button clicks, so its bounding box is excluded.
+    static constexpr float kEmotionDialCenterX = 180.0f;
+    static constexpr float kEmotionDialCenterY = 190.0f;
+    static constexpr float kEmotionDialCaptureRadius = 130.0f;
+    static constexpr int kStartBtnMinX = 106;
+    static constexpr int kStartBtnMaxX = 254;
+    static constexpr int kStartBtnMinY = 286;
+    static constexpr int kStartBtnMaxY = 332;
+    // Poll interval (ms) while a dial rotation drag is held. CST816S only pulses
+    // INT on press/release, so the touch task re-reads the position register at
+    // this rate to track the finger's angular motion. Kept moderate (not too
+    // aggressive) so the extra reads don't crowd the shared I2C bus (touch,
+    // charge and IMU all share it) and provoke transient timeouts.
+    static constexpr int kEmotionDialPollMs = 30;
+    bool emotion_dial_drag_ = false;        // a dial rotation is being tracked
+    float emotion_dial_last_angle_ = 0.0f;  // last finger angle (deg) around the dial
 
     // Display presentation owner. Higher layers take priority and are restored
     // by ResetToStandby(), so transient/mode/reminder feedback do not clobber
     // each other or the standby idle animation (spec §3.4).
     enum class Presentation {
         Standby,            // idle pet animation (lowest priority)
-        Mode,               // emotion-learning / yoga presentation
+        Mode,               // emotion-learning / settings presentation
         Reminder,           // active reminder (highest priority)
         TransientFeedback,  // short touch/shake feedback
     };
@@ -638,6 +687,12 @@ private:
     static constexpr uint64_t kModeIdleTimeoutMs =
         30000;  // Idle timeout (ms) before returning to chat
     esp_timer_handle_t mode_idle_timer_ = nullptr;
+
+    // Conversation overlay: last value driven to ui_->SetSpeaking(). A 200ms
+    // periodic poll maps the device state to the overlay's waveform, but only
+    // re-locks LVGL when the listening/speaking sense actually flips.
+    bool last_speaking_state_ = false;
+    esp_timer_handle_t state_poll_timer_ = nullptr;
 
     // Two-level power save (spec §6.1). Level 1 is a 1s tick that turns off the
     // display after DISPLAY_SLEEP_TIMEOUT_SECONDS of eligible idle while keeping
@@ -652,9 +707,19 @@ private:
 
     static void mode_idle_timer_callback(void* arg) {
         auto* self = static_cast<EspVocat*>(arg);
-        if (self == nullptr || self->mode_ == Mode::Chat || self->reminder_active_) {
+        if (self == nullptr || self->reminder_active_) {
             return;
         }
+        if (self->mode_ == Mode::Chat) {
+            // The Home pet face has nothing to return to. A live conversation
+            // overlay is active interaction: never auto-close it — the timer is
+            // one-shot, so re-arm it to keep this gate armed until the user leaves.
+            if (self->CurrentScreen() == ScreenId::ConversationOverlay) {
+                self->ResetModeIdleTimer();
+            }
+            return;
+        }
+        // Non-Chat modes (LVGL pages) idle back to Chat after the timeout.
         self->ExitToChat();
     }
 
@@ -663,21 +728,30 @@ private:
         // and wake the display if it had fallen to level-1 sleep (spec §6.2).
         TouchPowerSaveActivity();
         ResetModeIdleTimer();
-        // Reminder-first routing: while a reminder is active, its acknowledgement
-        // owns all screen gestures; mode navigation is blocked until handled.
-        if (reminder_active_) {
+        // Reminder-first routing: a reminder owns Home-screen gestures so it can
+        // be acknowledged. While a non-Home page is up, a reminder never hijacks
+        // that page's navigation — the swipe returns Home first, then the reminder
+        // re-engages there (reminders don't interrupt page navigation).
+        if (reminder_active_ && CurrentScreen() == ScreenId::Home) {
             HandleReminderGesture(gesture);
             return;
         }
         switch (mode_) {
             case Mode::Chat:
-                HandleChatGesture(gesture);
+                // In Chat the screen distinguishes the live conversation overlay
+                // from the Home pet face: swipes there leave/force-end the
+                // dialogue instead of navigating to a mode.
+                if (CurrentScreen() == ScreenId::ConversationOverlay) {
+                    HandleConversationGesture(gesture);
+                } else {
+                    HandleChatGesture(gesture);
+                }
                 break;
             case Mode::EmotionLearning:
                 HandleEmotionLearningGesture(gesture);
                 break;
-            case Mode::Yoga:
-                HandleYogaGesture(gesture);
+            case Mode::Settings:
+                HandleSettingsPageGesture(gesture);
                 break;
         }
     }
@@ -692,9 +766,20 @@ private:
         UpdatePowerSaveEligibility();
     }
 
+    // Return to the Home emote pet face from any non-Home presentation. If a
+    // conversation overlay is up, SetConversationActive(false) fires the
+    // dialog-gone callback, whose board handler force-stops the voice pipeline
+    // (StopListening + AbortSpeaking) — leaving a conversation by any navigation
+    // stops the audio.
     void ExitToChat() {
-        if (mode_ == Mode::Chat) {
-            return;
+        if (mode_ == Mode::Chat && CurrentScreen() == ScreenId::Home) {
+            return;  // already at the root Home state
+        }
+        // Leaving any non-Home screen hands the panel back to the emote pet face;
+        // the conversation overlay leaves force-stop the running dialogue.
+        if (ui_ != nullptr) {
+            ui_->SetConversationActive(false);  // fires dialog-gone -> force-stop
+            ui_->ShowHome();
         }
         mode_ = Mode::Chat;
         if (mode_idle_timer_ != nullptr) {
@@ -704,6 +789,70 @@ private:
         UpdatePowerSaveEligibility();
         // Return to the standby idle presentation (Chat → idle pet animation).
         ResetToStandby();
+    }
+
+    // Force-end any active conversation before leaving Home. Covers both the
+    // LVGL overlay conversation (SetConversationActive(false) fires dialog-gone →
+    // force-stop) and conversations started by the BOOT button / wake word, which
+    // run directly on the voice pipeline without the overlay. In that second case
+    // the overlay was never up, so also stop a device that is currently
+    // listening/speaking explicitly — idempotent with the dialog-gone path, and
+    // guarantees navigation away can never leave audio running over a page screen.
+    void ForceEndDialogue() {
+        if (ui_ != nullptr) {
+            ui_->SetConversationActive(false);  // fires dialog-gone if overlay up
+        }
+        auto& app = Application::GetInstance();
+        auto state = app.GetDeviceState();
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            app.StopListening();
+            app.AbortSpeaking(kAbortReasonNone);
+        }
+    }
+
+    // Post-screen-change bookkeeping shared by the Enter* navigations.
+    void AfterScreenChange() {
+        ResetModeIdleTimer();
+        UpdatePowerSaveEligibility();
+    }
+
+    // Drive the conversation overlay's listening/speaking state from the device
+    // state machine, on a light periodic poll. Re-locks LVGL only when the sense
+    // actually flips; a no-op while the overlay is not shown.
+    static void state_poll_timer_callback(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self != nullptr) {
+            self->PollSpeakingState();
+        }
+    }
+
+    void PollSpeakingState() {
+        if (ui_ == nullptr) {
+            return;
+        }
+        // Reflect conversations to the overlay only on the Home pet face (or an
+        // already-shown overlay). A page screen (Settings / EmotionLearning) is
+        // never interrupted by a wake-word conversation that started while it was
+        // shown; the overlay re-surfaces when the user returns Home.
+        ScreenId screen = CurrentScreen();
+        if (screen != ScreenId::Home && screen != ScreenId::ConversationOverlay) {
+            return;
+        }
+        auto state = Application::GetInstance().GetDeviceState();
+        bool active = (state == kDeviceStateListening || state == kDeviceStateSpeaking ||
+                       state == kDeviceStateConnecting || state == kDeviceStateActivating);
+        if (active) {
+            ui_->SetConversationActive(true);
+            bool speaking = (state == kDeviceStateSpeaking);
+            if (speaking != last_speaking_state_) {
+                last_speaking_state_ = speaking;
+                ui_->SetSpeaking(speaking);
+            }
+        } else {
+            // Returning to Idle ends the conversation: hide the overlay (fires
+            // dialog-gone, force-stopping any remaining dialogue idempotently).
+            ui_->SetConversationActive(false);
+        }
     }
 
     void ResetModeIdleTimer() {
@@ -718,12 +867,25 @@ private:
     // the idle pet animation in Chat, the current emotion/pose inside a mode.
     // Stops any transient animation and cannot permanently overwrite a mode
     // or reminder presentation, so feedback layers stay isolated (spec §3.4).
+    // Return the display to the presentation appropriate for the current mode:
+    // the idle pet animation in Chat, the current emotion/pose inside a mode.
+    // Stops any transient animation and cannot permanently overwrite a mode
+    // or reminder presentation, so feedback layers stay isolated (spec §3.4).
+    // Screen-aware: non-Home screens (LVGL pages / the conversation overlay) are
+    // presented by their own layer and are never reset here; a visible reminder
+    // on the Home face keeps its high-priority presentation too.
     void ResetToStandby() {
         if (display_ == nullptr) {
             return;
         }
         if (emotion_reset_timer_ != nullptr) {
             esp_timer_stop(emotion_reset_timer_);
+        }
+        if (reminder_active_ && CurrentScreen() == ScreenId::Home) {
+            return;  // a visible reminder owns the pet face
+        }
+        if (CurrentScreen() != ScreenId::Home) {
+            return;  // non-Home screens own their own presentation
         }
         auto* emote = static_cast<emote::EmoteDisplay*>(display_);
         switch (mode_) {
@@ -735,9 +897,8 @@ private:
                 presentation_ = Presentation::Mode;
                 ShowEmotionLearningCurrent();
                 break;
-            case Mode::Yoga:
+            case Mode::Settings:
                 presentation_ = Presentation::Mode;
-                ShowYogaPose();
                 break;
         }
     }
@@ -751,8 +912,9 @@ private:
             case Gesture::SwipeLeft:
                 EnterEmotionLearningMode();
                 break;
-            case Gesture::SwipeRight:
-                EnterYogaChallengeMode();
+            case Gesture::SwipeUp:
+                // New settings entry (up swipe, previously ignored by main).
+                EnterSettingsPage();
                 break;
             case Gesture::LongPress:
                 // Short cancel/help feedback without muting or recording drink.
@@ -767,50 +929,166 @@ private:
                 ESP_LOGI(TAG, "Shake feedback (Chat mode)");
                 break;
             default:
-                // Ignore mode-only gestures (SwipeUp, SwipeDown, Pet, Shake,
-                // ChatToggle, None). A swipe must never toggle chat.
+                // Ignore mode-only gestures (SwipeDown, Pet, Shake, ChatToggle,
+                // None). A swipe must never toggle chat.
+                break;
+        }
+    }
+
+    // Non-Home LVGL page gestures (Settings / EmotionLearning share this). The
+    // on-screen controls (‹ back, steppers, 开始 button, dial) are delivered to
+    // LVGL via FeedTouch; the gestures reaching this layer are the ones that
+    // started outside a control, and they exit the page back to Home.
+    void HandlePageGesture(Gesture gesture) {
+        switch (gesture) {
+            case Gesture::SwipeLeft:
+            case Gesture::SwipeRight:
+            case Gesture::SwipeUp:
+            case Gesture::LongPress:
+                ExitToChat();
+                break;
+            case Gesture::Tap:
+                // Light touch feedback — but not during a live conversation
+                // overlay, where an audible blip would distract from the dialogue.
+                if (CurrentScreen() == ScreenId::ConversationOverlay) {
+                    break;
+                }
+                ShowTemporaryEmotion("happy", 1500);
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void HandleSettingsPageGesture(Gesture gesture) { HandlePageGesture(gesture); }
+
+    // Live conversation (overlay up over the pet face). Tap keeps main's chat
+    // toggle semantics (stop the dialogue; the device returns to Idle and the
+    // state poll hides the overlay). Any swipe or long-press force-ends the
+    // conversation and returns to the Home pet face.
+    void HandleConversationGesture(Gesture gesture) {
+        switch (gesture) {
+            case Gesture::Tap:
+                Application::GetInstance().ToggleChatState();
+                break;
+            case Gesture::SwipeLeft:
+            case Gesture::SwipeRight:
+            case Gesture::SwipeUp:
+            case Gesture::SwipeDown:
+            case Gesture::LongPress:
+                ExitToChat();
+                break;
+            default:
                 break;
         }
     }
 
     void HandleEmotionLearningGesture(Gesture gesture) {
-        switch (gesture) {
-            case Gesture::SwipeLeft:  // previous emotion
-                current_emotion_index_ =
-                    (current_emotion_index_ + kEmotionLearningCount - 1) % kEmotionLearningCount;
-                ShowEmotionLearningCurrent();
-                break;
-            case Gesture::SwipeRight:  // next emotion
-                ShowEmotionLearningNext();
-                break;
-            case Gesture::Tap:  // feedback for the current emotion
-                ShowEmotionLearningCurrent();
-                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-                break;
-            case Gesture::LongPress:
-                ExitEmotionLearningMode();
-                break;
-            default:
-                break;
+        // Mid-lesson the panel is on the pet face and LVGL is stopped, so the
+        // only interaction is gestures. Tap skips to the next emotion; any swipe
+        // cancels the lesson back to the browsing card (instead of kicking
+        // straight to Chat).
+        if (lesson_active_) {
+            if (gesture == Gesture::Tap) {
+                // Swallow the tap that pressed 开始 (it may arrive as a gesture
+                // either before or after the LVGL click starts the lesson) so the
+                // first demonstrated emotion is never skipped.
+                if (esp_timer_get_time() / 1000 - lesson_start_ms_ < kLessonStartGraceMs) {
+                    return;
+                }
+                ++current_emotion_index_;
+                if (current_emotion_index_ >= kEmotionLearningCount) {
+                    EndEmotionLesson();
+                } else {
+                    PresentLessonEmotion();
+                }
+            } else if (gesture == Gesture::SwipeLeft || gesture == Gesture::SwipeRight ||
+                       gesture == Gesture::SwipeUp) {
+                CancelEmotionLesson();
+            }
+            return;
+        }
+
+        // Browsing the dial: choosing an emotion is a finger rotation around the
+        // dial, tracked as a continuous drag in the touch task (not a swipe). The
+        // gestures reaching this layer are touches that started outside the dial
+        // (or taps): a vertical swipe up/down or a long-press leaves the page to
+        // Home and a tap gives light feedback, while stray horizontal swipes do
+        // nothing (they must never navigate or exit — rotation is the only
+        // selector).
+        if (gesture == Gesture::SwipeUp || gesture == Gesture::SwipeDown ||
+            gesture == Gesture::LongPress) {
+            ExitEmotionLearningMode();
+            return;
+        }
+        if (gesture == Gesture::SwipeLeft || gesture == Gesture::SwipeRight) {
+            return;
+        }
+        if (gesture == Gesture::Tap) {
+            ShowTemporaryEmotion("happy", 1500);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+            return;
         }
     }
 
-    void HandleYogaGesture(Gesture gesture) {
-        switch (gesture) {
-            case Gesture::SwipeLeft:  // previous pose
-                ShowPrevYogaPose();
-                break;
-            case Gesture::SwipeRight:  // next pose
-                ShowNextYogaPose();
-                break;
-            case Gesture::Tap:  // replay the current pose
-                ShowYogaPose();
-                break;
-            case Gesture::LongPress:
-                ExitYogaChallengeMode();
-                break;
-            default:
-                break;
+    // ---- Emotion-learning dial rotation (touch drag) ---------------------------
+    // Finger angle (degrees, clockwise positive) around the dial centre, using
+    // screen coordinates (y down).
+    float EmotionDialAngle(int x, int y) const {
+        return atan2f(static_cast<float>(y - static_cast<int>(kEmotionDialCenterY)),
+                      static_cast<float>(x - static_cast<int>(kEmotionDialCenterX))) *
+               180.0f / 3.14159265f;
+    }
+
+    // Whether a touch press at (x,y) should begin a dial-rotation drag: only on
+    // the browsing emotion-learning screen (not mid-lesson), inside the dial
+    // capture circle, and not on the 开始 button (which stays a button click).
+    bool ShouldBeginEmotionDialDrag(int x, int y) const {
+        if (CurrentScreen() != ScreenId::EmotionLearning || lesson_active_) {
+            return false;
+        }
+        float dx = static_cast<float>(x) - kEmotionDialCenterX;
+        float dy = static_cast<float>(y) - kEmotionDialCenterY;
+        if (dx * dx + dy * dy > kEmotionDialCaptureRadius * kEmotionDialCaptureRadius) {
+            return false;
+        }
+        if (x >= kStartBtnMinX && x <= kStartBtnMaxX && y >= kStartBtnMinY && y <= kStartBtnMaxY) {
+            return false;
+        }
+        return true;
+    }
+
+    void BeginEmotionDialDrag(int x, int y) {
+        emotion_dial_drag_ = true;
+        emotion_dial_last_angle_ = EmotionDialAngle(x, y);
+        // A held drag is interaction too: keep the display awake and the mode idle
+        // timer reset so a long rotation is not treated as inactivity.
+        TouchPowerSaveActivity();
+        ResetModeIdleTimer();
+    }
+
+    void UpdateEmotionDialDrag(int x, int y) {
+        if (!emotion_dial_drag_) {
+            return;
+        }
+        float angle = EmotionDialAngle(x, y);
+        float delta = angle - emotion_dial_last_angle_;
+        emotion_dial_last_angle_ = angle;
+        // Wrap the signed angular step into [-180, 180]; positive = clockwise.
+        while (delta > 180.0f)
+            delta -= 360.0f;
+        while (delta < -180.0f)
+            delta += 360.0f;
+        if (fabsf(delta) > 0.05f && ui_ != nullptr) {
+            ui_->RotateEmotionDial(delta);
+        }
+    }
+
+    void EndEmotionDialDrag() {
+        emotion_dial_drag_ = false;
+        if (ui_ != nullptr) {
+            ui_->EndEmotionDialDrag();
         }
     }
 
@@ -1195,13 +1473,15 @@ private:
         touch_pad_clear_status();
     }
 
-    // Gate level-2 light sleep to the root Chat mode outside a reminder; the
-    // PowerSaveTimer itself additionally requires Application::CanEnterSleepMode().
+    // Gate level-2 light sleep to the root Chat Home screen outside a reminder;
+    // the PowerSaveTimer itself additionally requires Application::CanEnterSleepMode().
+    // LVGL pages and the conversation overlay never light-sleep.
     void UpdatePowerSaveEligibility() {
         if (power_save_timer_ == nullptr) {
             return;
         }
-        bool eligible = (mode_ == Mode::Chat) && !reminder_active_;
+        bool eligible =
+            (mode_ == Mode::Chat) && (CurrentScreen() == ScreenId::Home) && !reminder_active_;
         power_save_timer_->SetEnabled(eligible);
     }
 
@@ -1212,16 +1492,17 @@ private:
         }
     }
 
-    // Level-1 countdown. Only the root Chat mode, with no active reminder and a
-    // standby presentation, and only when the application is genuinely idle
+    // Level-1 countdown. Only the root Chat Home screen, with no active reminder
+    // and a standby presentation, and only when the application is genuinely idle
     // (kDeviceStateIdle, no audio/protocol activity), may sleep the display.
     void OnDisplaySleepTick() {
         if (display_sleep_active_) {
             return;  // already at level 1
         }
         auto& app = Application::GetInstance();
-        bool eligible = (mode_ == Mode::Chat) && !reminder_active_ &&
-                        (presentation_ == Presentation::Standby) && app.CanEnterSleepMode();
+        bool eligible = (mode_ == Mode::Chat) && (CurrentScreen() == ScreenId::Home) &&
+                        !reminder_active_ && (presentation_ == Presentation::Standby) &&
+                        app.CanEnterSleepMode();
         if (!eligible) {
             display_idle_ticks_ = 0;
             return;
@@ -1314,8 +1595,6 @@ private:
                 prev = cur;
                 has_prev = true;
             }
-            // Check yoga pose match periodically
-            self->ProcessImuForYoga();
             vTaskDelay(pdMS_TO_TICKS(80));
         }
     }
@@ -1479,6 +1758,44 @@ private:
                     board.swipe_start_x_ = touch_point.x;
                     board.swipe_start_y_ = touch_point.y;
                     board.swipe_start_recorded_ = true;
+                    // Feed the press point to LVGL so a tap on a page screen's
+                    // on-screen control can be delivered (no-op while Home/emote
+                    // owns the panel, where LVGL is stopped).
+                    if (board.ui_ != nullptr) {
+                        board.ui_->FeedTouch(touch_point.x, touch_point.y, true);
+                    }
+
+                    // Emotion-learning dial rotation: if the press lands on the
+                    // dial in the browsing screen, take over the touch with a
+                    // continuous rotation drag (the dial follows the finger's
+                    // angular motion) until release. CST816S only pulses INT on
+                    // press/release, so re-read the position register here while
+                    // the finger is held instead of waiting for another edge.
+                    if (board.ShouldBeginEmotionDialDrag(touch_point.x, touch_point.y)) {
+                        board.BeginEmotionDialDrag(touch_point.x, touch_point.y);
+                        while (true) {
+                            vTaskDelay(pdMS_TO_TICKS(kEmotionDialPollMs));
+                            touchpad->UpdateTouchPoint();
+                            auto hold_event = touchpad->CheckTouchEvent();
+                            auto& hold_point = touchpad->GetTouchPoint();
+                            if (hold_event == Cst816s::TOUCH_RELEASE) {
+                                break;
+                            }
+                            board.UpdateEmotionDialDrag(hold_point.x, hold_point.y);
+                        }
+                        // The drag consumed the touch: the physical finger is up, but
+                        // LVGL still latches the pointer as pressed (the release was
+                        // read here, not by the release routing below). Feed a release
+                        // so LVGL's next press starts from RELEASED and the 开始 tap
+                        // still delivers LV_EVENT_CLICKED (a stuck PRESSED makes LVGL
+                        // skip CLICKED on the following tap - see indev_proc_press).
+                        if (board.ui_ != nullptr) {
+                            board.ui_->FeedTouch(touch_point.x, touch_point.y, false);
+                        }
+                        board.EndEmotionDialDrag();
+                        board.swipe_start_recorded_ = false;
+                        continue;  // rotation fully handled; skip release routing below
+                    }
                 }
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
@@ -1487,6 +1804,12 @@ private:
                         board.swipe_start_recorded_ = false;
                         board.EnterWifiConfigMode();
                         continue;
+                    }
+
+                    // Feed the release point so LVGL completes the press->release
+                    // cycle into a click on the control under the finger.
+                    if (board.ui_ != nullptr) {
+                        board.ui_->FeedTouch(touch_point.x, touch_point.y, false);
                     }
 
                     // Normalize the release into a single screen gesture and route it.
@@ -1516,6 +1839,94 @@ private:
                     board.OnGesture(gesture);
                 }
             }
+        }
+    }
+
+    static void battery_task(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        while (true) {
+            bool healthy = false;
+            if (self != nullptr && self->charge_ != nullptr) {
+                healthy = self->charge_->Update();
+                if (healthy)
+                    self->HandleBatteryEmotions();
+            }
+            vTaskDelay(pdMS_TO_TICKS(healthy ? 2000 : 5000));
+        }
+    }
+
+    void PlayBatteryEmotion(const char* emotion, uint32_t duration_ms) {
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        if (display_ == nullptr || emotion == nullptr) {
+            return;
+        }
+        if (display_->InsertAnimDialog(emotion, duration_ms)) {
+            return;
+        }
+#endif
+        ShowTemporaryEmotion(emotion, duration_ms);
+    }
+
+    void StartLowBatteryAlertSequence() {
+        constexpr int kMaxPlays = 3;
+        constexpr int64_t kIntervalMs = 5 * 60 * 1000;
+
+        low_battery_plays_left_ = kMaxPlays - 1;
+        next_low_battery_play_ms_ = (esp_timer_get_time() / 1000) + kIntervalMs;
+        PlayBatteryEmotion("low_battery", 4000);
+    }
+
+    void HandleBatteryEmotions() {
+        if (charge_ == nullptr) {
+            return;
+        }
+
+        int level;
+        bool charging, discharging;
+        if (!charge_->GetSnapshot(level, charging, discharging))
+            return;
+        if (!battery_status_initialized_) {
+            was_charging_ = charging;
+            battery_status_initialized_ = true;
+        }
+
+        if (charging && !was_charging_) {
+            PlayBatteryEmotion("battery_connected", 4000);
+            low_battery_alert_mask_ = 0;
+            low_battery_plays_left_ = 0;
+            next_low_battery_play_ms_ = 0;
+        }
+        was_charging_ = charging;
+
+        if (charging) {
+            return;
+        }
+
+        if (level > 12) {
+            low_battery_alert_mask_ = 0;
+            low_battery_plays_left_ = 0;
+            next_low_battery_play_ms_ = 0;
+            return;
+        }
+
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (low_battery_plays_left_ > 0 && now_ms >= next_low_battery_play_ms_) {
+            PlayBatteryEmotion("low_battery", 4000);
+            low_battery_plays_left_--;
+            if (low_battery_plays_left_ > 0) {
+                next_low_battery_play_ms_ = now_ms + 5 * 60 * 1000;
+            }
+        }
+
+        if (level <= 5 && (low_battery_alert_mask_ & 0x02) == 0) {
+            low_battery_alert_mask_ |= 0x02;
+            StartLowBatteryAlertSequence();
+            return;
+        }
+
+        if (level <= 10 && (low_battery_alert_mask_ & 0x01) == 0) {
+            low_battery_alert_mask_ |= 0x01;
+            StartLowBatteryAlertSequence();
         }
     }
 
@@ -1589,14 +2000,20 @@ private:
         // The outer capacitive surface is a feedback-only "pet" input.
         self->HandleOuterTouchPet();
     }
+#endif  // ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR
 
     void EnterEmotionLearningMode() {
-        if (mode_ == Mode::EmotionLearning) {
+        if (ui_ == nullptr || CurrentScreen() == ScreenId::EmotionLearning) {
             return;
         }
+        // Entering a non-Home screen force-ends any active conversation (bug #2).
+        ForceEndDialogue();
         EnterMode(Mode::EmotionLearning);
         current_emotion_index_ = 0;
-        ShowEmotionLearningCurrent();
+        ShowEmotionLearningCurrent();  // seed the dial's central name before build
+        if (ui_ != nullptr) {
+            ui_->ShowScreen(ScreenId::EmotionLearning);
+        }
         // Play sound to indicate entering learning mode
         auto& audio = Application::GetInstance().GetAudioService();
         audio.PlaySound(Lang::Sounds::OGG_POPUP);
@@ -1615,148 +2032,158 @@ private:
         ESP_LOGI(TAG, "Exited emotion learning mode");
     }
 
+    // Drive the browsing dial's central label (the LVGL page owns the pet face;
+    // the pet demonstrates each emotion only during the flashcard lesson).
     void ShowEmotionLearningCurrent() {
+        if (ui_ != nullptr) {
+            ui_->SetEmotionLearningName(kEmotionLearningNames_[current_emotion_index_]);
+        }
+        ESP_LOGI(TAG, "Emotion learning current: %s",
+                 kEmotionLearningNames_[current_emotion_index_]);
+    }
+
+    // ---- Emotion-learning flashcard lesson ------------------------------------
+
+    // Started by the learning screen's 开始 button. Hands the panel to the emote
+    // pet face (kept inside the EmotionLearning screen for routing) and begins
+    // demonstrating the emotions one by one, auto-advancing via lesson_timer_.
+    void StartEmotionLesson() {
+        if (lesson_active_ || ui_ == nullptr || display_ == nullptr) {
+            return;
+        }
+        lesson_active_ = true;
+        current_emotion_index_ = 0;
+        lesson_start_ms_ = esp_timer_get_time() / 1000;
+        // A running lesson is active interaction: never let the 30s idle timer
+        // auto-close it mid-sequence. It ends by completion or an explicit cancel
+        // (swipe). The idle timer is re-armed on return to the browsing card.
+        if (mode_idle_timer_ != nullptr) {
+            esp_timer_stop(mode_idle_timer_);
+        }
+        ui_->ShowEmotionLessonFace();
+        PresentLessonEmotion();
+        ESP_LOGI(TAG, "Emotion lesson started");
+    }
+
+    // Play the current emotion on the pet face (expression + name/progress
+    // caption), cue the transition, and arm the advance timer.
+    void PresentLessonEmotion() {
         if (display_ != nullptr) {
-            // Emotion-learning is a Mode presentation: it must not be clobbered
-            // by transient feedback or the standby idle animation.
-            presentation_ = Presentation::Mode;
-            const char* emotion = kEmotionLearningEmotions_[current_emotion_index_];
-            display_->SetEmotion(emotion);
-            ESP_LOGI(TAG, "Emotion: %s (%s)", emotion,
-                     kEmotionLearningNames_[current_emotion_index_]);
+            static_cast<emote::EmoteDisplay*>(display_)->ShowEmotionLesson(
+                kEmotionLearningNames_[current_emotion_index_],
+                static_cast<int>(current_emotion_index_ + 1),
+                static_cast<int>(kEmotionLearningCount),
+                kEmotionLearningEmotions_[current_emotion_index_]);
+        }
+        ESP_LOGI(TAG, "Emotion lesson card %d/%d: %s", static_cast<int>(current_emotion_index_ + 1),
+                 static_cast<int>(kEmotionLearningCount),
+                 kEmotionLearningEmotions_[current_emotion_index_]);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+        if (lesson_timer_ != nullptr) {
+            esp_timer_start_once(lesson_timer_, kLessonCardMs * 1000ULL);
         }
     }
 
-    void ShowEmotionLearningNext() {
-        current_emotion_index_ = (current_emotion_index_ + 1) % kEmotionLearningCount;
+    // The last emotion was shown: celebrate on the pet face, then a brief pause
+    // before returning to the browsing card (handled by lesson_end_timer_).
+    void EndEmotionLesson() {
+        if (lesson_timer_ != nullptr) {
+            esp_timer_stop(lesson_timer_);
+        }
+        lesson_active_ = false;
+        if (display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(display_)->ShowEmotionLesson(
+                "学完啦", static_cast<int>(kEmotionLearningCount),
+                static_cast<int>(kEmotionLearningCount), "happy");
+        }
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
+        if (lesson_end_timer_ != nullptr) {
+            esp_timer_start_once(lesson_end_timer_, kLessonEndMs * 1000ULL);
+        }
+    }
+
+    // Cancel a running lesson (swipe during the lesson) and return to the
+    // browsing card at a fresh index.
+    void CancelEmotionLesson() {
+        if (lesson_timer_ != nullptr) {
+            esp_timer_stop(lesson_timer_);
+        }
+        if (lesson_end_timer_ != nullptr) {
+            esp_timer_stop(lesson_end_timer_);
+        }
+        lesson_active_ = false;
+        if (display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(display_)->HideEmotionLesson();
+        }
+        current_emotion_index_ = 0;
         ShowEmotionLearningCurrent();
+        if (ui_ != nullptr) {
+            ui_->ShowScreen(ScreenId::EmotionLearning);
+        }
+        AfterScreenChange();
+        ESP_LOGI(TAG, "Emotion lesson cancelled, back to library");
     }
 
-    void EnterYogaChallengeMode() {
-        if (mode_ == Mode::Yoga) {
+    static void lesson_start_defer_callback(void* arg) {
+        // Runs on the esp_timer task (not the LVGL task), so the render handoff
+        // in StartEmotionLesson is safe. Guarded by lesson_active_ so a re-fire
+        // (or a double-tap on 开始) never starts two overlapping lessons.
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr) {
             return;
         }
-        EnterMode(Mode::Yoga);
-        current_pose_index_ = 0;
-        yoga_success_until_ms_ = 0;  // start fresh: no success cooldown pending
-        ShowYogaPose();
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-        ESP_LOGI(TAG, "Entered yoga challenge mode");
+        self->StartEmotionLesson();
     }
 
-    void ExitYogaChallengeMode() {
-        if (mode_ != Mode::Yoga) {
+    static void lesson_timer_callback(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr || !self->lesson_active_) {
             return;
         }
-        ExitToChat();
-        ShowTemporaryEmotion("happy", 2000);
-        ESP_LOGI(TAG, "Exited yoga challenge mode");
-    }
-
-    void ShowYogaPose() {
-        if (display_ != nullptr) {
-            // Yoga is a Mode presentation: the arrow must not be overwritten by
-            // transient feedback or the standby idle animation (spec §2.3).
-            presentation_ = Presentation::Mode;
-            const char* direction = kYogaPoseDirections_[current_pose_index_];
-            static_cast<emote::EmoteDisplay*>(display_)->DrawArrow(direction);
-            ESP_LOGI(TAG, "Yoga pose: %s (%s)", kYogaPoseNames_[current_pose_index_], direction);
+        if (self->current_emotion_index_ + 1 >= kEmotionLearningCount) {
+            self->EndEmotionLesson();
+        } else {
+            ++self->current_emotion_index_;
+            self->PresentLessonEmotion();
         }
     }
 
-    // Deterministic pose navigation with wraparound (spec §2.3).
-    void ShowNextYogaPose() {
-        current_pose_index_ = (current_pose_index_ + 1) % kYogaPoseCount;
-        yoga_success_until_ms_ = 0;  // a manually navigated pose is immediately matchable
-        ShowYogaPose();
+    static void lesson_end_timer_callback(void* arg) {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+        // Lesson finished: return to the browsing card at a fresh index.
+        if (self->display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(self->display_)->HideEmotionLesson();
+        }
+        self->current_emotion_index_ = 0;
+        self->ShowEmotionLearningCurrent();
+        if (self->ui_ != nullptr) {
+            self->ui_->ShowScreen(ScreenId::EmotionLearning);
+        }
+        self->AfterScreenChange();
+        ESP_LOGI(TAG, "Emotion lesson completed");
     }
 
-    void ShowPrevYogaPose() {
-        current_pose_index_ = (current_pose_index_ + kYogaPoseCount - 1) % kYogaPoseCount;
-        yoga_success_until_ms_ = 0;
-        ShowYogaPose();
+    void EnterSettingsPage() {
+        if (ui_ == nullptr || CurrentScreen() == ScreenId::Settings) {
+            return;
+        }
+        // Entering a non-Home screen force-ends any active conversation (bug #2).
+        ForceEndDialogue();
+        EnterMode(Mode::Settings);
+        // Refresh the steppers with the real hardware values; value changes apply
+        // live via the callbacks registered in InitializeSt77916Display.
+        ui_->SetSettingsValueBrightness(backlight_ != nullptr ? backlight_->brightness() : 50);
+        ui_->SetSettingsValueVolume(Application::GetInstance().GetAudioService().GetOutputVolume());
+        ui_->ShowScreen(ScreenId::Settings);
+        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+        AfterScreenChange();
+        ESP_LOGI(TAG, "Entered settings screen");
     }
 
-    void CheckYogaPoseMatch(const char* motion_direction) {
-        if (mode_ != Mode::Yoga) {
-            return;
-        }
-        // Ignore duplicate tilt matches during the success window so the same
-        // pose is not completed twice (spec §2.3 feedback order).
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms < yoga_success_until_ms_) {
-            return;
-        }
-        const char* target = kYogaPoseDirections_[current_pose_index_];
-        if (strcmp(motion_direction, target) != 0) {
-            return;
-        }
-
-        // Correct pose matched: block further matches, then success feedback.
-        // ShowTemporaryEmotion() arms emotion_reset_timer, which calls
-        // ResetToStandby() → ShowYogaPose() once the success emotion has been
-        // shown for kYogaSuccessDurationMs, redrawing the (advanced) arrow.
-        yoga_success_until_ms_ = now_ms + kYogaSuccessDurationMs;
-        ShowTemporaryEmotion("happy", kYogaSuccessDurationMs);
-        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-
-        if (current_pose_index_ == kYogaPoseCount - 1) {
-            // Completed all poses: completion feedback then return to Chat.
-            ESP_LOGI(TAG, "Yoga challenge complete!");
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_SUCCESS);
-            ExitYogaChallengeMode();
-            return;
-        }
-
-        // Advance to the next pose; ResetToStandby() draws its arrow after the
-        // success face has been shown for its duration.
-        current_pose_index_++;
-        ESP_LOGI(TAG, "Correct! Next pose: %s", kYogaPoseDirections_[current_pose_index_]);
-    }
-
-    void ProcessImuForYoga() {
-        if (mode_ != Mode::Yoga || !bmi270_ready_) {
-            return;
-        }
-        static int64_t last_check_ms = 0;
-        constexpr int64_t kCooldownMs = 500;  // Only check every 500ms
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_check_ms < kCooldownMs) {
-            return;
-        }
-        last_check_ms = now_ms;
-
-        // Read accelerometer data
-        struct bmi2_sens_data data = {};
-        if (Bmi270Motion::ReadAccelRaw(data)) {
-            // Determine tilt direction
-            int acc_x = data.acc.x;
-            int acc_y = data.acc.y;
-            const char* direction = nullptr;
-            // Check dominant tilt
-            if (abs(acc_x) > abs(acc_y)) {
-                if (acc_x > 5000) {
-                    direction = "right";
-                } else if (acc_x < -5000) {
-                    direction = "left";
-                }
-            } else {
-                if (acc_y > 5000) {
-                    direction = "down";
-                } else if (acc_y < -5000) {
-                    direction = "up";
-                }
-            }
-            if (direction != nullptr) {
-                // A tilt is a meaningful Yoga interaction: keep the mode alive.
-                // (This is the IMU-mode-aware path, distinct from the Chat-only
-                // shake path, per spec §2.3.)
-                ResetModeIdleTimer();
-                CheckYogaPoseMatch(direction);
-            }
-        }
-    }
-
+#if ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel,
                                             touch_state_t state, void* cb_arg) {
         (void)handle;
@@ -1925,6 +2352,68 @@ private:
 #endif
         backlight_ = new PwmBacklight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         backlight_->RestoreBrightness();
+
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        // Boot the screen manager on the shared panel. It initializes LVGL on the
+        // same panel/io the EmoteDisplay owns and starts on the Home pet face
+        // (emote), exactly as before; LVGL stays dormant until a page screen is
+        // requested via ui_->ShowScreen(). See main/display/esp_vocat_ui.h for
+        // the gate model.
+        ui_ = new EspVocatUi(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                             static_cast<emote::EmoteDisplay*>(display_));
+        ui_->ShowHome();
+
+        // Wire the LVGL settings screen's steppers to the real hardware. The
+        // EspVocatUi stays decoupled from these services; the board injects the
+        // current values and registers change callbacks (applied only on an
+        // actual value change, clamped 0-100). Back returns to the Home face.
+        ui_->SetSettingsValueBrightness(backlight_ != nullptr ? backlight_->brightness() : 50);
+        ui_->SetSettingsValueVolume(Application::GetInstance().GetAudioService().GetOutputVolume());
+        ui_->SetBrightnessChangeCallback([this](int value) {
+            if (backlight_ != nullptr) {
+                backlight_->SetBrightness(static_cast<uint8_t>(value));
+            }
+        });
+        ui_->SetVolumeChangeCallback([this](int value) {
+            Application::GetInstance().GetAudioService().SetOutputVolume(value);
+        });
+        ui_->SetBackToHomeCallback([this]() {
+            // On-screen back (Settings / EmotionLearning) returns to the Home pet
+            // face, force-ending any active conversation (bug #2).
+            ExitToChat();
+        });
+
+        // The 开始 button on the LVGL emotion learning screen starts the flashcard
+        // lesson: the pet demonstrates each emotion on its face, one by one. The
+        // click event runs under the LVGL lock, so the actual lesson start is
+        // deferred off the LVGL task (see lesson_start_defer_callback).
+        ui_->SetStartLearningCallback([this]() {
+            if (lesson_start_defer_timer_ != nullptr) {
+                esp_timer_start_once(lesson_start_defer_timer_, kLessonStartDeferUs);
+            }
+        });
+
+        // The dial settles on a chosen emotion at the end of a rotation drag; keep
+        // current_emotion_index_ in sync so the flashcard lesson starts from the
+        // emotion the user left the dial on.
+        ui_->SetEmotionDialSettledCallback([this](int index) {
+            current_emotion_index_ = static_cast<size_t>(index);
+            ESP_LOGI(TAG, "Emotion dial settled -> %s",
+                     kEmotionLearningNames_[current_emotion_index_]);
+        });
+
+        // The conversation overlay fires this when it is left/gone
+        // (SetConversationActive(false) -> on_dialog_gone_, which already returns
+        // the panel to the Home pet face). This force-stops a running dialogue so
+        // leaving a conversation by any navigation also stops the voice pipeline
+        // — the bug #2 fix.
+        ui_->SetDialogGoneCallback([this]() {
+            ESP_LOGI(TAG, "Conversation overlay gone: force-stopping dialogue");
+            auto& app = Application::GetInstance();
+            app.StopListening();
+            app.AbortSpeaking(kAbortReasonNone);
+        });
+#endif
     }
 
     void InitializeButtons() {
@@ -2003,7 +2492,10 @@ public:
         }
 #endif
 
-        // Delete objects
+        // Delete objects. ui_ goes before display_: its RenderSwitch destructor
+        // hands the panel back to the emote renderer (which is display_).
+        delete ui_;
+        ui_ = nullptr;
         delete charge_;
         delete cst816s_;
         delete display_;
@@ -2022,6 +2514,26 @@ public:
             esp_timer_stop(mode_idle_timer_);
             esp_timer_delete(mode_idle_timer_);
             mode_idle_timer_ = nullptr;
+        }
+        if (lesson_timer_ != nullptr) {
+            esp_timer_stop(lesson_timer_);
+            esp_timer_delete(lesson_timer_);
+            lesson_timer_ = nullptr;
+        }
+        if (lesson_end_timer_ != nullptr) {
+            esp_timer_stop(lesson_end_timer_);
+            esp_timer_delete(lesson_end_timer_);
+            lesson_end_timer_ = nullptr;
+        }
+        if (lesson_start_defer_timer_ != nullptr) {
+            esp_timer_stop(lesson_start_defer_timer_);
+            esp_timer_delete(lesson_start_defer_timer_);
+            lesson_start_defer_timer_ = nullptr;
+        }
+        if (state_poll_timer_ != nullptr) {
+            esp_timer_stop(state_poll_timer_);
+            esp_timer_delete(state_poll_timer_);
+            state_poll_timer_ = nullptr;
         }
         if (reminder_timer_ != nullptr) {
             esp_timer_stop(reminder_timer_);
@@ -2074,6 +2586,50 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&mode_idle_timer_args, &mode_idle_timer_));
+
+        // Emotion-learning lesson timers: per-card advance + completion pause.
+        const esp_timer_create_args_t lesson_timer_args = {
+            .callback = &EspVocat::lesson_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lesson_adv",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&lesson_timer_args, &lesson_timer_));
+
+        const esp_timer_create_args_t lesson_end_timer_args = {
+            .callback = &EspVocat::lesson_end_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lesson_end",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&lesson_end_timer_args, &lesson_end_timer_));
+
+        // Deferred lesson start: fires StartEmotionLesson on the esp_timer task,
+        // out of the LVGL event callback's lock (see kLessonStartDeferUs notes).
+        const esp_timer_create_args_t lesson_start_defer_timer_args = {
+            .callback = &EspVocat::lesson_start_defer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lesson_start",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(
+            esp_timer_create(&lesson_start_defer_timer_args, &lesson_start_defer_timer_));
+
+        // Periodic poll that maps the device listening/speaking state to the
+        // conversation overlay's waveform/status. Drives SetSpeaking only on a
+        // real sense change, so it costs nothing while the overlay is not shown.
+        const esp_timer_create_args_t state_poll_timer_args = {
+            .callback = &EspVocat::state_poll_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "state_poll",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&state_poll_timer_args, &state_poll_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(state_poll_timer_, 200 * 1000));
 
         const esp_timer_create_args_t reminder_restore_timer_args = {
             .callback = &EspVocat::reminder_restore_callback,
@@ -2142,10 +2698,5 @@ const EspVocat::ScheduleEntry EspVocat::kScheduleReminders_[] = {
     {14, 0, "该睡午觉了~", "sleepy"}, {18, 0, "该吃晚饭了~", "happy"},
     {21, 0, "该睡觉了~", "sleepy"},
 };
-
-// Static array definitions for yoga challenge
-const char* EspVocat::kYogaPoseNames_[] = {"向上倾斜", "向下倾斜", "向左倾斜",
-                                           "向右倾斜", "向上倾斜", "向下倾斜"};
-const char* EspVocat::kYogaPoseDirections_[] = {"up", "down", "left", "right", "up", "down"};
 
 DECLARE_BOARD(EspVocat);

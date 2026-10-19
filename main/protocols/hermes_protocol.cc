@@ -1,13 +1,13 @@
 #include "hermes_protocol.h"
-#include "board.h"
 #include "application.h"
-#include "settings.h"
 #include "audio/audio_service.h"
+#include "board.h"
 #include "display.h"
+#include "settings.h"
 
 #include <esp_log.h>
-#include <cstring>
 #include <mbedtls/base64.h>
+#include <cstring>
 
 #define TAG "HERMES"
 
@@ -37,12 +37,11 @@ HermesProtocol::HermesProtocol() {
         tts_url_ = "http://100.78.111.3:8080";
     }
 
-    ESP_LOGI(TAG, "Hermes URLs - LLM: %s, STT: %s, TTS: %s",
-             hermes_url_.c_str(), whisper_url_.c_str(), tts_url_.c_str());
+    ESP_LOGI(TAG, "Hermes URLs - LLM: %s, STT: %s, TTS: %s", hermes_url_.c_str(),
+             whisper_url_.c_str(), tts_url_.c_str());
 }
 
-HermesProtocol::~HermesProtocol() {
-}
+HermesProtocol::~HermesProtocol() {}
 
 bool HermesProtocol::Start() {
     ESP_LOGI(TAG, "HermesProtocol starting...");
@@ -122,9 +121,7 @@ bool HermesProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     }
 
     // Add new packet to buffer
-    pending_audio_.insert(pending_audio_.end(),
-                          packet->payload.begin(),
-                          packet->payload.end());
+    pending_audio_.insert(pending_audio_.end(), packet->payload.begin(), packet->payload.end());
 
     return true;
 }
@@ -224,7 +221,8 @@ bool HermesProtocol::InitHttp() {
     return true;
 }
 
-std::string HermesProtocol::PostJson(const std::string& url, const std::string& body, bool is_binary) {
+std::string HermesProtocol::PostJson(const std::string& url, const std::string& body,
+                                     bool is_binary) {
     auto& board = Board::GetInstance();
     auto network = board.GetNetwork();
     if (!network) {
@@ -241,16 +239,16 @@ std::string HermesProtocol::PostJson(const std::string& url, const std::string& 
     http->SetTimeout(30000);
     http->SetHeader("Content-Type", "application/json");
 
-    if (!http->Open("POST", url)) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection to %s, error=%d",
-                 url.c_str(), http->GetLastError());
+    if (auto opened = http->Open("POST", url); !opened) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection to %s: %s", url.c_str(),
+                 opened.error().ToString().c_str());
         return "";
     }
 
     // Write body
     if (!body.empty()) {
-        int written = http->Write(body.data(), body.size());
-        if (written != (int)body.size()) {
+        auto written = http->Write(body.data(), body.size());
+        if (!written || *written != (int)body.size()) {
             ESP_LOGE(TAG, "Failed to write HTTP body");
             http->Close();
             return "";
@@ -259,18 +257,19 @@ std::string HermesProtocol::PostJson(const std::string& url, const std::string& 
 
     // Read response
     std::string response = http->ReadAll();
-    int status = http->GetStatusCode();
+    auto status = http->GetStatusCode();
     http->Close();
 
-    if (status < 200 || status >= 300) {
-        ESP_LOGE(TAG, "HTTP request failed with status %d", status);
+    if (!status || *status < 200 || *status >= 300) {
+        ESP_LOGE(TAG, "HTTP request failed with status %d", status ? *status : -1);
         return "";
     }
 
     return response;
 }
 
-std::vector<uint8_t> HermesProtocol::PostJsonBinary(const std::string& url, const std::string& body) {
+std::vector<uint8_t> HermesProtocol::PostJsonBinary(const std::string& url,
+                                                    const std::string& body) {
     auto& board = Board::GetInstance();
     auto network = board.GetNetwork();
     if (!network) {
@@ -287,16 +286,16 @@ std::vector<uint8_t> HermesProtocol::PostJsonBinary(const std::string& url, cons
     http->SetTimeout(30000);
     http->SetHeader("Content-Type", "application/json");
 
-    if (!http->Open("POST", url)) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection to %s, error=%d",
-                 url.c_str(), http->GetLastError());
+    if (auto opened = http->Open("POST", url); !opened) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection to %s: %s", url.c_str(),
+                 opened.error().ToString().c_str());
         return {};
     }
 
     // Write body
     if (!body.empty()) {
-        int written = http->Write(body.data(), body.size());
-        if (written != (int)body.size()) {
+        auto written = http->Write(body.data(), body.size());
+        if (!written || *written != (int)body.size()) {
             ESP_LOGE(TAG, "Failed to write HTTP body");
             http->Close();
             return {};
@@ -306,16 +305,19 @@ std::vector<uint8_t> HermesProtocol::PostJsonBinary(const std::string& url, cons
     // Read binary response
     std::vector<uint8_t> response;
     char buffer[1024];
-    int read;
-    while ((read = http->Read(buffer, sizeof(buffer))) > 0) {
-        response.insert(response.end(), buffer, buffer + read);
+    while (true) {
+        auto read = http->Read(buffer, sizeof(buffer));
+        if (!read || *read <= 0) {
+            break;
+        }
+        response.insert(response.end(), buffer, buffer + *read);
     }
 
-    int status = http->GetStatusCode();
+    auto status = http->GetStatusCode();
     http->Close();
 
-    if (status < 200 || status >= 300) {
-        ESP_LOGE(TAG, "HTTP request failed with status %d", status);
+    if (!status || *status < 200 || *status >= 300) {
+        ESP_LOGE(TAG, "HTTP request failed with status %d", status ? *status : -1);
         return {};
     }
 

@@ -1,0 +1,281 @@
+#pragma once
+
+#include <atomic>
+#include <functional>
+#include <string>
+
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+
+#include "lvgl.h"
+
+// Forward declaration: the emote pet renderer is owned by the board's
+// EmoteDisplay instance. RenderSwitch only needs a hook to gate its flushes.
+namespace emote {
+class EmoteDisplay;
+}
+
+// Screens that real LVGL renders when it owns the panel. Home is the emote pet
+// face (handled by the emote renderer, not LVGL); the page screens are pure
+// LVGL (no pet face).
+enum class ScreenId {
+    Home,
+    EmotionLearning,
+    Settings,
+    ConversationOverlay,
+};
+
+// Owns the single ST77916 round panel and hands it alternately to the emote
+// pet renderer (Home / conversation) and to a real LVGL scene (pages). Exactly
+// one renderer may flush the panel at a time; RenderSwitch serializes them.
+//
+// Gate model (confirmed by the Task 1 spike):
+//   * LVGL side:  lvgl_port_stop() / lvgl_port_resume() start/stop the LVGL
+//     timer task, so while emote owns the panel LVGL produces no flushes at
+//     all. This is the documented esp_lvgl_port hook - there is no public way
+//     to gate just esp_lvgl_port's internal flush callback.
+//   * Emote side: EmoteDisplay::SetPanelWritesEnabled(false) makes the emote
+//     flush callback drop panel writes (it feeds emote_notify_flush_finished
+//     itself), so the emote task keeps rendering into its own buffer but does
+//     not touch the panel while LVGL owns it. The emote API exposes no
+//     public pause/stop for its render task, so gating its flush callback is
+//     the mechanism that works.
+//   * Shared io slot: both emote and esp_lvgl_port want the panel_io's single
+//     on_color_trans_done slot (the SPI io driver stores only one callback and
+//     silently overwrites). RenderSwitch claims that slot with a fan-out that
+//     routes the transfer-done signal to whichever renderer is the current
+//     owner.
+class RenderSwitch {
+public:
+    RenderSwitch(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
+                 int height, emote::EmoteDisplay* emote);
+    ~RenderSwitch();
+
+    // Hand the panel to the emote renderer (Home / conversation pet face).
+    void ShowEmote();
+    // Hand the panel to LVGL and show the given page screen. When build is
+    // non-empty it runs under the LVGL lock (in place of the solid-color
+    // stand-in) so EspVocatUi can assemble a real screen on the active scr.
+    void ShowLvgl(ScreenId id, const std::function<void()>& build);
+    void ShowLvgl(ScreenId id);
+
+    // True while LVGL owns the panel (ShowLvgl active); false while emote does.
+    bool IsLvglActive() const { return active_lvgl_.load(); }
+
+    // The LVGL display this switch attached, so the screen manager can bind its
+    // touch input device to it.
+    lv_display_t* lvgl_display() const { return lvgl_display_; }
+
+    // The emote pet renderer (Home / conversation face), so the screen manager
+    // can composite the conversation overlay over the live pet.
+    emote::EmoteDisplay* emote() const { return emote_; }
+
+private:
+    // Routes the shared panel_io transfer-done signal to the active renderer.
+    static bool IoReadyCallback(esp_lcd_panel_io_handle_t panel_io,
+                                esp_lcd_panel_io_event_data_t* edata, void* user_ctx);
+
+    esp_lcd_panel_handle_t panel_;
+    esp_lcd_panel_io_handle_t panel_io_;
+    int width_;
+    int height_;
+    emote::EmoteDisplay* emote_;
+    // Authoritative owner flag: true = LVGL owns the panel, false = emote.
+    std::atomic<bool> active_lvgl_{false};
+    lv_display_t* lvgl_display_ = nullptr;
+};
+
+// Top-level screen manager for the ESP-VOCAT round panel. Owns a RenderSwitch
+// that hands the shared panel alternately to the emote pet renderer (Home /
+// conversation) and to real LVGL page screens, and tracks which presentation
+// is currently shown. The real page screens arrive in later tasks; for now a
+// non-Home screen renders as a solid-color stand-in via the RenderSwitch.
+class EspVocatUi {
+public:
+    EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
+               int height, emote::EmoteDisplay* emote);
+
+    // Return the panel to the emote pet face (Home). Emotion / idle-animation
+    // driving stays with the board via display_->SetEmotion(...).
+    void ShowHome();
+
+    // Switch to the given LVGL page screen (solid-color stand-in for now).
+    void ShowScreen(ScreenId id);
+
+    // Show/hide the conversation. on = keep the panel on the emote pet face and
+    // composite the "Siri-style" waveform + status overlay over the live pet
+    // (current_ = ConversationOverlay, so gestures/routing treat us as in
+    // conversation while the pet stays visible and live). off = hide the overlay
+    // and return the pet to idle + fire the dialog-gone callback (this is the
+    // leave/dialog-gone mechanism; the force-stop of the running dialogue is
+    // handled downstream).
+    void SetConversationActive(bool on);
+
+    // The screen currently being presented (Home or a page).
+    ScreenId CurrentScreen() const { return current_; }
+
+    // --- Settings screen (pure LVGL, no pet face) --------------------------
+    // Value-change callback signature. EspVocatUi stays decoupled from the
+    // backlight / audio service; the board registers these to apply changes.
+    using ChangeCb = std::function<void(int)>;
+    using BackToHomeCb = std::function<void()>;
+
+    // Inject the current hardware value so the stepper displays reality
+    // (esp-vocat calls these at startup). Values clamp to 0-100.
+    void SetSettingsValueBrightness(int value);
+    void SetSettingsValueVolume(int value);
+
+    // Register callbacks invoked when the user changes a stepper value (only
+    // when the value actually changed). Called with the new clamped 0-100 value.
+    void SetBrightnessChangeCallback(ChangeCb cb) { brightness_change_cb_ = std::move(cb); }
+    void SetVolumeChangeCallback(ChangeCb cb) { volume_change_cb_ = std::move(cb); }
+
+    // Invoked when the settings screen's upper-left back button is pressed.
+    void SetBackToHomeCallback(BackToHomeCb cb) { back_to_home_cb_ = std::move(cb); }
+
+    // --- Emotion learning screen (pure LVGL, no pet face) --------------------
+    using StartCb = std::function<void()>;
+
+    // Set the central "current emotion" name shown on the learning screen.
+    // If the screen is not yet built, the string is cached and applied on build.
+    void SetEmotionLearningName(const char* name);
+
+    // Register the callback invoked when the user presses the 开始 button.
+    // The board wires this to its existing emotion-learning flow.
+    void SetStartLearningCallback(StartCb cb) { start_learning_cb_ = std::move(cb); }
+
+    // --- Dial selection (rotate to choose an emotion) --------------------------
+    // The learning screen's dial is rotated by dragging a finger around it, not
+    // by arrow buttons. The board drives this continuously while a touch is held:
+    //   RotateEmotionDial(deg)  adds a clockwise(+)/counterclockwise(-) angular
+    //                            step in degrees, re-positioning the ticks so the
+    //                            dial follows the finger.
+    //   EndEmotionDialDrag()     snaps the dial to the nearest emotion, then fires
+    //                            the settled callback with the chosen index.
+    // The chosen index callback lets the board keep current_emotion_index_ in sync
+    // (it drives the flashcard lesson). Registered once at startup.
+    using EmotionDialSettledCb = std::function<void(int)>;
+    void SetEmotionDialSettledCallback(EmotionDialSettledCb cb)
+    {
+        emotion_dial_settled_cb_ = std::move(cb);
+    }
+    void RotateEmotionDial(float clockwise_deg);
+    void EndEmotionDialDrag();
+
+    // Flashcard lesson: hand the panel to the emote pet face so the pet can
+    // demonstrate each emotion (expression + name/progress caption), while
+    // keeping CurrentScreen() == EmotionLearning so gestures/routing and the 30s
+    // idle timeout still treat the lesson as part of the learning screen. The
+    // board drives the advance timing; call ShowScreen(ScreenId::EmotionLearning)
+    // to return to the browsing card afterwards.
+    void ShowEmotionLessonFace();
+
+    // --- Conversation overlay (emote-composited over the live pet) -----------
+    // Fired when the conversation is left/gone (SetConversationActive off); the
+    // board force-stops the running dialogue (bug #2 fix basis).
+    using DialogGoneCb = std::function<void()>;
+    void SetDialogGoneCallback(DialogGoneCb cb) { dialog_gone_cb_ = std::move(cb); }
+
+    // Toggle the live status (正在听/正在说) and the waveform intensity on the
+    // emote-composited conversation overlay: listening = gentle waveform,
+    // speaking = taller/faster. Forwards to the emote overlay and caches the
+    // state so SetConversationActive(true) can apply the latest desired state.
+    void SetSpeaking(bool speaking);
+
+    // --- Touch input (LVGL page screens) --------------------------------------
+    // Feed a CST816S press/release point into the LVGL pointer input device so
+    // the on-screen controls (Settings steppers / back, EmotionLearning step /
+    // start) receive click events. The board's touch task calls this on every
+    // press and release. LVGL only polls this indev while it owns the panel
+    // (a page screen is shown); on the Home emote face the LVGL task is stopped
+    // and these writes are ignored, so Home gestures are unaffected. Coordinates
+    // are panel-native and map 1:1 to LVGL pixels (360x360, no swap/mirror).
+    void FeedTouch(int x, int y, bool pressed);
+
+private:
+    RenderSwitch render_switch_;
+    ScreenId current_ = ScreenId::Home;
+    bool conversation_active_ = false;
+
+    // ---- Touch input (LVGL page screens) -------------------------------------
+    // Pointer input device that delivers CST816S taps to the page screens'
+    // on-screen controls. Its read callback returns the latched point; the board
+    // writes the latch via FeedTouch() from its touch task (another core), so
+    // the latch fields are atomics. LVGL polls this only while it owns the panel.
+    void SetupTouchInput();
+    static void TouchInputReadCallback(lv_indev_t* indev, lv_indev_data_t* data);
+
+    lv_indev_t* touch_indev_ = nullptr;
+    std::atomic<int> touch_x_{0};
+    std::atomic<int> touch_y_{0};
+    std::atomic<bool> touch_pressed_{false};
+
+    // ---- Settings screen implementation ------------------------------------
+    // Identifies which stepper was pressed (brightness/volume + direction).
+    struct SettingsStepTarget {
+        EspVocatUi* ui;
+        bool is_brightness;
+        int delta;
+    };
+
+    static void SettingsStepperEventCb(lv_event_t* e);
+    static void SettingsBackEventCb(lv_event_t* e);
+
+    // Build (once) and show the settings screen; reused across ShowScreen calls.
+    void BuildSettingsScreen();
+    // Build one circular instrument inside the settings face: a dim arc track, a
+    // cyan value arc, a central readout, and − / ＋ hit areas.
+    void BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** value_label_out,
+                          bool is_brightness, int x_offset);
+    // Clamp, refresh the value label, and fire the change callback if changed.
+    void ApplySettingsValue(bool is_brightness, int delta);
+    void RefreshSettingsValueLabel(bool is_brightness);
+
+    lv_obj_t* settings_screen_ = nullptr;
+    lv_obj_t* brightness_value_label_ = nullptr;
+    lv_obj_t* volume_value_label_ = nullptr;
+    lv_obj_t* brightness_arc_ = nullptr;
+    lv_obj_t* volume_arc_ = nullptr;
+    int brightness_ = 50;  // cached stepper values (0-100), shown on the screen
+    int volume_ = 50;
+    ChangeCb brightness_change_cb_;
+    ChangeCb volume_change_cb_;
+    BackToHomeCb back_to_home_cb_;
+
+    // ---- Emotion learning screen implementation ------------------------------
+    // Identifies the 开始 button press; heap-allocated once when the screen is
+    // built (mirrors Task 3's per-button SettingsStepTarget pattern).
+    struct StartLearningTarget {
+        EspVocatUi* ui;
+    };
+
+    static void EmotionLearningStartEventCb(lv_event_t* e);
+
+    // Build (once) and show the emotion learning screen; reused across
+    // ShowScreen calls. Its back button reuses the shared back_to_home_cb_.
+    void BuildEmotionLearningScreen();
+    // Re-position the 8 scale ticks to the current dial rotation and highlight
+    // the tick nearest the top (12 o'clock), updating the central label to the
+    // emotion under it. Single render path for both explicit sets and drags.
+    void RefreshEmotionDial();
+    // Index of the emotion whose tick is nearest the top for the current rotation.
+    int SelectedEmotionIndex() const;
+
+    lv_obj_t* emotion_screen_ = nullptr;
+    lv_obj_t* emotion_name_label_ = nullptr;
+    lv_obj_t* emotion_ticks_[8] = {};
+    std::string emotion_name_;  // cached; applied to the label once built
+    // Current dial rotation in degrees. Ticks sit at rotation - i*45 - 90, so the
+    // tick selected (at the top, -90) is round(rotation/45) mod 8. Clockwise
+    // finger rotation raises it (the ring turns with the finger) and steps to the
+    // next emotion. Set implicitly by SetEmotionLearningName / EndEmotionDialDrag;
+    // tracked live during a drag.
+    float emotion_dial_rotation_ = 0.0f;
+    StartCb start_learning_cb_;
+    EmotionDialSettledCb emotion_dial_settled_cb_;
+
+    // ---- Conversation overlay (emote-composited) ------------------------------
+    // Cached desired state, forwarded to the emote overlay on SetConversationActive.
+    bool speaking_ = false;  // 0 listening / 1 speaking
+    DialogGoneCb dialog_gone_cb_;
+};

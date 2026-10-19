@@ -149,6 +149,10 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
+    // Output volume control (forwards to the codec when present).
+    void SetOutputVolume(int volume);
+    int GetOutputVolume() const;
+
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;

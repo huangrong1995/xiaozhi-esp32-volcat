@@ -1,0 +1,847 @@
+#include "display/esp_vocat_ui.h"
+
+#include <cmath>
+#include <cstdio>
+
+#include <esp_log.h>
+
+#include "display/emote_display.h"
+#include "esp_lvgl_port.h"
+
+// The board's built-in full-range CJK text font (font_puhui_20_4, from the
+// xiaozhi-fonts component). Used for every label on the LVGL settings screen
+// because the default LVGL montserrat set has no CJK glyphs and only size 14
+// is compiled in by default.
+LV_FONT_DECLARE(font_esp_vocat_20_4);
+
+// Log tag shared by RenderSwitch and EspVocatUi.
+static const char* TAG = "esp-vocat";
+
+// ===== Shared visual language (one place; applied by the page screens). A Peak-
+// inspired dark instrument face tuned to the 360x360 round panel: near-black
+// cockpit background, cyan instrument arcs, dim tick marks, and coral only for
+// the emotion under study. Typography hierarchy (title > content > action) is
+// expressed with the existing font_puhui_20_4 via color / weight / spacing - the
+// OTA slot has no room for a larger CJK font, so sizes are not scaled.
+namespace {
+// Peak instrument palette.
+constexpr uint32_t kScreenBg = 0x080D12;        // cockpit background
+constexpr uint32_t kCardBg = 0x10181E;          // recessed instrument well
+constexpr uint32_t kPrimaryText = 0xE8FFF9;     // instrument readout
+constexpr uint32_t kSecondaryText = 0x6F8D91;   // scale labels
+constexpr uint32_t kSeparator = 0x1D2A31;       // dim tick / track
+constexpr uint32_t kIosBlue = 0x35F5D0;         // cyan instrument accent
+constexpr uint32_t kPink = 0xFF8A68;            // coral emotion readout
+constexpr uint32_t kLavender = 0x54A8FF;        // cold-blue secondary accent
+constexpr uint32_t kWhite = 0x081014;
+constexpr uint32_t kEmotionPillBg = 0x10181E;   // recessed readout well
+
+// Rounded-corner language matching the panel curvature.
+constexpr lv_coord_t kRadiusCard = 20;          // white grouped card
+constexpr lv_coord_t kRadiusPrimaryBtn = 20;    // iOS-blue 开始 button
+constexpr lv_coord_t kRadiusStepperPill = 12;   // UIStepper pill
+
+// Round-panel safe-inset geometry. The ST77916 is a 360x360 *inscribed circle*
+// (centre 180,180, radius 180): anything near the square corners is clipped by
+// the round glass. Nav, cards and buttons are positioned so every corner lands
+// inside the visible circle (verified: back (76,36)+44 -> corner (76,36) at
+// distance ~178px; card 300 wide top corners at (30,88/92) ~178px; 开始 bottom
+// corners (70,322) ~180px).
+constexpr lv_coord_t kNavBackSize = 44;
+constexpr lv_coord_t kNavBackX = 76;            // top-left corner of the back btn
+constexpr lv_coord_t kNavBackY = 36;
+constexpr lv_coord_t kNavTitleY = 44;
+constexpr lv_coord_t kCardWidth = 300;          // fully visible at this width
+constexpr lv_coord_t kCardTopSettings = 88;
+constexpr lv_coord_t kCardTopEmotion = 92;
+constexpr lv_coord_t kStepperPillWidth = 96;
+
+// Screen-transition animation budget (lightweight, keeps within frame budget on
+// the RGB565 round panel).
+constexpr uint32_t kScreenFadeMs = 200;
+
+// Shared style objects, constructed once via EnsureSharedStyles() (LVGL v9
+// pointer API), then attached to widgets with lv_obj_add_style.
+lv_style_t g_style_screen_bg;    // F2F2F7 opaque page background
+lv_style_t g_style_card;         // white inset rounded card
+lv_style_t g_style_title;        // dark primary heading
+lv_style_t g_style_body;         // dark primary content
+lv_style_t g_style_subtitle;     // grey secondary content
+lv_style_t g_style_accent_text;  // iOS blue value / highlight text
+lv_style_t g_style_emotion_name; // pink central emotion label
+lv_style_t g_style_primary_btn;  // iOS blue filled (开始)
+lv_style_t g_style_btn_label;    // white on-blue glyph
+lv_style_t g_style_chevron_btn;  // transparent hit-area for blue text chevrons
+
+void InitSharedStyles() {
+    lv_style_init(&g_style_screen_bg);
+    lv_style_set_bg_color(&g_style_screen_bg, lv_color_hex(kScreenBg));
+    lv_style_set_bg_opa(&g_style_screen_bg, LV_OPA_COVER);
+
+    lv_style_init(&g_style_card);
+    lv_style_set_bg_color(&g_style_card, lv_color_hex(kCardBg));
+    lv_style_set_bg_opa(&g_style_card, LV_OPA_COVER);
+    lv_style_set_radius(&g_style_card, kRadiusCard);
+    lv_style_set_border_color(&g_style_card, lv_color_hex(kIosBlue));
+    lv_style_set_border_width(&g_style_card, 1);
+    lv_style_set_border_opa(&g_style_card, LV_OPA_30);
+
+    lv_style_init(&g_style_title);
+    lv_style_set_text_color(&g_style_title, lv_color_hex(kPrimaryText));
+    lv_style_set_text_font(&g_style_title, &font_esp_vocat_20_4);
+
+    lv_style_init(&g_style_body);
+    lv_style_set_text_color(&g_style_body, lv_color_hex(kPrimaryText));
+    lv_style_set_text_font(&g_style_body, &font_esp_vocat_20_4);
+
+    lv_style_init(&g_style_subtitle);
+    lv_style_set_text_color(&g_style_subtitle, lv_color_hex(kSecondaryText));
+    lv_style_set_text_font(&g_style_subtitle, &font_esp_vocat_20_4);
+
+    lv_style_init(&g_style_accent_text);
+    lv_style_set_text_color(&g_style_accent_text, lv_color_hex(kIosBlue));
+    lv_style_set_text_font(&g_style_accent_text, &font_esp_vocat_20_4);
+
+    lv_style_init(&g_style_emotion_name);
+    lv_style_set_text_color(&g_style_emotion_name, lv_color_hex(kPink));
+    lv_style_set_text_font(&g_style_emotion_name, &font_esp_vocat_20_4);
+
+    lv_style_init(&g_style_primary_btn);
+    lv_style_set_bg_color(&g_style_primary_btn, lv_color_hex(kIosBlue));
+    lv_style_set_bg_opa(&g_style_primary_btn, LV_OPA_COVER);
+    lv_style_set_radius(&g_style_primary_btn, kRadiusPrimaryBtn);
+
+    lv_style_init(&g_style_btn_label);
+    lv_style_set_text_color(&g_style_btn_label, lv_color_hex(0x081014));
+    lv_style_set_text_font(&g_style_btn_label, &font_esp_vocat_20_4);
+
+    lv_style_init(&g_style_chevron_btn);
+    // A plain transparent hit-area; the glyph itself is a blue accent-text label
+    // (iOS back / step chevrons have no fill).
+    lv_style_set_bg_opa(&g_style_chevron_btn, LV_OPA_TRANSP);
+    lv_style_set_border_width(&g_style_chevron_btn, 0);
+    lv_style_set_pad_all(&g_style_chevron_btn, 0);
+}
+
+void EnsureSharedStyles() {
+    static bool inited = false;
+    if (!inited) {
+        InitSharedStyles();
+        inited = true;
+    }
+}
+}  // namespace
+
+// Solid-color stand-in for a real LVGL page, per ScreenId. Replaced by the real
+// page screens in a later task; kept so a non-Home screen renders something.
+static lv_color_t SpikePageColor(ScreenId id) {
+    switch (id) {
+        case ScreenId::EmotionLearning:
+            return lv_color_hex(0xFF8FB1);  // pink
+        case ScreenId::Settings:
+            return lv_color_hex(0x63E6BE);  // mint
+        case ScreenId::Home:
+        default:
+            return lv_color_hex(0x1A1A2E);  // dark
+    }
+}
+
+bool RenderSwitch::IoReadyCallback(esp_lcd_panel_io_handle_t panel_io,
+                                   esp_lcd_panel_io_event_data_t* edata, void* user_ctx) {
+    (void)panel_io;
+    (void)edata;
+    auto* self = static_cast<RenderSwitch*>(user_ctx);
+    if (self == nullptr) {
+        return false;
+    }
+    // This callback runs in the SPI ISR. It is shared by emote and esp_lvgl_port
+    // for the panel's single on_color_trans_done slot.
+    //
+    // ALWAYS clear LVGL's pending flush first. taskLVGL is a tight loop that
+    // paints the default screen as soon as add_disp creates it — i.e. before
+    // active_lvgl_ is set true — and its SPI transfer relies on this callback to
+    // release disp->flushing. If this were gated on active_lvgl_, that first
+    // render would leave flushing latched and taskLVGL would spin in
+    // wait_for_flushing forever (holding the LVGL lock, so ShowLvgl then blocks
+    // and every swipe/long-press to a non-Home screen freezes). lv_disp_flush_ready
+    // is idempotent and a safe no-op when LVGL is idle, so clearing it for an
+    // emote-owned transfer is harmless.
+    lv_display_t* lvgl_disp = self->lvgl_display_;
+    if (lvgl_disp == nullptr) {
+        // The very first boot render can land before add_disp's return has been
+        // stored into lvgl_display_; fall back to the display being rendered.
+        lvgl_disp = lv_display_get_default();
+    }
+    if (lvgl_disp != nullptr) {
+        lvgl_port_flush_ready(lvgl_disp);
+    }
+    // Acknowledge emote's flush completion on EVERY color transfer, regardless of
+    // which renderer owns the panel. emote_notify_flush_finished only sets the
+    // gfx WAIT_FLUSH_DONE event bit (gfx_render_part_area clears it before each
+    // real flush), so a spurious ack when emote has no pending flush is a
+    // harmless no-op. We call it unconditionally because gfx_core pends on
+    // WAIT_FLUSH_DONE with the gfx mutex held; gating the ack on active_lvgl_
+    // let an emote write that was in flight across an ownership flip (SetPanelWritesEnabled
+    // committed a real draw_bitmap, then active_lvgl_ turned true before its
+    // ISR) go forever unacked -> gfx_core hung on the mutex -> every subsequent
+    // SetEmotion (idle animation on the esp_timer task) blocked -> clock_timer
+    // never fired -> the whole app froze (SystemInfo/SetEmotion logs went silent).
+    if (self->emote_ != nullptr) {
+        emote_notify_flush_finished(self->emote_->GetEmoteHandle());
+    }
+    return true;
+}
+
+RenderSwitch::RenderSwitch(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io,
+                           int width, int height, emote::EmoteDisplay* emote)
+    : panel_(panel), panel_io_(panel_io), width_(width), height_(height), emote_(emote) {
+    ESP_LOGI(TAG, "RenderSwitch: init LVGL on emote-owned panel");
+
+    // Prevent emote from starting a panel transfer while esp_lvgl_port is
+    // attaching LVGL to the same SPI panel. add_disp starts taskLVGL before it
+    // returns, so leaving emote enabled here creates a boot-time bus race that
+    // can corrupt the ST77916 address window and produce full-screen stripes.
+    if (emote_ != nullptr) {
+        emote_->SetPanelWritesEnabled(false);
+    }
+
+    lv_init();
+    lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    port_cfg.task_priority = 1;
+#if CONFIG_SOC_CPU_CORES_NUM > 1
+    port_cfg.task_affinity = 1;
+#endif
+    lvgl_port_init(&port_cfg);
+
+    // The SPI panel_io stores exactly one on_color_trans_done callback and
+    // silently overwrites the previous one (both emote and esp_lvgl_port each
+    // want that slot). Claim it with our fan-out so emote keeps getting its
+    // flush completion even before/after esp_lvgl_port registers its own.
+    const esp_lcd_panel_io_callbacks_t io_cbs = {
+        .on_color_trans_done = RenderSwitch::IoReadyCallback,
+    };
+    esp_lcd_panel_io_register_event_callbacks(panel_io_, &io_cbs, this);
+
+    const lvgl_port_display_cfg_t display_cfg = {
+        .io_handle = panel_io_,
+        .panel_handle = panel_,
+        .control_handle = nullptr,
+        .buffer_size = static_cast<uint32_t>(width_ * 20),
+        .double_buffer = false,
+        .trans_size = 0,
+        .hres = static_cast<uint32_t>(width_),
+        .vres = static_cast<uint32_t>(height_),
+        .monochrome = false,
+        .rotation =
+            {
+                .swap_xy = false,
+                .mirror_x = false,
+                .mirror_y = false,
+            },
+        .color_format = LV_COLOR_FORMAT_RGB565,
+        .flags =
+            {
+                .buff_dma = 1,
+                .buff_spiram = 0,
+                .sw_rotate = 0,
+                .swap_bytes = 1,
+                .full_refresh = 0,
+                .direct_mode = 0,
+            },
+    };
+    lvgl_display_ = lvgl_port_add_disp(&display_cfg);
+    if (lvgl_display_ == nullptr) {
+        ESP_LOGE(TAG, "RenderSwitch: esp_lvgl_port_add_disp failed to attach existing panel");
+        return;
+    }
+
+    // esp_lvgl_port registered its own io callback during add_disp; reclaim the
+    // slot so our fan-out is the stable owner for both renderers.
+    esp_lcd_panel_io_register_event_callbacks(panel_io_, &io_cbs, this);
+
+    // LVGL starts stopped: emote owns the panel until ShowLvgl().
+    lvgl_port_stop();
+    active_lvgl_.store(false);
+    ESP_LOGI(TAG, "RenderSwitch: ready; LVGL display %p attached to emote-owned panel",
+             (void*)lvgl_display_);
+}
+
+RenderSwitch::~RenderSwitch() {
+    // Return the panel to emote ownership before the switch goes away. LVGL is
+    // left dormant (its io fan-out is intentionally kept registered for the
+    // emote renderer, so the object must outlive any subsequent emote flush).
+    ShowEmote();
+}
+
+void RenderSwitch::ShowEmote() {
+    // 1) Stop LVGL first so it produces no further flushes.
+    lvgl_port_stop();
+    // 2) Return the panel to the emote renderer.
+    active_lvgl_.store(false);
+    if (emote_ != nullptr) {
+        emote_->SetPanelWritesEnabled(true);
+        // LVGL may have repainted only its damaged regions before ownership
+        // changed. Force emote to redraw the complete frame so the round panel
+        // cannot retain LVGL pixels as a white halo around the pet expression.
+        emote_->RefreshAll();
+    }
+    ESP_LOGI(TAG, "RenderSwitch: ShowEmote -> panel owned by emote");
+}
+
+void RenderSwitch::ShowLvgl(ScreenId id, const std::function<void()>& build) {
+    // 1) Gate emote's panel writes first. Emote keeps rendering into its own
+    //    buffer but drops panel flushes, so no emote write can race LVGL.
+    if (emote_ != nullptr) {
+        emote_->SetPanelWritesEnabled(false);
+    }
+    active_lvgl_.store(true);
+
+    // 2) Build the requested page under the LVGL lock. A page screen (Settings)
+    //    supplies its own build callback; otherwise fall back to the solid color.
+    lvgl_port_lock(0);
+    if (build) {
+        build();
+    } else {
+        lv_obj_t* scr = lv_screen_active();
+        lv_obj_remove_style_all(scr);
+        lv_obj_set_style_bg_color(scr, SpikePageColor(id), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        lv_screen_load(scr);
+    }
+
+    // 3) Force a full repaint of the freshly-claimed panel. The page screens are
+    //    cached: on reload a cached widget tree that hasn't changed since LVGL
+    //    last drew it is NOT re-invalidated by LVGL, so when ownership cycles
+    //    back from emote (whose full-frame round pet face overwrote the panel)
+    //    LVGL would repaint nothing and leave emote's pixels as residue ("一些
+    //    区域没有刷新"). Clearing the whole active screen on every LVGL handoff
+    //    ensures the new owner repaints 100% of the round panel. One-shot per
+    //    transition (only the screen, not continuous full-refresh), so it does
+    //    not add per-frame flush cost.
+    lv_obj_invalidate(lv_screen_active());
+
+    lvgl_port_unlock();
+
+    // 3) Resume LVGL so it renders and flushes the page.
+    lvgl_port_resume();
+    ESP_LOGI(TAG, "RenderSwitch: ShowLvgl(%d) -> panel owned by LVGL", static_cast<int>(id));
+}
+
+void RenderSwitch::ShowLvgl(ScreenId id) { ShowLvgl(id, {}); }
+
+EspVocatUi::EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
+                       int height, emote::EmoteDisplay* emote)
+    : render_switch_(panel, panel_io, width, height, emote) {
+    // Build the shared style set once (RenderSwitch has already run lv_init).
+    EnsureSharedStyles();
+    // Bind a pointer input device to the LVGL display so the page screens'
+    // on-screen controls receive taps (fed by the board's touch task). LVGL is
+    // still stopped here (emote owns the panel), so creating the indev is safe.
+    SetupTouchInput();
+    // The panel starts owned by emote; land on the Home pet face.
+    ShowHome();
+}
+
+void EspVocatUi::ShowHome() {
+    render_switch_.ShowEmote();
+    current_ = ScreenId::Home;
+}
+
+void EspVocatUi::ShowEmotionLessonFace() {
+    // Mirror SetConversationActive's trick: hand the panel to the emote pet face
+    // (the pet demonstrates the emotion) but keep current_ = EmotionLearning so
+    // routing, the 30s idle timeout, and screen-aware gestures all stay in the
+    // learning screen rather than flipping to Home.
+    render_switch_.ShowEmote();
+    current_ = ScreenId::EmotionLearning;
+    ESP_LOGI(TAG, "EspVocatUi: emotion lesson face on (emote-composited)");
+}
+
+// Create a pointer input device so the page screens' on-screen controls can be
+// clicked. The read callback returns the last point fed by the board's touch
+// task (FeedTouch). LVGL polls this indev only while it owns the panel; while
+// the Home emote face owns it, the LVGL task is stopped and nothing reads it.
+void EspVocatUi::SetupTouchInput() {
+    lv_display_t* disp = render_switch_.lvgl_display();
+    if (disp == nullptr) {
+        ESP_LOGE(TAG, "SetupTouchInput: no LVGL display to bind indev to");
+        return;
+    }
+    touch_indev_ = lv_indev_create();
+    lv_indev_set_type(touch_indev_, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(touch_indev_, EspVocatUi::TouchInputReadCallback);
+    lv_indev_set_user_data(touch_indev_, this);
+    lv_indev_set_display(touch_indev_, disp);
+    ESP_LOGI(TAG, "SetupTouchInput: pointer indev %p bound to display %p", (void*)touch_indev_,
+             (void*)disp);
+}
+
+void EspVocatUi::TouchInputReadCallback(lv_indev_t* indev, lv_indev_data_t* data) {
+    auto* self = static_cast<EspVocatUi*>(lv_indev_get_user_data(indev));
+    if (self == nullptr) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    // Atomics: each read is current (seq_cst). A press/release boundary update
+    // is only off by the latency of the two latch fields updating in sequence,
+    // which never splits a point+state pair into a torn, unclickable one.
+    data->point.x = self->touch_x_.load();
+    data->point.y = self->touch_y_.load();
+    data->state = self->touch_pressed_.load() ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+void EspVocatUi::FeedTouch(int x, int y, bool pressed) {
+    touch_x_.store(x);
+    touch_y_.store(y);
+    touch_pressed_.store(pressed);
+}
+
+void EspVocatUi::ShowScreen(ScreenId id) {
+    // The page screens always supply a build callback; the conversation is not a
+    // page (it stays composited over the pet via SetConversationActive), and Home
+    // returns the panel to emote via ShowHome, so nothing needs the solid-color
+    // fallback anymore.
+    if (id == ScreenId::Settings) {
+        render_switch_.ShowLvgl(id, [this]() { BuildSettingsScreen(); });
+    } else if (id == ScreenId::EmotionLearning) {
+        render_switch_.ShowLvgl(id, [this]() { BuildEmotionLearningScreen(); });
+    }
+    current_ = id;
+}
+
+void EspVocatUi::SetConversationActive(bool on) {
+    if (conversation_active_ == on) {
+        return;  // no state change; keep the current presentation and callback
+    }
+    conversation_active_ = on;
+    if (on) {
+        // Siri-style: keep the panel on the emote pet face (the pet keeps
+        // animating its listen/speak look via the board's SetStatus) and
+        // composite the waveform + status label over the live pet. current_ =
+        // ConversationOverlay so gestures/routing still treat us as in a
+        // conversation (swipes exit, no light-sleep, no idle auto-close).
+        render_switch_.ShowEmote();
+        current_ = ScreenId::ConversationOverlay;
+        if (render_switch_.emote() != nullptr) {
+            render_switch_.emote()->ShowConversationOverlay(speaking_);
+        }
+        ESP_LOGI(TAG, "EspVocatUi: conversation overlay on (emote-composited)");
+    } else {
+        // Any leave returns to the Home pet face and fires the dialog-gone
+        // callback so esp-vocat can force-stop the running dialogue.
+        if (render_switch_.emote() != nullptr) {
+            render_switch_.emote()->HideConversationOverlay();
+        }
+        ShowHome();
+        if (dialog_gone_cb_) {
+            dialog_gone_cb_();
+        }
+        ESP_LOGI(TAG, "EspVocatUi: conversation overlay off (dialog gone fired)");
+    }
+}
+
+void EspVocatUi::SetSpeaking(bool speaking) {
+    // The emote overlay owns the conversation visuals now; no LVGL lock is
+    // involved. Cache the state so SetConversationActive(true) can apply the
+    // latest desired state when the overlay is first shown.
+    speaking_ = speaking;
+    if (render_switch_.emote() != nullptr) {
+        render_switch_.emote()->SetConversationSpeaking(speaking);
+    }
+}
+
+// ---- Settings screen -------------------------------------------------------
+
+void EspVocatUi::SettingsStepperEventCb(lv_event_t* e) {
+    auto* target = static_cast<SettingsStepTarget*>(lv_event_get_user_data(e));
+    if (target == nullptr || target->ui == nullptr) {
+        return;
+    }
+    target->ui->ApplySettingsValue(target->is_brightness, target->delta);
+}
+
+void EspVocatUi::SettingsBackEventCb(lv_event_t* e) {
+    auto* ui = static_cast<EspVocatUi*>(lv_event_get_user_data(e));
+    if (ui == nullptr) {
+        return;
+    }
+    ESP_LOGI(TAG, "EspVocatUi: settings back pressed");
+    if (ui->back_to_home_cb_) {
+        ui->back_to_home_cb_();
+    } else {
+        ui->ShowHome();
+    }
+}
+
+void EspVocatUi::BuildSettingsScreen() {
+    // Build the object tree once and reuse it for the device lifetime; a later
+    // ShowScreen just reloads and refreshes the cached labels.
+    if (settings_screen_ != nullptr) {
+        lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0,
+                            false);
+        RefreshSettingsValueLabel(true);
+        RefreshSettingsValueLabel(false);
+        return;
+    }
+
+    // Peak-style instrument face, inset to the round 360x360 panel.
+    // Each page owns its own screen object (lv_obj_create(NULL), the LVGL 9
+    // idiom), never lv_screen_active() — otherwise pages would alias the shared
+    // default screen and stack stale children across reloads.
+    lv_obj_t* scr = lv_obj_create(NULL);
+    lv_obj_remove_style_all(scr);
+    lv_obj_add_style(scr, &g_style_screen_bg, 0);
+
+    // Thin instrument back chevron, kept inside the visible circle.
+    lv_obj_t* back = lv_button_create(scr);
+    lv_obj_add_style(back, &g_style_chevron_btn, 0);
+    lv_obj_set_size(back, kNavBackSize, kNavBackSize);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, kNavBackX, kNavBackY);
+    lv_obj_add_event_cb(back, EspVocatUi::SettingsBackEventCb, LV_EVENT_CLICKED, this);
+    lv_obj_t* back_label = lv_label_create(back);
+    lv_label_set_text(back_label, "<");
+    lv_obj_add_style(back_label, &g_style_accent_text, 0);
+    lv_obj_center(back_label);
+
+    // Title 设置, centred above the two gauges.
+    lv_obj_t* title = lv_label_create(scr);
+    lv_label_set_text(title, "设置");
+    lv_obj_add_style(title, &g_style_title, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, kNavTitleY);
+
+    // One recessed instrument well holding the brightness and volume gauges.
+    lv_obj_t* card = lv_obj_create(scr);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, kCardWidth, 228);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_add_style(card, &g_style_card, 0);
+
+    BuildSettingsRow(card, "亮度", &brightness_value_label_, true, -72);
+    BuildSettingsRow(card, "音量", &volume_value_label_, false, 72);
+
+    settings_screen_ = scr;
+    lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
+    RefreshSettingsValueLabel(true);
+    RefreshSettingsValueLabel(false);
+    ESP_LOGI(TAG, "EspVocatUi: settings screen built");
+}
+
+void EspVocatUi::BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** value_label_out,
+                                  bool is_brightness, int x_offset) {
+    lv_obj_t* gauge = lv_obj_create(card);
+    lv_obj_remove_style_all(gauge);
+    lv_obj_set_size(gauge, 132, 184);
+    lv_obj_align(gauge, LV_ALIGN_CENTER, x_offset, 0);
+
+    // Dim full-scale track.
+    lv_obj_t* track = lv_arc_create(gauge);
+    lv_obj_remove_style_all(track);
+    lv_obj_set_size(track, 116, 116);
+    lv_obj_align(track, LV_ALIGN_TOP_MID, 0, 4);
+    lv_arc_set_rotation(track, 135);
+    lv_arc_set_bg_angles(track, 0, 270);
+    lv_arc_set_value(track, 100);
+    lv_obj_set_style_arc_width(track, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(track, lv_color_hex(kSeparator), LV_PART_INDICATOR);
+    lv_obj_remove_flag(track, LV_OBJ_FLAG_CLICKABLE);
+
+    // Cyan value arc. The indicator is refreshed whenever the cached value changes.
+    lv_obj_t* arc = lv_arc_create(gauge);
+    lv_obj_remove_style_all(arc);
+    lv_obj_set_size(arc, 116, 116);
+    lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 4);
+    lv_arc_set_rotation(arc, 135);
+    lv_arc_set_bg_angles(arc, 0, 270);
+    lv_arc_set_range(arc, 0, 100);
+    lv_obj_set_style_arc_width(arc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(kIosBlue), LV_PART_INDICATOR);
+    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    if (is_brightness) {
+        brightness_arc_ = arc;
+    } else {
+        volume_arc_ = arc;
+    }
+
+    lv_obj_t* name_label = lv_label_create(gauge);
+    lv_label_set_text(name_label, name);
+    lv_obj_add_style(name_label, &g_style_subtitle, 0);
+    lv_obj_align(name_label, LV_ALIGN_TOP_MID, 0, 42);
+
+    lv_obj_t* value_label = lv_label_create(gauge);
+    lv_obj_add_style(value_label, &g_style_accent_text, 0);
+    lv_obj_align(value_label, LV_ALIGN_TOP_MID, 0, 70);
+    *value_label_out = value_label;
+
+    // Transparent − / ＋ hit areas flanking the readout.
+    lv_obj_t* minus = lv_button_create(gauge);
+    lv_obj_remove_style_all(minus);
+    lv_obj_set_size(minus, 48, 40);
+    lv_obj_align(minus, LV_ALIGN_BOTTOM_LEFT, 4, -4);
+    lv_obj_add_event_cb(minus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
+                        new SettingsStepTarget{this, is_brightness, -1});
+    lv_obj_t* minus_label = lv_label_create(minus);
+    lv_label_set_text(minus_label, "-");
+    lv_obj_add_style(minus_label, &g_style_accent_text, 0);
+    lv_obj_center(minus_label);
+
+    lv_obj_t* plus = lv_button_create(gauge);
+    lv_obj_remove_style_all(plus);
+    lv_obj_set_size(plus, 48, 40);
+    lv_obj_align(plus, LV_ALIGN_BOTTOM_RIGHT, -4, -4);
+    lv_obj_add_event_cb(plus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
+                        new SettingsStepTarget{this, is_brightness, +1});
+    lv_obj_t* plus_label = lv_label_create(plus);
+    lv_label_set_text(plus_label, "+");
+    lv_obj_add_style(plus_label, &g_style_accent_text, 0);
+    lv_obj_center(plus_label);
+}
+
+void EspVocatUi::ApplySettingsValue(bool is_brightness, int delta) {
+    int& value = is_brightness ? brightness_ : volume_;
+    int new_value = value + delta;
+    if (new_value < 0) {
+        new_value = 0;
+    }
+    if (new_value > 100) {
+        new_value = 100;
+    }
+    if (new_value == value) {
+        return;  // already at the clamp; do not fire an empty change
+    }
+    value = new_value;
+    RefreshSettingsValueLabel(is_brightness);
+    if (is_brightness) {
+        if (brightness_change_cb_) {
+            brightness_change_cb_(value);
+        }
+    } else if (volume_change_cb_) {
+        volume_change_cb_(value);
+    }
+}
+
+void EspVocatUi::RefreshSettingsValueLabel(bool is_brightness) {
+    lv_obj_t* label = is_brightness ? brightness_value_label_ : volume_value_label_;
+    int value = is_brightness ? brightness_ : volume_;
+    if (label == nullptr) {
+        return;  // screen not built yet; SetSettingsValue* just caches
+    }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%03d", value);
+    lv_label_set_text(label, buf);
+    lv_obj_t* arc = is_brightness ? brightness_arc_ : volume_arc_;
+    if (arc != nullptr) {
+        lv_arc_set_value(arc, value);
+    }
+}
+
+void EspVocatUi::SetSettingsValueBrightness(int value) {
+    brightness_ = value < 0 ? 0 : (value > 100 ? 100 : value);
+    RefreshSettingsValueLabel(true);
+}
+
+void EspVocatUi::SetSettingsValueVolume(int value) {
+    volume_ = value < 0 ? 0 : (value > 100 ? 100 : value);
+    RefreshSettingsValueLabel(false);
+}
+
+// ---- Emotion learning screen -----------------------------------------------
+
+// Radius (px) of the 8 scale ticks around the dial. Shared by the tick builder
+// and RefreshEmotionDial() so the rotation re-positions on the same circle.
+static constexpr int kEmotionTickRadius = 84;
+// The 8 emotion names, ordered clockwise around the dial (tick 0 at 12 o'clock).
+static const char* const kEmotionUiNames[8] = {"开心", "伤心", "生气", "惊讶",
+                                               "困惑", "困了", "喜欢", "平静"};
+// Degrees per tick (360/8); used to convert dial rotation into a selection.
+static constexpr float kEmotionTickDeg = 45.0f;
+
+void EspVocatUi::EmotionLearningStartEventCb(lv_event_t* e) {
+    auto* target = static_cast<StartLearningTarget*>(lv_event_get_user_data(e));
+    if (target == nullptr || target->ui == nullptr) {
+        return;
+    }
+    ESP_LOGI(TAG, "EspVocatUi: emotion learning 开始 pressed");
+    if (target->ui->start_learning_cb_) {
+        target->ui->start_learning_cb_();
+    }
+}
+
+void EspVocatUi::BuildEmotionLearningScreen() {
+    // Build the object tree once and reuse it for the device lifetime; a later
+    // ShowScreen just reloads and refreshes the cached labels.
+    if (emotion_screen_ != nullptr) {
+        lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0,
+                            false);
+        if (emotion_name_label_ != nullptr) {
+            lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
+        }
+        return;
+    }
+
+    // Peak-style emotion instrument, inset to the round 360x360 panel. No pet face;
+    // this is a pure LVGL page. Own dedicated screen object (lv_obj_create(NULL)),
+    // never lv_screen_active(), so this page's children never alias another
+    // page's children on the shared default screen.
+    lv_obj_t* scr = lv_obj_create(NULL);
+    lv_obj_remove_style_all(scr);
+    lv_obj_add_style(scr, &g_style_screen_bg, 0);
+
+    lv_obj_t* back = lv_button_create(scr);
+    lv_obj_add_style(back, &g_style_chevron_btn, 0);
+    lv_obj_set_size(back, kNavBackSize, kNavBackSize);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, kNavBackX, kNavBackY);
+    lv_obj_add_event_cb(back, EspVocatUi::SettingsBackEventCb, LV_EVENT_CLICKED, this);
+    lv_obj_t* back_label = lv_label_create(back);
+    lv_label_set_text(back_label, "<");
+    lv_obj_add_style(back_label, &g_style_accent_text, 0);
+    lv_obj_center(back_label);
+
+    lv_obj_t* title = lv_label_create(scr);
+    lv_label_set_text(title, "情绪学习");
+    lv_obj_add_style(title, &g_style_title, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, kNavTitleY);
+
+    lv_obj_t* dial = lv_obj_create(scr);
+    lv_obj_remove_style_all(dial);
+    lv_obj_set_size(dial, 236, 236);
+    lv_obj_align(dial, LV_ALIGN_CENTER, 0, 10);
+
+    lv_obj_t* ring = lv_arc_create(dial);
+    lv_obj_remove_style_all(ring);
+    lv_obj_set_size(ring, 220, 220);
+    lv_obj_center(ring);
+    lv_arc_set_bg_angles(ring, 0, 360);
+    lv_arc_set_value(ring, 100);
+    lv_obj_set_style_arc_width(ring, 2, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(ring, lv_color_hex(kIosBlue), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(ring, LV_OPA_40, LV_PART_INDICATOR);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* name_label = lv_label_create(dial);
+    lv_obj_add_style(name_label, &g_style_emotion_name, 0);
+    lv_obj_align(name_label, LV_ALIGN_CENTER, 0, -8);
+    emotion_name_label_ = name_label;
+    if (!emotion_name_.empty()) {
+        lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
+    }
+
+    // Eight scale ticks around the dial; the active emotion (nearest the top) is
+    // coral. Created here once; RefreshEmotionDial() re-positions them around the
+    // dial and re-highlights as the dial rotates with the finger.
+    for (int i = 0; i < 8; ++i) {
+        lv_obj_t* tick = lv_obj_create(dial);
+        lv_obj_remove_style_all(tick);
+        lv_obj_set_size(tick, 10, 10);
+        lv_obj_set_style_radius(tick, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(tick, lv_color_hex(kSeparator), 0);
+        lv_obj_set_style_bg_opa(tick, LV_OPA_COVER, 0);
+        emotion_ticks_[i] = tick;
+    }
+
+    // Selection is made by rotating the dial with a finger (the board feeds the
+    // angular deltas); no arrow buttons are drawn here.
+
+    // Compact cyan START control, kept inside the lower arc of the round panel.
+    lv_obj_t* start = lv_button_create(scr);
+    lv_obj_set_size(start, 148, 46);
+    lv_obj_align(start, LV_ALIGN_BOTTOM_MID, 0, -28);
+    lv_obj_add_style(start, &g_style_primary_btn, 0);
+    lv_obj_add_event_cb(start, EspVocatUi::EmotionLearningStartEventCb, LV_EVENT_CLICKED,
+                        new StartLearningTarget{this});
+    lv_obj_t* start_label = lv_label_create(start);
+    lv_label_set_text(start_label, "开始");
+    lv_obj_add_style(start_label, &g_style_btn_label, 0);
+    lv_obj_center(start_label);
+
+    emotion_screen_ = scr;
+    // Apply the cached/initial rotation and highlight once all ticks exist.
+    RefreshEmotionDial();
+    lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
+    ESP_LOGI(TAG, "EspVocatUi: emotion learning screen built");
+}
+
+void EspVocatUi::SetEmotionLearningName(const char* name) {
+    // Cache unconditionally; the label only exists once the screen is built.
+    emotion_name_ = name != nullptr ? name : "";
+    // Park the dial so the named emotion sits at the top (12 o'clock), then
+    // refresh. This is the non-drag path (explicit set / lesson return); a live
+    // drag drives emotion_dial_rotation_ directly instead.
+    int index = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (emotion_name_ == kEmotionUiNames[i]) {
+            index = i;
+            break;
+        }
+    }
+    // Park the dial so the named emotion's tick sits at the top: rotation = index*45.
+    emotion_dial_rotation_ = index * kEmotionTickDeg;
+    RefreshEmotionDial();
+}
+
+int EspVocatUi::SelectedEmotionIndex() const {
+    // Tick i sits at rotation - i*45 - 90; it is at the top (-90) when
+    // rotation - i*45 = 0 (mod 360), i.e. i = round(rotation/45) (mod 8).
+    // Clockwise finger rotation raises rotation -> the next emotion comes to the
+    // top, and the ring turns with the finger.
+    int sel = static_cast<int>(roundf(emotion_dial_rotation_ / kEmotionTickDeg));
+    return ((sel % 8) + 8) % 8;
+}
+
+void EspVocatUi::RefreshEmotionDial() {
+    if (emotion_name_label_ == nullptr) {
+        return;  // screen not built yet; rotation applied on build
+    }
+    int sel = SelectedEmotionIndex();
+    emotion_name_ = kEmotionUiNames[sel];
+    lvgl_port_lock(0);
+    lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
+    for (int i = 0; i < 8; ++i) {
+        if (emotion_ticks_[i] == nullptr) {
+            continue;
+        }
+        // Place tick i at angle rotation - i*45 - 90 degrees, measured from the
+        // dial centre with 0 at 3 o'clock and clockwise positive (screen y down).
+        // Increasing i runs counterclockwise so that a clockwise ring rotation
+        // (which follows the finger) brings the next emotion under the top marker.
+        float angle_deg = emotion_dial_rotation_ - static_cast<float>(i) * kEmotionTickDeg - 90.0f;
+        float rad = angle_deg * 3.14159265f / 180.0f;
+        lv_obj_align(emotion_ticks_[i], LV_ALIGN_CENTER,
+                     static_cast<lv_coord_t>(kEmotionTickRadius * cosf(rad)),
+                     static_cast<lv_coord_t>(kEmotionTickRadius * sinf(rad)));
+        lv_obj_set_style_bg_color(emotion_ticks_[i],
+                                  lv_color_hex(i == sel ? kPink : kSeparator), 0);
+    }
+    lvgl_port_unlock();
+}
+
+void EspVocatUi::RotateEmotionDial(float clockwise_deg) {
+    // Clockwise (positive) turns the ring clockwise with the finger and steps to
+    // the next emotion (see SelectedEmotionIndex). Called from the touch task
+    // under a held drag.
+    if (!lv_obj_is_valid(emotion_screen_)) {
+        return;
+    }
+    emotion_dial_rotation_ += clockwise_deg;
+    RefreshEmotionDial();
+}
+
+void EspVocatUi::EndEmotionDialDrag() {
+    // Snap the dial to the nearest tick so the chosen emotion sits at the top,
+    // then tell the board which index was settled (it keeps current_emotion_index_
+    // in sync for the flashcard lesson).
+    int sel = SelectedEmotionIndex();
+    emotion_dial_rotation_ = sel * kEmotionTickDeg;
+    RefreshEmotionDial();
+    ESP_LOGI(TAG, "EspVocatUi: emotion dial settled on index %d (%s)", sel,
+             kEmotionUiNames[sel]);
+    if (emotion_dial_settled_cb_) {
+        emotion_dial_settled_cb_(sel);
+    }
+}
+
+// ---- Conversation overlay ----------------------------------------------------
+// The conversation no longer renders here: it is composited over the live emote
+// pet face by EmoteDisplay::ShowConversationOverlay/HideConversationOverlay/
+// SetConversationSpeaking (see emote_display.cc). EspVocatUi only forwards the
+// desired state (SetConversationActive / SetSpeaking) and keeps current_ =
+// ConversationOverlay so the board's gesture/routing logic is unchanged.
