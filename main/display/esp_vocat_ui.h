@@ -53,11 +53,9 @@ public:
 
     // Hand the panel to the emote renderer (Home / conversation pet face).
     void ShowEmote();
-    // Hand the panel to LVGL and show the given page screen. When build is
-    // non-empty it runs under the LVGL lock (in place of the solid-color
-    // stand-in) so EspVocatUi can assemble a real screen on the active scr.
+    // Hand the panel to LVGL and show the given page screen. The build callback
+    // runs under the LVGL lock so EspVocatUi can assemble the real screen.
     void ShowLvgl(ScreenId id, const std::function<void()>& build);
-    void ShowLvgl(ScreenId id);
 
     // True while LVGL owns the panel (ShowLvgl active); false while emote does.
     bool IsLvglActive() const { return active_lvgl_.load(); }
@@ -88,8 +86,7 @@ private:
 // Top-level screen manager for the ESP-VOCAT round panel. Owns a RenderSwitch
 // that hands the shared panel alternately to the emote pet renderer (Home /
 // conversation) and to real LVGL page screens, and tracks which presentation
-// is currently shown. The real page screens arrive in later tasks; for now a
-// non-Home screen renders as a solid-color stand-in via the RenderSwitch.
+// is currently shown.
 class EspVocatUi {
 public:
     EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
@@ -155,8 +152,7 @@ public:
     // The chosen index callback lets the board keep current_emotion_index_ in sync
     // (it drives the flashcard lesson). Registered once at startup.
     using EmotionDialSettledCb = std::function<void(int)>;
-    void SetEmotionDialSettledCallback(EmotionDialSettledCb cb)
-    {
+    void SetEmotionDialSettledCallback(EmotionDialSettledCb cb) {
         emotion_dial_settled_cb_ = std::move(cb);
     }
     void RotateEmotionDial(float clockwise_deg);

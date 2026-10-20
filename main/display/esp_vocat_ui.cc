@@ -25,21 +25,21 @@ static const char* TAG = "esp-vocat";
 // OTA slot has no room for a larger CJK font, so sizes are not scaled.
 namespace {
 // Peak instrument palette.
-constexpr uint32_t kScreenBg = 0x080D12;        // cockpit background
-constexpr uint32_t kCardBg = 0x10181E;          // recessed instrument well
-constexpr uint32_t kPrimaryText = 0xE8FFF9;     // instrument readout
-constexpr uint32_t kSecondaryText = 0x6F8D91;   // scale labels
-constexpr uint32_t kSeparator = 0x1D2A31;       // dim tick / track
-constexpr uint32_t kIosBlue = 0x35F5D0;         // cyan instrument accent
-constexpr uint32_t kPink = 0xFF8A68;            // coral emotion readout
-constexpr uint32_t kLavender = 0x54A8FF;        // cold-blue secondary accent
+constexpr uint32_t kScreenBg = 0x080D12;       // cockpit background
+constexpr uint32_t kCardBg = 0x10181E;         // recessed instrument well
+constexpr uint32_t kPrimaryText = 0xE8FFF9;    // instrument readout
+constexpr uint32_t kSecondaryText = 0x6F8D91;  // scale labels
+constexpr uint32_t kSeparator = 0x1D2A31;      // dim tick / track
+constexpr uint32_t kIosBlue = 0x35F5D0;        // cyan instrument accent
+constexpr uint32_t kPink = 0xFF8A68;           // coral emotion readout
+constexpr uint32_t kLavender = 0x54A8FF;       // cold-blue secondary accent
 constexpr uint32_t kWhite = 0x081014;
-constexpr uint32_t kEmotionPillBg = 0x10181E;   // recessed readout well
+constexpr uint32_t kEmotionPillBg = 0x10181E;  // recessed readout well
 
 // Rounded-corner language matching the panel curvature.
-constexpr lv_coord_t kRadiusCard = 20;          // white grouped card
-constexpr lv_coord_t kRadiusPrimaryBtn = 20;    // iOS-blue 开始 button
-constexpr lv_coord_t kRadiusStepperPill = 12;   // UIStepper pill
+constexpr lv_coord_t kRadiusCard = 20;         // white grouped card
+constexpr lv_coord_t kRadiusPrimaryBtn = 20;   // iOS-blue 开始 button
+constexpr lv_coord_t kRadiusStepperPill = 12;  // UIStepper pill
 
 // Round-panel safe-inset geometry. The ST77916 is a 360x360 *inscribed circle*
 // (centre 180,180, radius 180): anything near the square corners is clipped by
@@ -48,10 +48,10 @@ constexpr lv_coord_t kRadiusStepperPill = 12;   // UIStepper pill
 // distance ~178px; card 300 wide top corners at (30,88/92) ~178px; 开始 bottom
 // corners (70,322) ~180px).
 constexpr lv_coord_t kNavBackSize = 44;
-constexpr lv_coord_t kNavBackX = 76;            // top-left corner of the back btn
+constexpr lv_coord_t kNavBackX = 76;  // top-left corner of the back btn
 constexpr lv_coord_t kNavBackY = 36;
 constexpr lv_coord_t kNavTitleY = 44;
-constexpr lv_coord_t kCardWidth = 300;          // fully visible at this width
+constexpr lv_coord_t kCardWidth = 300;  // fully visible at this width
 constexpr lv_coord_t kCardTopSettings = 88;
 constexpr lv_coord_t kCardTopEmotion = 92;
 constexpr lv_coord_t kStepperPillWidth = 96;
@@ -62,16 +62,17 @@ constexpr uint32_t kScreenFadeMs = 200;
 
 // Shared style objects, constructed once via EnsureSharedStyles() (LVGL v9
 // pointer API), then attached to widgets with lv_obj_add_style.
-lv_style_t g_style_screen_bg;    // F2F2F7 opaque page background
-lv_style_t g_style_card;         // white inset rounded card
-lv_style_t g_style_title;        // dark primary heading
-lv_style_t g_style_body;         // dark primary content
-lv_style_t g_style_subtitle;     // grey secondary content
-lv_style_t g_style_accent_text;  // iOS blue value / highlight text
-lv_style_t g_style_emotion_name; // pink central emotion label
-lv_style_t g_style_primary_btn;  // iOS blue filled (开始)
-lv_style_t g_style_btn_label;    // white on-blue glyph
-lv_style_t g_style_chevron_btn;  // transparent hit-area for blue text chevrons
+lv_style_t g_style_screen_bg;     // F2F2F7 opaque page background
+lv_style_t g_style_card;          // white inset rounded card
+lv_style_t g_style_title;         // dark primary heading
+lv_style_t g_style_body;          // dark primary content
+lv_style_t g_style_subtitle;      // grey secondary content
+lv_style_t g_style_accent_text;   // iOS blue value / highlight text
+lv_style_t g_style_emotion_name;  // pink central emotion label
+lv_style_t g_style_primary_btn;   // iOS blue filled (开始)
+lv_style_t g_style_btn_label;     // white on-blue glyph
+lv_style_t g_style_chevron_btn;   // transparent hit-area for blue text chevrons
+lv_style_t g_style_pressed;       // pressed-state wash on every hit area
 
 void InitSharedStyles() {
     lv_style_init(&g_style_screen_bg);
@@ -121,6 +122,14 @@ void InitSharedStyles() {
     lv_style_set_bg_opa(&g_style_chevron_btn, LV_OPA_TRANSP);
     lv_style_set_border_width(&g_style_chevron_btn, 0);
     lv_style_set_pad_all(&g_style_chevron_btn, 0);
+
+    // Pressed-state feedback shared by every hit area (‹ back, − / + steppers,
+    // 开始): a translucent white wash so a press is visible on the recessed
+    // instrument face (the base styles are flat, with no pressed state).
+    lv_style_init(&g_style_pressed);
+    lv_style_set_bg_color(&g_style_pressed, lv_color_hex(0xFFFFFF));
+    lv_style_set_bg_opa(&g_style_pressed, LV_OPA_20);
+    lv_style_set_radius(&g_style_pressed, kRadiusStepperPill);
 }
 
 void EnsureSharedStyles() {
@@ -131,20 +140,6 @@ void EnsureSharedStyles() {
     }
 }
 }  // namespace
-
-// Solid-color stand-in for a real LVGL page, per ScreenId. Replaced by the real
-// page screens in a later task; kept so a non-Home screen renders something.
-static lv_color_t SpikePageColor(ScreenId id) {
-    switch (id) {
-        case ScreenId::EmotionLearning:
-            return lv_color_hex(0xFF8FB1);  // pink
-        case ScreenId::Settings:
-            return lv_color_hex(0x63E6BE);  // mint
-        case ScreenId::Home:
-        default:
-            return lv_color_hex(0x1A1A2E);  // dark
-    }
-}
 
 bool RenderSwitch::IoReadyCallback(esp_lcd_panel_io_handle_t panel_io,
                                    esp_lcd_panel_io_event_data_t* edata, void* user_ctx) {
@@ -242,7 +237,11 @@ RenderSwitch::RenderSwitch(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle
         .flags =
             {
                 .buff_dma = 1,
-                .buff_spiram = 0,
+                // Render buffer in PSRAM: SPI flush copies through a temp
+                // internal DMA buffer anyway (no psram_dma_direct here), so
+                // keeping the big LVGL buffer out of internal RAM frees ~14KB
+                // for the audio/I2S wake path that OOM-crashed before.
+                .buff_spiram = 1,
                 .sw_rotate = 0,
                 .swap_bytes = 1,
                 .full_refresh = 0,
@@ -296,17 +295,11 @@ void RenderSwitch::ShowLvgl(ScreenId id, const std::function<void()>& build) {
     }
     active_lvgl_.store(true);
 
-    // 2) Build the requested page under the LVGL lock. A page screen (Settings)
-    //    supplies its own build callback; otherwise fall back to the solid color.
+    // 2) Build the requested page under the LVGL lock. Every page screen
+    //    supplies its own build callback (Settings / EmotionLearning).
     lvgl_port_lock(0);
     if (build) {
         build();
-    } else {
-        lv_obj_t* scr = lv_screen_active();
-        lv_obj_remove_style_all(scr);
-        lv_obj_set_style_bg_color(scr, SpikePageColor(id), 0);
-        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-        lv_screen_load(scr);
     }
 
     // 3) Force a full repaint of the freshly-claimed panel. The page screens are
@@ -326,8 +319,6 @@ void RenderSwitch::ShowLvgl(ScreenId id, const std::function<void()>& build) {
     lvgl_port_resume();
     ESP_LOGI(TAG, "RenderSwitch: ShowLvgl(%d) -> panel owned by LVGL", static_cast<int>(id));
 }
-
-void RenderSwitch::ShowLvgl(ScreenId id) { ShowLvgl(id, {}); }
 
 EspVocatUi::EspVocatUi(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
                        int height, emote::EmoteDisplay* emote)
@@ -477,8 +468,7 @@ void EspVocatUi::BuildSettingsScreen() {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
     if (settings_screen_ != nullptr) {
-        lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0,
-                            false);
+        lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
         RefreshSettingsValueLabel(true);
         RefreshSettingsValueLabel(false);
         return;
@@ -495,6 +485,7 @@ void EspVocatUi::BuildSettingsScreen() {
     // Thin instrument back chevron, kept inside the visible circle.
     lv_obj_t* back = lv_button_create(scr);
     lv_obj_add_style(back, &g_style_chevron_btn, 0);
+    lv_obj_add_style(back, &g_style_pressed, LV_STATE_PRESSED);
     lv_obj_set_size(back, kNavBackSize, kNavBackSize);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, kNavBackX, kNavBackY);
     lv_obj_add_event_cb(back, EspVocatUi::SettingsBackEventCb, LV_EVENT_CLICKED, this);
@@ -575,6 +566,7 @@ void EspVocatUi::BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** v
     // Transparent − / ＋ hit areas flanking the readout.
     lv_obj_t* minus = lv_button_create(gauge);
     lv_obj_remove_style_all(minus);
+    lv_obj_add_style(minus, &g_style_pressed, LV_STATE_PRESSED);
     lv_obj_set_size(minus, 48, 40);
     lv_obj_align(minus, LV_ALIGN_BOTTOM_LEFT, 4, -4);
     lv_obj_add_event_cb(minus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
@@ -586,6 +578,7 @@ void EspVocatUi::BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** v
 
     lv_obj_t* plus = lv_button_create(gauge);
     lv_obj_remove_style_all(plus);
+    lv_obj_add_style(plus, &g_style_pressed, LV_STATE_PRESSED);
     lv_obj_set_size(plus, 48, 40);
     lv_obj_align(plus, LV_ALIGN_BOTTOM_RIGHT, -4, -4);
     lv_obj_add_event_cb(plus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
@@ -670,8 +663,7 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
     if (emotion_screen_ != nullptr) {
-        lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0,
-                            false);
+        lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
         if (emotion_name_label_ != nullptr) {
             lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
         }
@@ -688,6 +680,7 @@ void EspVocatUi::BuildEmotionLearningScreen() {
 
     lv_obj_t* back = lv_button_create(scr);
     lv_obj_add_style(back, &g_style_chevron_btn, 0);
+    lv_obj_add_style(back, &g_style_pressed, LV_STATE_PRESSED);
     lv_obj_set_size(back, kNavBackSize, kNavBackSize);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, kNavBackX, kNavBackY);
     lv_obj_add_event_cb(back, EspVocatUi::SettingsBackEventCb, LV_EVENT_CLICKED, this);
@@ -725,6 +718,15 @@ void EspVocatUi::BuildEmotionLearningScreen() {
         lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
     }
 
+    // Rotation affordance: the dial is the only emotion selector, so tell the
+    // child how to use it (and how to leave) right under the current name.
+    // Fits inside the 236px dial (8 CJK glyphs at the 20px font); the scale
+    // ticks live at radius 84, so this radius-40 hint never collides with them.
+    lv_obj_t* hint = lv_label_create(dial);
+    lv_label_set_text(hint, "转动选择 · 长按退出");
+    lv_obj_add_style(hint, &g_style_subtitle, 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 40);
+
     // Eight scale ticks around the dial; the active emotion (nearest the top) is
     // coral. Created here once; RefreshEmotionDial() re-positions them around the
     // dial and re-highlights as the dial rotates with the finger.
@@ -746,6 +748,7 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     lv_obj_set_size(start, 148, 46);
     lv_obj_align(start, LV_ALIGN_BOTTOM_MID, 0, -28);
     lv_obj_add_style(start, &g_style_primary_btn, 0);
+    lv_obj_add_style(start, &g_style_pressed, LV_STATE_PRESSED);
     lv_obj_add_event_cb(start, EspVocatUi::EmotionLearningStartEventCb, LV_EVENT_CLICKED,
                         new StartLearningTarget{this});
     lv_obj_t* start_label = lv_label_create(start);
@@ -808,8 +811,8 @@ void EspVocatUi::RefreshEmotionDial() {
         lv_obj_align(emotion_ticks_[i], LV_ALIGN_CENTER,
                      static_cast<lv_coord_t>(kEmotionTickRadius * cosf(rad)),
                      static_cast<lv_coord_t>(kEmotionTickRadius * sinf(rad)));
-        lv_obj_set_style_bg_color(emotion_ticks_[i],
-                                  lv_color_hex(i == sel ? kPink : kSeparator), 0);
+        lv_obj_set_style_bg_color(emotion_ticks_[i], lv_color_hex(i == sel ? kPink : kSeparator),
+                                  0);
     }
     lvgl_port_unlock();
 }
@@ -832,8 +835,7 @@ void EspVocatUi::EndEmotionDialDrag() {
     int sel = SelectedEmotionIndex();
     emotion_dial_rotation_ = sel * kEmotionTickDeg;
     RefreshEmotionDial();
-    ESP_LOGI(TAG, "EspVocatUi: emotion dial settled on index %d (%s)", sel,
-             kEmotionUiNames[sel]);
+    ESP_LOGI(TAG, "EspVocatUi: emotion dial settled on index %d (%s)", sel, kEmotionUiNames[sel]);
     if (emotion_dial_settled_cb_) {
         emotion_dial_settled_cb_(sel);
     }

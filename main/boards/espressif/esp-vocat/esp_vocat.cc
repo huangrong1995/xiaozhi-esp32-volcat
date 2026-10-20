@@ -625,6 +625,12 @@ private:
     static constexpr uint32_t kDrinkSuccessDurationMs = 3000;  // loving face duration (ms)
     static constexpr int kReminderMaxSnooze = 3;               // bounded retries before going quiet
     static constexpr int64_t kReminderAutoSnoozeMs = 60 * 1000;  // re-remind after no action
+    // After a schedule reminder (08:00/12:00/...), defer the periodic drink
+    // reminder for a quiet window so the two never pile up back-to-back: the
+    // drink period is almost always "stale" in the morning, so without this an
+    // acknowledged schedule reminder pops the drink reminder on the very next
+    // minute tick.
+    static constexpr int64_t kScheduleToDrinkQuietMs = 15 * 60 * 1000;
 
     // Daily schedule reminders (hour, minute, message, emotion).
     struct ScheduleEntry {
@@ -867,10 +873,6 @@ private:
     // the idle pet animation in Chat, the current emotion/pose inside a mode.
     // Stops any transient animation and cannot permanently overwrite a mode
     // or reminder presentation, so feedback layers stay isolated (spec §3.4).
-    // Return the display to the presentation appropriate for the current mode:
-    // the idle pet animation in Chat, the current emotion/pose inside a mode.
-    // Stops any transient animation and cannot permanently overwrite a mode
-    // or reminder presentation, so feedback layers stay isolated (spec §3.4).
     // Screen-aware: non-Home screens (LVGL pages / the conversation overlay) are
     // presented by their own layer and are never reset here; a visible reminder
     // on the Home face keeps its high-priority presentation too.
@@ -912,8 +914,10 @@ private:
             case Gesture::SwipeLeft:
                 EnterEmotionLearningMode();
                 break;
-            case Gesture::SwipeUp:
-                // New settings entry (up swipe, previously ignored by main).
+            case Gesture::SwipeRight:
+                // Right swipe opens Settings (left swipe opens EmotionLearning),
+                // matching the approved screen mapping. SwipeUp/SwipeDown stay
+                // reserved for future shortcuts.
                 EnterSettingsPage();
                 break;
             case Gesture::LongPress:
@@ -929,8 +933,8 @@ private:
                 ESP_LOGI(TAG, "Shake feedback (Chat mode)");
                 break;
             default:
-                // Ignore mode-only gestures (SwipeDown, Pet, Shake, ChatToggle,
-                // None). A swipe must never toggle chat.
+                // Ignore reserved/feedback-only gestures (SwipeUp, SwipeDown, Pet,
+                // ChatToggle, None). A swipe must never toggle chat.
                 break;
         }
     }
@@ -1004,7 +1008,7 @@ private:
                     PresentLessonEmotion();
                 }
             } else if (gesture == Gesture::SwipeLeft || gesture == Gesture::SwipeRight ||
-                       gesture == Gesture::SwipeUp) {
+                       gesture == Gesture::SwipeUp || gesture == Gesture::SwipeDown) {
                 CancelEmotionLesson();
             }
             return;
@@ -1072,6 +1076,11 @@ private:
         if (!emotion_dial_drag_) {
             return;
         }
+        // A held rotation is continuous interaction: keep the mode idle timer
+        // fresh so a long rotation is never auto-exited mid-drag. Auto-exit
+        // stops LVGL (ShowHome) while this loop still calls RotateEmotionDial,
+        // which can then block the touch task on the LVGL lock indefinitely.
+        ResetModeIdleTimer();
         float angle = EmotionDialAngle(x, y);
         float delta = angle - emotion_dial_last_angle_;
         emotion_dial_last_angle_ = angle;
@@ -1217,6 +1226,12 @@ private:
         reminder_ = Reminder{type, message, emotion, sound, esp_timer_get_time() / 1000, false};
         if (reset_snooze) {
             reminder_snooze_count_ = 0;
+        }
+        // Schedule reminders defer the drink reminder (see kScheduleToDrinkQuietMs):
+        // presenting is enough, so the quiet window covers both an immediate ack
+        // and a snooze of the schedule reminder.
+        if (type == Reminder::Type::Schedule) {
+            reminder_quiet_until_ms_ = esp_timer_get_time() / 1000 + kScheduleToDrinkQuietMs;
         }
         reminder_active_ = true;
         reminder_pending_ = true;
@@ -1825,12 +1840,17 @@ private:
                                  board.swipe_start_x_, board.swipe_start_y_, touch_point.x,
                                  touch_point.y, delta_x, delta_y, duration_ms);
 
-                        if (duration_ms >= kLongPressThresholdMs) {
-                            gesture = Gesture::LongPress;
-                        } else if (abs(delta_x) >= kSwipeThreshold && abs(delta_x) > abs(delta_y)) {
+                        // Classify by movement FIRST: a swipe must win even when
+                        // slow (children drag their finger over >1s routinely),
+                        // otherwise a slow swipe is misread as a LongPress and
+                        // either shows wrong feedback or force-exits the page.
+                        // LongPress is then any long hold with little movement.
+                        if (abs(delta_x) >= kSwipeThreshold && abs(delta_x) > abs(delta_y)) {
                             gesture = (delta_x > 0) ? Gesture::SwipeRight : Gesture::SwipeLeft;
                         } else if (abs(delta_y) >= kSwipeThreshold && abs(delta_y) > abs(delta_x)) {
                             gesture = (delta_y > 0) ? Gesture::SwipeDown : Gesture::SwipeUp;
+                        } else if (duration_ms >= kLongPressThresholdMs) {
+                            gesture = Gesture::LongPress;
                         } else {
                             gesture = Gesture::Tap;
                         }
@@ -2153,6 +2173,14 @@ private:
         if (self == nullptr) {
             return;
         }
+        // If the child already left during the ~1.8s "学完啦" celebration pause
+        // (long-press / swipe back to Chat, or a reminder), do NOT yank the
+        // browsing screen back up under a Chat mode — that would mis-route
+        // every later gesture. Only return to the browsing card when the user
+        // is still inside the learning screen.
+        if (self->mode_ != Mode::EmotionLearning || self->CurrentScreen() == ScreenId::Home) {
+            return;
+        }
         // Lesson finished: return to the browsing card at a fresh index.
         if (self->display_ != nullptr) {
             static_cast<emote::EmoteDisplay*>(self->display_)->HideEmotionLesson();
@@ -2315,7 +2343,11 @@ private:
         io_config.dc_gpio_num = GPIO_NUM_NC;
         io_config.spi_mode = 0;
         io_config.pclk_hz = 40 * 1000 * 1000;
-        io_config.trans_queue_depth = 10;
+        // Keep the in-flight transaction pool small: each queued color transfer
+        // carries DMA descriptors, and on this memory-tight board a deep queue
+        // (default 10) means more internal RAM held by the SPI driver. 4 is
+        // plenty for the partial-frame flushes emote/LVGL issue.
+        io_config.trans_queue_depth = 4;
         io_config.lcd_cmd_bits = 32;
         io_config.lcd_param_bits = 8;
         io_config.flags.quad_mode = true;

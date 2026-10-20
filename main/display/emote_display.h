@@ -12,24 +12,17 @@
 
 namespace emote {
 
-// Conversation "voice ripple" overlay, composited below the live pet face.
-// Emote draws solid fills with no opacity blend (no soft glow) and no
-// arcs/gradients, so a circular ripple is faked as a fan of small squares
-// tiling a lower arc around a point just below the pet. The squares are spaced
-// to overlap by ~1px (count per ring sized for its max surge radius), so the
-// row joins into smooth continuous ripple LINES rather than dotted dots. Only
-// the lower arc is drawn (squares sit at y >= the ring center) so the ripples
-// never climb over the pet's face above. The rings ripple outward with the
-// voice (speaking = strong outward surge, listening = gentle breathing).
-// Shared as namespace constants so both the class member array and the .cc
-// file-scope tables can size from them.
-inline constexpr int kRippleRings = 3;
-// Squares per ring, sized so adjacent squares overlap (no gaps) even at each
-// ring's maximum surge radius. Smaller squares = thinner lines, but more of
-// them are needed to stay continuous. Total is the flat object array size.
-inline constexpr int kRippleSegCounts[kRippleRings] = {46, 70, 80};
-inline constexpr int kRippleSegTotal =
-    kRippleSegCounts[0] + kRippleSegCounts[1] + kRippleSegCounts[2];
+// Conversation "Siri-style voice spectrum" overlay, composited below the live
+// pet face. Emote draws solid fills with no opacity blend and no arcs, so the
+// spectrum is a row of vertical bars whose heights ripple like an audio
+// spectrum with the voice: tallest + brightest in the centre, falling away and
+// cooling toward the edges (cyan centre -> magenta -> pink), sitting on the
+// round panel's bottom arc. Speaking = tall, lively travelling waves;
+// listening = gentle breathing. Bars are named labels with a solid background,
+// created once and cached.
+inline constexpr int kSiriBarCount = 17;     // odd, symmetric around the centre
+inline constexpr int kSiriBarWidth = 8;      // px per bar
+inline constexpr int kSiriBarSpacing = 10;   // px between bar centres
 
 class EmoteDisplay : public Display {
 public:
@@ -62,16 +55,16 @@ public:
     void ShowReminder(const char* emotion);
     void RestoreFromReminder();
 
-    // Conversation "voice ripple" overlay composited over the live pet face.
-    // The panel stays owned by emote (the pet keeps animating its listen/speak
-    // look via SetStatus); these gfx objects add a bottom ribbon of colored
-    // rings whose radii ripple outward with the voice (speaking = strong surge,
-    // listening = gentle breathing) + a slim status label. The center stays
-    // clear so the pet stays the focus. LVGL is never involved in a
-    // conversation.
+    // Conversation "Siri-style voice spectrum" overlay composited over the
+    // live pet face. The panel stays owned by emote (the pet keeps animating
+    // its listen/speak look via SetStatus); these gfx objects add a bottom arc
+    // of vertical bars whose heights ripple like an audio spectrum with the
+    // voice (speaking = tall lively waves, listening = gentle breathing) + a
+    // slim status label at the top. The center stays clear so the pet stays
+    // the focus. LVGL is never involved in a conversation.
     void ShowConversationOverlay(bool speaking);
     void HideConversationOverlay();
-    // Flip the overlay's status text / ripple energy for listening vs speaking.
+    // Flip the overlay's status text / wave energy for listening vs speaking.
     void SetConversationSpeaking(bool speaking);
 
     // Emotion-learning flashcard lesson, composited over the live pet face (like
@@ -102,11 +95,11 @@ private:
     void StopIdleAnimation();
     static void IdleAnimTimerCallback(void* arg);
 
-    // Conversation overlay: a "voice ripple" of concentric rings fanning outward
-    // from a point just below the live pet (driven by a smooth outward-traveling
-    // envelope, not random). The pet stays centered and calm; the rings stay
-    // below it. Emote fills don't blend opacity and there are no arcs, so each
-    // ring is tiled from overlapping squares (motion + shape via size/pos).
+    // Conversation overlay: a "voice spectrum" of vertical bars fanning up from
+    // the round panel's bottom arc (driven by smooth travelling waves, not
+    // random). The pet stays centered and calm; the bars stay below it. Emote
+    // fills don't blend opacity and there are no arcs, so each bar is a solid
+    // label whose height is re-sized every animation tick (motion via size/pos).
     void EnsureConversationUi();
     void AnimateConversationRipple();
     static void ConversationTimerCallback(void* arg);
@@ -122,10 +115,10 @@ private:
     size_t current_idle_index_ = 0;
     std::vector<std::string> idle_emotions_;
 
-    // The ripple squares (tiling each ring's lower arc into continuous lines)
-    // + the slim status label.
+    // The spectrum bars (vertical bars along the bottom arc, heights = voice
+    // energy) + the slim status label.
     gfx_obj_t* conversation_status_ = nullptr;
-    gfx_obj_t* conversation_segs_[kRippleSegTotal] = {};
+    gfx_obj_t* conversation_bars_[kSiriBarCount] = {};
     esp_timer_handle_t conversation_timer_ = nullptr;
     bool conversation_active_ = false;
     bool conversation_speaking_ = false;

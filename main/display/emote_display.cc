@@ -44,30 +44,62 @@ static const char* TAG = "EmoteDisplay";
 static const gfx_color_t kColorWhite = GFX_COLOR_HEX(0xFFFFFF);
 static const gfx_color_t kColorDarkBg = GFX_COLOR_HEX(0x1A1A2E);
 
-// Conversation "voice ripple" palette. Each ring is a single color that gets
-// cooler as it moves outward: warm pink nearest the pet -> magenta -> cyan at
-// the edge, so the ripple reads as sound energy fading as it travels.
-static const gfx_color_t kRippleColor[kRippleRings] = {
-    GFX_COLOR_HEX(0xFF8FB1),  // pink   (inner ring, near the pet)
-    GFX_COLOR_HEX(0xE06BFA),  // magenta (mid ring)
-    GFX_COLOR_HEX(0x64E3FF),  // cyan   (outer ring)
-};
+// Conversation "Siri-style voice spectrum" palette. The hue sweeps cyan at the
+// centre -> magenta -> pink at the edges; over time the whole sweep drifts
+// (kSiriHueDrift) and each bar's brightness follows its height/energy, so the
+// spectrum shimmer changes instead of being a static gradient.
+static constexpr int kSiriBarHeightMin = 2;            // keep bars visible
+static constexpr int kSiriBarHeightMaxSpeaking = 88;   // tall, lively waves
+static constexpr int kSiriBarHeightMaxListen = 32;     // gentle breathing
+static constexpr float kSiriPanelRadius = 180.0f;      // round panel inscribed circle
+static constexpr float kSiriHueDrift = 14.0f;          // deg hue wander over time
 
-// "Voice ripple" geometry. kRippleCenterY is the shared ring center just below
-// the pet's face; line segments are only placed on the lower arc (y >= center)
-// so they never climb over the pet above. Each ring has a base radius plus a
-// voice-driven outward surge that grows stronger toward the outside
-// (kRippleTravel), so ripples visibly spread from inner to outer. Each ring's
-// lower arc is tiled from kRippleSegCounts[r] small squares, spaced to overlap
-// by ~1px so the row joins into smooth continuous ripple lines. Angles are
-// degrees from the right axis (0 = right, 90 = straight down).
-static constexpr int kRippleSquareSize = 3;
-static constexpr int kRippleCenterY = 268;
-static constexpr int kRippleBaseRadius[kRippleRings] = {28, 48, 68};
-static constexpr float kRippleTravel[kRippleRings] = {1.0f, 1.3f, 1.6f};
-static constexpr int kRippleMinAngle = 25;
-static constexpr int kRippleMaxAngle = 155;
-static constexpr int kRippleMaxRadius = 88;  // cap so the bottom arc stays on screen
+// HSV (h in deg, s/v in [0,1]) -> GFX RGB565. Siri's spectrum is a hue sweep,
+// so animating hue keeps the whole bar row alive instead of a static gradient.
+static gfx_color_t HsvToGfxColor(float h, float s, float v) {
+    // Normalize hue to [0,360).
+    h = fmodf(h, 360.0f);
+    if (h < 0.0f) {
+        h += 360.0f;
+    }
+    const float c = v * s;
+    const float hp = h / 60.0f;
+    const float x = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    if (hp < 1.0f) {
+        r = c; g = x;
+    } else if (hp < 2.0f) {
+        r = x; g = c;
+    } else if (hp < 3.0f) {
+        g = c; b = x;
+    } else if (hp < 4.0f) {
+        g = x; b = c;
+    } else if (hp < 5.0f) {
+        r = x; b = c;
+    } else {
+        r = c; b = x;
+    }
+    const float m = v - c;
+    const uint32_t ri = static_cast<uint32_t>((r + m) * 255.0f);
+    const uint32_t gi = static_cast<uint32_t>((g + m) * 255.0f);
+    const uint32_t bi = static_cast<uint32_t>((b + m) * 255.0f);
+    return GFX_COLOR_HEX((ri << 16) | (gi << 8) | bi);
+}
+
+// Colour for bar i at animation phase t (sec) with relative energy [0,1]:
+// hue sweeps cyan(centre) -> pink(edge), slowly drifts with t, and brightness
+// follows the bar's energy so high bars glow brighter.
+static gfx_color_t SiriBarColor(int i, float t, float energy) {
+    const float half = (kSiriBarCount - 1) / 2.0f;
+    const float pos = fabsf(static_cast<float>(i) - half) / half;  // 0 centre .. 1 edge
+    // Map position to hue: 205 (cyan) centre -> 320 (pink) edge, plus the
+    // time drift so the whole sweep slowly breathes through the spectrum.
+    const float hue = 205.0f + pos * 115.0f + kSiriHueDrift * sinf(t * 0.09f);
+    const float sat = 0.85f;
+    // Brightness rides the bar height: quiet bars dim, tall bars glow.
+    const float val = 0.72f + 0.28f * energy;
+    return HsvToGfxColor(hue, sat, val);
+}
 
 // ============================================================================
 // Forward Declarations
@@ -128,6 +160,12 @@ static emote_handle_t InitializeEmote(EmoteDisplay* self, const int width, const
                 .swap = true,
                 .double_buffer = true,
                 .buff_dma = false,
+                // Render buffers in PSRAM: keeps 23KB of double-buffering out
+                // of internal RAM, which is what starves the I2S wake path
+                // (i2s_alloc_dma_desc OOM crash). SPI flushes copy through a
+                // small temp internal DMA buffer per chunk - slower but stable;
+                // direct PSRAM DMA (psram_dma_direct) underflows at 40MHz.
+                .buff_spiram = true,
             },
         .gfx_emote =
             {
@@ -229,38 +267,35 @@ void EmoteDisplay::RestoreFromReminder() {
     StartIdleAnimation();
 }
 
-// Conversation "voice ripple" overlay: concentric rings fanning outward from a
-// point just below the pet, composited over the live pet face (panel stays
-// owned by emote, so the pet keeps animating). Emote can't draw arcs, so each
-// ring's lower arc is tiled from small overlapping squares (kRippleSegCounts[r]
-// per ring), colored by radius and rippling outward with the voice (see
-// AnimateConversationRipple). The squares are named labels with a solid
-// background, created once and cached. Only the lower arc is drawn (y >= center)
-// so the ripples never climb over the pet's face above.
+// Conversation "Siri-style voice spectrum": a row of vertical bars fanning up
+// from the round panel's bottom arc, composited over the live pet face (panel
+// stays owned by emote, so the pet keeps animating). Emote can't draw arcs or
+// gradients, so each bar is a named label with a solid background, created
+// once and cached; every animation tick re-sizes/re-positions them (see
+// AnimateConversationRipple). Bars are tallest and brightest in the centre,
+// cooling to the edges, so the whole row reads as a Siri voice spectrum.
 void EmoteDisplay::EnsureConversationUi() {
     if (!emote_handle_ || conversation_ui_ready_) {
         return;
     }
     emote_lock(emote_handle_);
     const int cx = width_ / 2;
-    int flat = 0;
-    for (int r = 0; r < kRippleRings; ++r) {
-        for (int s = 0; s < kRippleSegCounts[r]; ++s, ++flat) {
-            char name[24];
-            snprintf(name, sizeof(name), "vocat_rip_r%d_s%d", r, s);
-            gfx_obj_t* sq =
-                emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name);
-            if (sq) {
-                gfx_label_set_text(sq, "");
-                gfx_label_set_bg_enable(sq, true);
-                gfx_label_set_bg_color(sq, kRippleColor[r]);
-                // Park each square at its ring's bottom until the first tick.
-                gfx_obj_set_size(sq, kRippleSquareSize, kRippleSquareSize);
-                gfx_obj_set_pos(sq, cx - kRippleSquareSize / 2,
-                                kRippleCenterY + kRippleBaseRadius[r] - kRippleSquareSize / 2);
-            }
-            conversation_segs_[flat] = sq;
+    for (int i = 0; i < kSiriBarCount; ++i) {
+        char name[24];
+        snprintf(name, sizeof(name), "vocat_siri_b%d", i);
+        gfx_obj_t* bar =
+            emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name);
+        if (bar) {
+            gfx_label_set_text(bar, "");
+            gfx_label_set_bg_enable(bar, true);
+            gfx_label_set_bg_color(bar, SiriBarColor(i, 0.0f, 0.5f));
+            // Park each bar at the bottom of the panel until the first tick.
+            const int dx = (i - (kSiriBarCount - 1) / 2) * kSiriBarSpacing;
+            gfx_obj_set_size(bar, kSiriBarWidth, kSiriBarHeightMin);
+            gfx_obj_set_pos(bar, cx + dx - kSiriBarWidth / 2,
+                            static_cast<gfx_coord_t>(height_ - kSiriBarHeightMin));
         }
+        conversation_bars_[i] = bar;
     }
     gfx_obj_t* status =
         emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "vocat_conv_status");
@@ -271,8 +306,9 @@ void EmoteDisplay::EnsureConversationUi() {
         gfx_label_set_long_mode(status, GFX_LABEL_LONG_CLIP);
         gfx_label_set_bg_enable(status, true);
         gfx_label_set_bg_color(status, kColorDarkBg);
-        gfx_obj_set_size(status, 120, 28);
-        gfx_obj_align(status, GFX_ALIGN_BOTTOM_MID, 0, -6);
+        // Status sits at the very top so the spectrum bars own the bottom arc.
+        gfx_obj_set_size(status, 96, 24);
+        gfx_obj_align(status, GFX_ALIGN_TOP_MID, 0, 8);
         gfx_obj_set_visible(status, false);
     }
     conversation_status_ = status;
@@ -293,9 +329,9 @@ void EmoteDisplay::ShowConversationOverlay(bool speaking) {
         gfx_label_set_text(conversation_status_, speaking ? "正在说" : "正在听");
         gfx_obj_set_visible(conversation_status_, true);
     }
-    for (int i = 0; i < kRippleSegTotal; ++i) {
-        if (conversation_segs_[i]) {
-            gfx_obj_set_visible(conversation_segs_[i], true);
+    for (int i = 0; i < kSiriBarCount; ++i) {
+        if (conversation_bars_[i]) {
+            gfx_obj_set_visible(conversation_bars_[i], true);
         }
     }
     emote_unlock(emote_handle_);
@@ -328,9 +364,9 @@ void EmoteDisplay::HideConversationOverlay() {
     if (conversation_status_) {
         gfx_obj_set_visible(conversation_status_, false);
     }
-    for (int i = 0; i < kRippleSegTotal; ++i) {
-        if (conversation_segs_[i]) {
-            gfx_obj_set_visible(conversation_segs_[i], false);
+    for (int i = 0; i < kSiriBarCount; ++i) {
+        if (conversation_bars_[i]) {
+            gfx_obj_set_visible(conversation_bars_[i], false);
         }
     }
     emote_unlock(emote_handle_);
@@ -427,49 +463,48 @@ void EmoteDisplay::AnimateConversationRipple() {
     }
     const float t = static_cast<float>(conversation_phase_++);
     const bool speaking = conversation_speaking_;
-    // Ripple energy per mode: how far the rings surge outward and how fast the
-    // wave rolls. Speaking = strong + lively outward spread; listening = gentle.
-    float amp, speed;
-    if (speaking) {
-        amp = 22.0f;
-        speed = 0.65f;
-    } else {
-        amp = 9.0f;
-        speed = 0.35f;
-    }
-    constexpr float kD2R = 0.01745329252f;  // pi / 180
-    const int w = width_;
-    const int cx = w / 2;
-    const float a_min = static_cast<float>(kRippleMinAngle) * kD2R;
+    // Voice energy per mode: speaking = tall, lively travelling waves; listening
+    // = gentle breathing.
+    const float max_h = speaking ? static_cast<float>(kSiriBarHeightMaxSpeaking)
+                                 : static_cast<float>(kSiriBarHeightMaxListen);
+    const float speed = speaking ? 0.45f : 0.25f;
+    const float cx = width_ / 2.0f;
+    const int half = (kSiriBarCount - 1) / 2;  // 12: index of the centre bar
     emote_lock(emote_handle_);
-    int flat = 0;
-    for (int r = 0; r < kRippleRings; ++r) {
-        // Outward-traveling wave: outer rings lag the inner ones (phase offset)
-        // and surge further (kRippleTravel), so the ripples read as spreading
-        // out from the pet instead of swelling all at once.
-        const float wave = 0.5f + 0.5f * sinf(t * speed + r * 1.15f);
-        float radius = static_cast<float>(kRippleBaseRadius[r]) + amp * kRippleTravel[r] * wave;
-        if (radius > static_cast<float>(kRippleMaxRadius)) {
-            radius = static_cast<float>(kRippleMaxRadius);
+    for (int i = 0; i < kSiriBarCount; ++i) {
+        gfx_obj_t* bar = conversation_bars_[i];
+        if (bar == nullptr) {
+            continue;
         }
-        const int count = kRippleSegCounts[r];
-        const float a_step = static_cast<float>(kRippleMaxAngle - kRippleMinAngle) * kD2R /
-                             static_cast<float>(count - 1);
-        for (int s = 0; s < count; ++s, ++flat) {
-            gfx_obj_t* sq = conversation_segs_[flat];
-            if (sq == nullptr) {
-                continue;
-            }
-            // Place equal-size squares along the arc. Each ring's count is sized
-            // so adjacent squares overlap by ~1px even at max surge, so the row
-            // reads as a smooth continuous line rather than separate dots.
-            const float a = a_min + a_step * static_cast<float>(s);
-            const int x = static_cast<int>(static_cast<float>(cx) + radius * cosf(a)) -
-                          kRippleSquareSize / 2;
-            const int y = static_cast<int>(static_cast<float>(kRippleCenterY) + radius * sinf(a)) -
-                          kRippleSquareSize / 2;
-            gfx_obj_set_pos(sq, x, y);
+        const float dx = static_cast<float>((i - half) * kSiriBarSpacing);
+        // Envelope: tallest at the centre, smooth falloff to the edges (cos
+        // quarter-wave -> 1 centre, 0 edge).
+        const float f = fabsf(dx) / static_cast<float>(half * kSiriBarSpacing);
+        const float env = cosf(f * 1.5707963f);
+        // Travelling wave: the phase advances with x, so the bars roll across
+        // the spectrum like sound energy instead of swelling in place.
+        const float wave = 0.5f + 0.5f * sinf(t * speed - static_cast<float>(i) * 0.38f);
+        // Speaking adds a slower second harmonic so the spectrum has a lively,
+        // speech-like beat rather than a uniform pump.
+        float mod = 1.0f;
+        if (speaking) {
+            mod = 0.85f + 0.15f * sinf(t * 0.11f + static_cast<float>(i) * 0.21f);
         }
+        float h = max_h * env * (0.25f + 0.75f * wave) * mod;
+        if (h < static_cast<float>(kSiriBarHeightMin)) {
+            h = static_cast<float>(kSiriBarHeightMin);
+        }
+        // Colour follows motion: hue drifts slowly over time and brightness
+        // tracks the bar's height, so tall bars glow and the row shimmers.
+        const float energy = h / max_h;
+        gfx_label_set_bg_color(bar, SiriBarColor(i, t * 0.1f, energy));
+        // The bar base sits on the round panel's bottom arc, so the row hugs
+        // the circular edge (higher at the sides, lowest at the very bottom).
+        const float y_base = (height_ / 2.0f) +
+                             sqrtf(kSiriPanelRadius * kSiriPanelRadius - dx * dx);
+        gfx_obj_set_size(bar, kSiriBarWidth, static_cast<uint16_t>(h));
+        gfx_obj_set_pos(bar, static_cast<gfx_coord_t>(cx + dx - kSiriBarWidth / 2.0f),
+                        static_cast<gfx_coord_t>(y_base - h));
     }
     emote_unlock(emote_handle_);
 }
@@ -618,7 +653,7 @@ void EmoteDisplay::StartIdleAnimation() {
             SetEmotion(idle_emotions_[current_idle_index_].c_str());
         }
         // Start timer to cycle emotions (every 3 seconds)
-        esp_timer_start_periodic(idle_anim_timer_, 30000000);
+        esp_timer_start_periodic(idle_anim_timer_, 3000000);
         ESP_LOGI(TAG, "Idle animation started");
     }
 }
