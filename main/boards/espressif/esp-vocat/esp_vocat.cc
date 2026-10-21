@@ -1418,7 +1418,13 @@ private:
         // While a reminder is active, it is the highest-priority presentation
         // (spec §3.4): suppress pet feedback so it does not overwrite it.
         if (!reminder_active_) {
-            ShowTemporaryEmotion("happy", 2000);
+            // Alternate the petting feedback between two affectionate faces so
+            // repeated pets read as growing pleasure, not a static smile.
+            static const char* kPetEmotions[] = {"happy", "loving"};
+            static size_t pet_face_index = 0;
+            const char* pet_emotion = kPetEmotions[pet_face_index % 2];
+            ++pet_face_index;
+            ShowTemporaryEmotion(pet_emotion, 2000);
         }
     }
 
