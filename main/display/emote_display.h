@@ -100,9 +100,14 @@ private:
     // random). The pet stays centered and calm; the bars stay below it. Emote
     // fills don't blend opacity and there are no arcs, so each bar is a solid
     // label whose height is re-sized every animation tick (motion via size/pos).
+    // Show fades the wave in (opa 0->255) and Hide fades it out, so a
+    // conversation never pops on/off the screen.
     void EnsureConversationUi();
     void AnimateConversationRipple();
     static void ConversationTimerCallback(void* arg);
+    void StartConversationFade(bool fade_in);
+    static void ConversationFadeTimerCallback(void* arg);
+    void ApplyConversationOpa(uint8_t opa);
 
     // Emotion-learning lesson caption helpers.
     void EnsureLessonUi();
@@ -120,10 +125,12 @@ private:
     gfx_obj_t* conversation_status_ = nullptr;
     gfx_obj_t* conversation_bars_[kSiriBarCount] = {};
     esp_timer_handle_t conversation_timer_ = nullptr;
+    esp_timer_handle_t conversation_fade_timer_ = nullptr;
     bool conversation_active_ = false;
     bool conversation_speaking_ = false;
     uint32_t conversation_phase_ = 0;
     std::atomic<bool> conversation_ui_ready_ = false;
+    int conversation_opa_ = 0;  // current overlay opacity 0..255 (fade progress)
 
     // Emotion-learning lesson: a single caption label over the pet face showing
     // the demonstrated emotion's name + progress ("开心 · 3/8"). Created lazily,

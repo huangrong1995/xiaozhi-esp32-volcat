@@ -208,7 +208,7 @@ EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
       idle_anim_timer_(nullptr),
       is_idle_(false),
       current_idle_index_(0),
-      idle_emotions_({"happy", "confused", "angry", "shocked"}) {
+      idle_emotions_({"happy", "loving", "neutral", "confused"}) {
     width_ = width;
     height_ = height;
     panel_ = panel;
@@ -240,6 +240,11 @@ EmoteDisplay::~EmoteDisplay() {
         esp_timer_stop(conversation_timer_);
         esp_timer_delete(conversation_timer_);
         conversation_timer_ = nullptr;
+    }
+    if (conversation_fade_timer_) {
+        esp_timer_stop(conversation_fade_timer_);
+        esp_timer_delete(conversation_fade_timer_);
+        conversation_fade_timer_ = nullptr;
     }
     if (emote_handle_) {
         emote_deinit(emote_handle_);
@@ -324,14 +329,18 @@ void EmoteDisplay::ShowConversationOverlay(bool speaking) {
     if (!conversation_ui_ready_) {
         return;
     }
+    // Reset the fade progress so the overlay re-enters fully transparent.
+    conversation_opa_ = 0;
     emote_lock(emote_handle_);
     if (conversation_status_) {
         gfx_label_set_text(conversation_status_, speaking ? "正在说" : "正在听");
         gfx_obj_set_visible(conversation_status_, true);
+        gfx_label_set_opa(conversation_status_, 0);
     }
     for (int i = 0; i < kSiriBarCount; ++i) {
         if (conversation_bars_[i]) {
             gfx_obj_set_visible(conversation_bars_[i], true);
+            gfx_label_set_opa(conversation_bars_[i], 0);
         }
     }
     emote_unlock(emote_handle_);
@@ -349,24 +358,91 @@ void EmoteDisplay::ShowConversationOverlay(bool speaking) {
         esp_timer_create(&args, &conversation_timer_);
     }
     esp_timer_start_periodic(conversation_timer_, 100000);  // 10fps both modes
+    // Fade the wave in from transparent (short, ~250ms).
+    StartConversationFade(true);
 }
 
 void EmoteDisplay::HideConversationOverlay() {
     ESP_LOGI(TAG, "HideConversationOverlay");
     conversation_active_ = false;
+    // Stop the wave animation; the fade timer keeps running to dissolve the
+    // overlay out (short, ~250ms) instead of popping it off instantly.
     if (conversation_timer_ != nullptr) {
         esp_timer_stop(conversation_timer_);
     }
+    StartConversationFade(false);
+}
+
+// Fade the conversation overlay in/out. fade_in=true ramps 0->255; fade_out
+// ramps 255->0 then hides the objects. Driven by a lightweight one-shot chain
+// on the esp_timer task (10ms steps -> ~250ms total per direction).
+void EmoteDisplay::StartConversationFade(bool fade_in) {
+    if (conversation_fade_timer_ == nullptr) {
+        esp_timer_create_args_t args = {
+            .callback = &EmoteDisplay::ConversationFadeTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "conv_fade",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&args, &conversation_fade_timer_);
+    }
+    // Fade target: full for in, hidden for out.
+    conversation_opa_ = fade_in ? 0 : 255;
+    ApplyConversationOpa(static_cast<uint8_t>(conversation_opa_));
+    esp_timer_start_once(conversation_fade_timer_, 10000);  // 10ms per step
+}
+
+void EmoteDisplay::ConversationFadeTimerCallback(void* arg) {
+    auto* self = static_cast<EmoteDisplay*>(arg);
+    if (self == nullptr) {
+        return;
+    }
+    const int step = 26;  // ~255/10 steps, 10ms each -> ~250ms full fade
+    bool fading_in = (self->conversation_opa_ < 255);
+    self->conversation_opa_ = fading_in
+                                  ? (self->conversation_opa_ + step > 255
+                                         ? 255
+                                         : self->conversation_opa_ + step)
+                                  : (self->conversation_opa_ - step < 0
+                                         ? 0
+                                         : self->conversation_opa_ - step);
+    self->ApplyConversationOpa(static_cast<uint8_t>(self->conversation_opa_));
+    const bool done = fading_in ? (self->conversation_opa_ >= 255) : (self->conversation_opa_ <= 0);
+    if (done) {
+        if (!fading_in) {
+            // Fade-out finished: actually hide the overlay objects.
+            if (!self->conversation_ui_ready_) {
+                return;
+            }
+            emote_lock(self->emote_handle_);
+            if (self->conversation_status_) {
+                gfx_obj_set_visible(self->conversation_status_, false);
+            }
+            for (int i = 0; i < kSiriBarCount; ++i) {
+                if (self->conversation_bars_[i]) {
+                    gfx_obj_set_visible(self->conversation_bars_[i], false);
+                }
+            }
+            emote_unlock(self->emote_handle_);
+        }
+    } else {
+        esp_timer_start_once(self->conversation_fade_timer_, 10000);
+    }
+}
+
+// Apply the current overlay opacity to the status label and all bars.
+void EmoteDisplay::ApplyConversationOpa(uint8_t opa) {
     if (!conversation_ui_ready_) {
         return;
     }
     emote_lock(emote_handle_);
     if (conversation_status_) {
-        gfx_obj_set_visible(conversation_status_, false);
+        gfx_label_set_opa(conversation_status_, opa);
     }
     for (int i = 0; i < kSiriBarCount; ++i) {
         if (conversation_bars_[i]) {
-            gfx_obj_set_visible(conversation_bars_[i], false);
+            gfx_label_set_opa(conversation_bars_[i], opa);
         }
     }
     emote_unlock(emote_handle_);
