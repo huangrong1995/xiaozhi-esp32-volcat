@@ -261,12 +261,49 @@ void EmoteDisplay::SetEmotion(const char* const emotion) {
 
 void EmoteDisplay::ShowReminder(const char* emotion) {
     // Pause idle animation so it does not overwrite the reminder, then present
-    // the reminder emotion.
+    // the reminder emotion plus a hint telling the child how to acknowledge it.
     StopIdleAnimation();
     SetEmotion(emotion);
+    EnsureReminderHint();
+    if (reminder_hint_ready_) {
+        emote_lock(emote_handle_);
+        gfx_obj_set_visible(reminder_hint_, true);
+        emote_unlock(emote_handle_);
+    }
+}
+
+// Lazily build the reminder hint caption ("点击确认 · 长按忽略"). One label,
+// bottom strip like the lesson caption; hidden by RestoreFromReminder.
+void EmoteDisplay::EnsureReminderHint() {
+    if (!emote_handle_ || reminder_hint_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_t* hint = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                               "vocat_reminder_hint");
+    if (hint) {
+        gfx_label_set_text(hint, "点击确认 · 长按忽略");
+        gfx_label_set_color(hint, kColorWhite);
+        gfx_label_set_text_align(hint, GFX_TEXT_ALIGN_CENTER);
+        gfx_label_set_long_mode(hint, GFX_LABEL_LONG_CLIP);
+        gfx_label_set_bg_enable(hint, true);
+        gfx_label_set_bg_color(hint, kColorDarkBg);
+        gfx_obj_set_size(hint, 220, 30);
+        gfx_obj_align(hint, GFX_ALIGN_BOTTOM_MID, 0, -12);
+        gfx_obj_set_visible(hint, false);
+    }
+    reminder_hint_ = hint;
+    reminder_hint_ready_ = true;
+    emote_unlock(emote_handle_);
 }
 
 void EmoteDisplay::RestoreFromReminder() {
+    // Hide the acknowledgment hint once the reminder is handled.
+    if (reminder_hint_ready_) {
+        emote_lock(emote_handle_);
+        gfx_obj_set_visible(reminder_hint_, false);
+        emote_unlock(emote_handle_);
+    }
     // Return to the standby presentation. StartIdleAnimation() is a no-op when
     // idle is already running, so this is safe to call at any time.
     StartIdleAnimation();

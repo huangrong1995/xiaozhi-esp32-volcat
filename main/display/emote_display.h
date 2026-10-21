@@ -51,9 +51,14 @@ public:
     void RefreshAll();
 
     // Reminder presentation: pause idle animation and show the reminder emotion.
-    // RestoreFromReminder() returns to the standby/mode presentation.
+    // The hint caption tells the child how to acknowledge it (tap = confirm /
+    // ignore-reminder, long-press = snooze); RestoreFromReminder() returns to
+    // the standby/mode presentation.
     void ShowReminder(const char* emotion);
     void RestoreFromReminder();
+
+    // Lazily create + show the reminder hint caption (see ShowReminder).
+    void EnsureReminderHint();
 
     // Conversation "Siri-style voice spectrum" overlay composited over the
     // live pet face. The panel stays owned by emote (the pet keeps animating
@@ -137,6 +142,12 @@ private:
     // shown by ShowEmotionLesson, hidden by HideEmotionLesson.
     gfx_obj_t* lesson_status_ = nullptr;
     std::atomic<bool> lesson_ui_ready_ = false;
+
+    // Reminder hint: a small caption telling the child how to acknowledge the
+    // current reminder. Created lazily (EnsureReminderHint), shown with each
+    // reminder and hidden on restore.
+    gfx_obj_t* reminder_hint_ = nullptr;
+    std::atomic<bool> reminder_hint_ready_ = false;
 };
 
 }  // namespace emote
