@@ -25,6 +25,14 @@ enum class ScreenId {
     ConversationOverlay,
 };
 
+// Direction for the page-switch animation, so a swipe feels like the content
+// follows the finger (iPhone-style navigation) instead of always fading.
+enum class ScreenSlide {
+    Fade,            // default: gentle cross-fade (also used for returns)
+    SlideFromRight,  // new screen enters from the right (left-swipe forward)
+    SlideFromLeft,   // new screen enters from the left (right-swipe forward)
+};
+
 // Owns the single ST77916 round panel and hands it alternately to the emote
 // pet renderer (Home / conversation) and to a real LVGL scene (pages). Exactly
 // one renderer may flush the panel at a time; RenderSwitch serializes them.
@@ -96,8 +104,9 @@ public:
     // driving stays with the board via display_->SetEmotion(...).
     void ShowHome();
 
-    // Switch to the given LVGL page screen (solid-color stand-in for now).
-    void ShowScreen(ScreenId id);
+    // Switch to the given LVGL page screen. The optional slide picks the
+    // screen-transition animation direction (see ScreenSlide).
+    void ShowScreen(ScreenId id, ScreenSlide slide = ScreenSlide::Fade);
 
     // Show/hide the conversation. on = keep the panel on the emote pet face and
     // composite the "Siri-style" waveform + status overlay over the live pet
@@ -178,7 +187,7 @@ public:
     // state so SetConversationActive(true) can apply the latest desired state.
     void SetSpeaking(bool speaking);
 
-    // --- Touch input (LVGL page screens) --------------------------------------
+    // --- Touch input (LVGL page screens) ----------------------------------------
     // Feed a CST816S press/release point into the LVGL pointer input device so
     // the on-screen controls (Settings steppers / back, EmotionLearning step /
     // start) receive click events. The board's touch task calls this on every
@@ -218,7 +227,7 @@ private:
     static void SettingsBackEventCb(lv_event_t* e);
 
     // Build (once) and show the settings screen; reused across ShowScreen calls.
-    void BuildSettingsScreen();
+    void BuildSettingsScreen(ScreenSlide slide = ScreenSlide::Fade);
     // Build one circular instrument inside the settings face: a dim arc track, a
     // cyan value arc, a central readout, and − / ＋ hit areas.
     void BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** value_label_out,
@@ -247,9 +256,12 @@ private:
 
     static void EmotionLearningStartEventCb(lv_event_t* e);
 
+    // Dial snap animation: eases the ring to the nearest tick on drag release.
+    static void EmotionDialAnimExecCb(void* var, int32_t value);
+
     // Build (once) and show the emotion learning screen; reused across
     // ShowScreen calls. Its back button reuses the shared back_to_home_cb_.
-    void BuildEmotionLearningScreen();
+    void BuildEmotionLearningScreen(ScreenSlide slide = ScreenSlide::Fade);
     // Re-position the 8 scale ticks to the current dial rotation and highlight
     // the tick nearest the top (12 o'clock), updating the central label to the
     // emotion under it. Single render path for both explicit sets and drags.
@@ -267,6 +279,8 @@ private:
     // next emotion. Set implicitly by SetEmotionLearningName / EndEmotionDialDrag;
     // tracked live during a drag.
     float emotion_dial_rotation_ = 0.0f;
+    // Reusable snap animation for the dial (see EndEmotionDialDrag).
+    lv_anim_t emotion_dial_anim_ = {};
     StartCb start_learning_cb_;
     EmotionDialSettledCb emotion_dial_settled_cb_;
 

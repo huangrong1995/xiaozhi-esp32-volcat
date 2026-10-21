@@ -348,7 +348,7 @@ void EmoteDisplay::ShowConversationOverlay(bool speaking) {
         };
         esp_timer_create(&args, &conversation_timer_);
     }
-    esp_timer_start_periodic(conversation_timer_, speaking ? 100000 : 200000);
+    esp_timer_start_periodic(conversation_timer_, 100000);  // 10fps both modes
 }
 
 void EmoteDisplay::HideConversationOverlay() {
@@ -446,7 +446,7 @@ void EmoteDisplay::SetConversationSpeaking(bool speaking) {
     emote_unlock(emote_handle_);
     if (conversation_timer_ != nullptr) {
         esp_timer_stop(conversation_timer_);
-        esp_timer_start_periodic(conversation_timer_, speaking ? 100000 : 200000);
+        esp_timer_start_periodic(conversation_timer_, 100000);  // 10fps both modes
     }
 }
 

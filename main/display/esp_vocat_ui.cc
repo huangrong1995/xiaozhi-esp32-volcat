@@ -60,6 +60,21 @@ constexpr lv_coord_t kStepperPillWidth = 96;
 // the RGB565 round panel).
 constexpr uint32_t kScreenFadeMs = 200;
 
+// Map our ScreenSlide to LVGL's screen-load animation. Fade = gentle cross-fade
+// (used for returns); SlideFromRight = the new page slides in from the right
+// (matches a left-swipe forward); SlideFromLeft = from the left (right-swipe).
+lv_screen_load_anim_t ScreenAnimFor(ScreenSlide slide) {
+    switch (slide) {
+        case ScreenSlide::SlideFromRight:
+            return LV_SCREEN_LOAD_ANIM_MOVE_LEFT;  // new screen comes from the right
+        case ScreenSlide::SlideFromLeft:
+            return LV_SCREEN_LOAD_ANIM_MOVE_RIGHT;  // new screen comes from the left
+        case ScreenSlide::Fade:
+        default:
+            return LV_SCREEN_LOAD_ANIM_FADE_IN;
+    }
+}
+
 // Shared style objects, constructed once via EnsureSharedStyles() (LVGL v9
 // pointer API), then attached to widgets with lv_obj_add_style.
 lv_style_t g_style_screen_bg;     // F2F2F7 opaque page background
@@ -387,15 +402,14 @@ void EspVocatUi::FeedTouch(int x, int y, bool pressed) {
     touch_pressed_.store(pressed);
 }
 
-void EspVocatUi::ShowScreen(ScreenId id) {
+void EspVocatUi::ShowScreen(ScreenId id, ScreenSlide slide) {
     // The page screens always supply a build callback; the conversation is not a
     // page (it stays composited over the pet via SetConversationActive), and Home
-    // returns the panel to emote via ShowHome, so nothing needs the solid-color
-    // fallback anymore.
+    // returns the panel to emote via ShowHome.
     if (id == ScreenId::Settings) {
-        render_switch_.ShowLvgl(id, [this]() { BuildSettingsScreen(); });
+        render_switch_.ShowLvgl(id, [this, slide]() { BuildSettingsScreen(slide); });
     } else if (id == ScreenId::EmotionLearning) {
-        render_switch_.ShowLvgl(id, [this]() { BuildEmotionLearningScreen(); });
+        render_switch_.ShowLvgl(id, [this, slide]() { BuildEmotionLearningScreen(slide); });
     }
     current_ = id;
 }
@@ -464,11 +478,11 @@ void EspVocatUi::SettingsBackEventCb(lv_event_t* e) {
     }
 }
 
-void EspVocatUi::BuildSettingsScreen() {
+void EspVocatUi::BuildSettingsScreen(ScreenSlide slide) {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
     if (settings_screen_ != nullptr) {
-        lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
+        lv_screen_load_anim(settings_screen_, ScreenAnimFor(slide), kScreenFadeMs, 0, false);
         RefreshSettingsValueLabel(true);
         RefreshSettingsValueLabel(false);
         return;
@@ -511,7 +525,7 @@ void EspVocatUi::BuildSettingsScreen() {
     BuildSettingsRow(card, "音量", &volume_value_label_, false, 72);
 
     settings_screen_ = scr;
-    lv_screen_load_anim(settings_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
+    lv_screen_load_anim(settings_screen_, ScreenAnimFor(slide), kScreenFadeMs, 0, false);
     RefreshSettingsValueLabel(true);
     RefreshSettingsValueLabel(false);
     ESP_LOGI(TAG, "EspVocatUi: settings screen built");
@@ -569,7 +583,12 @@ void EspVocatUi::BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** v
     lv_obj_add_style(minus, &g_style_pressed, LV_STATE_PRESSED);
     lv_obj_set_size(minus, 48, 40);
     lv_obj_align(minus, LV_ALIGN_BOTTOM_LEFT, 4, -4);
+    // Click steps once; long-press auto-repeats (LVGL fires LONG_PRESSED_REPEAT
+    // every long_press_repeat_time while held), so holding − / + sweeps the
+    // value instead of requiring repeated taps.
     lv_obj_add_event_cb(minus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
+                        new SettingsStepTarget{this, is_brightness, -1});
+    lv_obj_add_event_cb(minus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_LONG_PRESSED_REPEAT,
                         new SettingsStepTarget{this, is_brightness, -1});
     lv_obj_t* minus_label = lv_label_create(minus);
     lv_label_set_text(minus_label, "-");
@@ -582,6 +601,8 @@ void EspVocatUi::BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** v
     lv_obj_set_size(plus, 48, 40);
     lv_obj_align(plus, LV_ALIGN_BOTTOM_RIGHT, -4, -4);
     lv_obj_add_event_cb(plus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_CLICKED,
+                        new SettingsStepTarget{this, is_brightness, +1});
+    lv_obj_add_event_cb(plus, EspVocatUi::SettingsStepperEventCb, LV_EVENT_LONG_PRESSED_REPEAT,
                         new SettingsStepTarget{this, is_brightness, +1});
     lv_obj_t* plus_label = lv_label_create(plus);
     lv_label_set_text(plus_label, "+");
@@ -659,11 +680,11 @@ void EspVocatUi::EmotionLearningStartEventCb(lv_event_t* e) {
     }
 }
 
-void EspVocatUi::BuildEmotionLearningScreen() {
+void EspVocatUi::BuildEmotionLearningScreen(ScreenSlide slide) {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
     if (emotion_screen_ != nullptr) {
-        lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
+        lv_screen_load_anim(emotion_screen_, ScreenAnimFor(slide), kScreenFadeMs, 0, false);
         if (emotion_name_label_ != nullptr) {
             lv_label_set_text(emotion_name_label_, emotion_name_.c_str());
         }
@@ -759,7 +780,7 @@ void EspVocatUi::BuildEmotionLearningScreen() {
     emotion_screen_ = scr;
     // Apply the cached/initial rotation and highlight once all ticks exist.
     RefreshEmotionDial();
-    lv_screen_load_anim(emotion_screen_, LV_SCREEN_LOAD_ANIM_FADE_IN, kScreenFadeMs, 0, false);
+    lv_screen_load_anim(emotion_screen_, ScreenAnimFor(slide), kScreenFadeMs, 0, false);
     ESP_LOGI(TAG, "EspVocatUi: emotion learning screen built");
 }
 
@@ -828,13 +849,42 @@ void EspVocatUi::RotateEmotionDial(float clockwise_deg) {
     RefreshEmotionDial();
 }
 
+// Animation exec for the dial snap: rotate the ring to the animated value.
+// LVGL exec callbacks receive (var, current_value); var is our EspVocatUi.
+void EspVocatUi::EmotionDialAnimExecCb(void* var, int32_t value) {
+    auto* self = static_cast<EspVocatUi*>(var);
+    if (self == nullptr) {
+        return;
+    }
+    self->emotion_dial_rotation_ = static_cast<float>(value);
+    self->RefreshEmotionDial();
+}
+
 void EspVocatUi::EndEmotionDialDrag() {
     // Snap the dial to the nearest tick so the chosen emotion sits at the top,
     // then tell the board which index was settled (it keeps current_emotion_index_
-    // in sync for the flashcard lesson).
+    // in sync for the flashcard lesson). Animate the snap (short ease-out roll)
+    // so the ring settles smoothly instead of jumping to the tick.
     int sel = SelectedEmotionIndex();
-    emotion_dial_rotation_ = sel * kEmotionTickDeg;
-    RefreshEmotionDial();
+    const float target = static_cast<float>(sel) * kEmotionTickDeg;
+    if (fabsf(target - emotion_dial_rotation_) > 0.5f) {
+        lvgl_port_lock(0);
+        // lv_anim_start copies the struct, so re-initializing the member and
+        // starting it again is the safe reuse pattern (a running animation is
+        // not mutated by touching this member).
+        lv_anim_init(&emotion_dial_anim_);
+        lv_anim_set_var(&emotion_dial_anim_, this);
+        lv_anim_set_exec_cb(&emotion_dial_anim_, EspVocatUi::EmotionDialAnimExecCb);
+        lv_anim_set_path_cb(&emotion_dial_anim_, lv_anim_path_ease_out);
+        lv_anim_set_duration(&emotion_dial_anim_, 160);
+        lv_anim_set_values(&emotion_dial_anim_, static_cast<int32_t>(emotion_dial_rotation_),
+                           static_cast<int32_t>(target));
+        lv_anim_start(&emotion_dial_anim_);
+        lvgl_port_unlock();
+    } else {
+        emotion_dial_rotation_ = target;
+        RefreshEmotionDial();
+    }
     ESP_LOGI(TAG, "EspVocatUi: emotion dial settled on index %d (%s)", sel, kEmotionUiNames[sel]);
     if (emotion_dial_settled_cb_) {
         emotion_dial_settled_cb_(sel);

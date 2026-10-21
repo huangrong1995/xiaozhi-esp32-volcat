@@ -730,6 +730,17 @@ private:
     }
 
     void OnGesture(Gesture gesture) {
+        // A display that fell to level-1 sleep: the first touch is a wake-up
+        // intent, not an action. Light the screen and swallow the gesture so a
+        // tap/swipe meant just to wake cannot start a conversation, enter a
+        // mode, or confirm a reminder. (Level-2 light-sleep wake is handled
+        // separately in ClearStaleWakeTouch.)
+        if (display_sleep_active_) {
+            TouchPowerSaveActivity();  // wakes display + backlight, resets timers
+            ESP_LOGI(TAG, "Gesture %d swallowed: display was asleep, wake only",
+                     static_cast<int>(gesture));
+            return;
+        }
         // Any normalized gesture is interaction: reset both power-save countdowns
         // and wake the display if it had fallen to level-1 sleep (spec §6.2).
         TouchPowerSaveActivity();
@@ -952,13 +963,11 @@ private:
                 ExitToChat();
                 break;
             case Gesture::Tap:
-                // Light touch feedback — but not during a live conversation
-                // overlay, where an audible blip would distract from the dialogue.
-                if (CurrentScreen() == ScreenId::ConversationOverlay) {
-                    break;
-                }
-                ShowTemporaryEmotion("happy", 1500);
-                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+                // On a page, taps are consumed by the on-screen controls (‹ back,
+                // − / + steppers, 开始) whose own pressed/click feedback already
+                // plays. A bare tap on empty page space is a no-op: no extra
+                // sound/emotion (that would double up with a button press, and
+                // empty-space taps have no meaning on a settings/learning page).
                 break;
             default:
                 break;
@@ -1030,8 +1039,9 @@ private:
             return;
         }
         if (gesture == Gesture::Tap) {
-            ShowTemporaryEmotion("happy", 1500);
-            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+            // The on-screen controls (dial drag, 开始 button) consume real taps;
+            // a tap on empty space is a no-op (no double sound/emotion with the
+            // button's own feedback).
             return;
         }
     }
@@ -2032,7 +2042,7 @@ private:
         current_emotion_index_ = 0;
         ShowEmotionLearningCurrent();  // seed the dial's central name before build
         if (ui_ != nullptr) {
-            ui_->ShowScreen(ScreenId::EmotionLearning);
+            ui_->ShowScreen(ScreenId::EmotionLearning, ScreenSlide::SlideFromRight);
         }
         // Play sound to indicate entering learning mode
         auto& audio = Application::GetInstance().GetAudioService();
@@ -2138,7 +2148,7 @@ private:
         current_emotion_index_ = 0;
         ShowEmotionLearningCurrent();
         if (ui_ != nullptr) {
-            ui_->ShowScreen(ScreenId::EmotionLearning);
+            ui_->ShowScreen(ScreenId::EmotionLearning, ScreenSlide::SlideFromRight);
         }
         AfterScreenChange();
         ESP_LOGI(TAG, "Emotion lesson cancelled, back to library");
@@ -2188,7 +2198,7 @@ private:
         self->current_emotion_index_ = 0;
         self->ShowEmotionLearningCurrent();
         if (self->ui_ != nullptr) {
-            self->ui_->ShowScreen(ScreenId::EmotionLearning);
+            self->ui_->ShowScreen(ScreenId::EmotionLearning, ScreenSlide::SlideFromRight);
         }
         self->AfterScreenChange();
         ESP_LOGI(TAG, "Emotion lesson completed");
@@ -2205,7 +2215,7 @@ private:
         // live via the callbacks registered in InitializeSt77916Display.
         ui_->SetSettingsValueBrightness(backlight_ != nullptr ? backlight_->brightness() : 50);
         ui_->SetSettingsValueVolume(Application::GetInstance().GetAudioService().GetOutputVolume());
-        ui_->ShowScreen(ScreenId::Settings);
+        ui_->ShowScreen(ScreenId::Settings, ScreenSlide::SlideFromLeft);
         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
         AfterScreenChange();
         ESP_LOGI(TAG, "Entered settings screen");
@@ -2452,6 +2462,15 @@ private:
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             // A BOOT press is interaction: wake the display / exit light sleep.
+            // If the display had fallen to level-1 sleep, this press is a wake
+            // intent, not a chat toggle — light the screen and swallow so a
+            // key meant just to wake cannot start a conversation (mirrors the
+            // gesture-layer wake-swallow in OnGesture).
+            if (display_sleep_active_) {
+                TouchPowerSaveActivity();
+                ESP_LOGI(TAG, "Boot press swallowed: display was asleep, wake only");
+                return;
+            }
             TouchPowerSaveActivity();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 ESP_LOGI(TAG, "Boot button pressed, enter WiFi configuration mode");
