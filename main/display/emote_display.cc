@@ -42,7 +42,11 @@ static const char* TAG = "EmoteDisplay";
 // Cute-colorful palette shared by the conversation overlay and lesson caption.
 // Values are RGB hex.
 static const gfx_color_t kColorWhite = GFX_COLOR_HEX(0xFFFFFF);
-static const gfx_color_t kColorDarkBg = GFX_COLOR_HEX(0x1A1A2E);
+// Opaque label backdrop. Set to the display's own background (gfx_disp
+// defaults to 0x0000 black), so the caption rectangles are invisible against
+// the screen — white text stays readable over any pet animation without the
+// visible "矩形色差" a lighter panel would produce.
+static const gfx_color_t kColorDarkBg = GFX_COLOR_HEX(0x000000);
 
 // Conversation "Siri-style voice spectrum" palette. The hue sweeps cyan at the
 // centre -> magenta -> pink at the edges; over time the whole sweep drifts
