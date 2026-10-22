@@ -941,6 +941,7 @@ private:
                 // "被摇晃" feedback: shake is meaningful only in Chat (spec §1.3).
                 // Other modes' handlers ignore Shake, so it never advances a mode.
                 ShowTemporaryEmotion("confused", 1800);
+                Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
                 ESP_LOGI(TAG, "Shake feedback (Chat mode)");
                 break;
             default:

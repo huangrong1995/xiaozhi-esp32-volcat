@@ -696,7 +696,20 @@ void EspVocatUi::RefreshSettingsValueLabel(bool is_brightness) {
     lv_label_set_text(label, buf);
     lv_obj_t* arc = is_brightness ? brightness_arc_ : volume_arc_;
     if (arc != nullptr) {
-        lv_arc_set_value(arc, value);
+        // Animate the gauge sweep toward the new value (short ease-out) so the
+        // arc glides instead of snapping. lv_anim_start deletes a running
+        // animation on the same var, so long-press repeat stays continuous —
+        // each step replaces the previous glide rather than queueing.
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, arc);
+        lv_anim_set_exec_cb(&a, [](void* var, int32_t v) {
+            lv_arc_set_value(static_cast<lv_obj_t*>(var), v);
+        });
+        lv_anim_set_values(&a, lv_arc_get_value(arc), value);
+        lv_anim_set_time(&a, 150);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
     }
 }
 
