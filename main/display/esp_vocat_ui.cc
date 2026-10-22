@@ -478,6 +478,30 @@ void EspVocatUi::SettingsBackEventCb(lv_event_t* e) {
     }
 }
 
+// Staggered entrance for a page's major elements: fade in and rise slightly
+// from below, one after another (iPhone-style page composition). Each element
+// animates independently with its own delay, so the title lands first, then
+// the card, then the controls.
+void EspVocatUi::FadeInPageElement(lv_obj_t* obj, uint32_t delay_ms) {
+    if (obj == nullptr) {
+        return;
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_exec_cb(&a, [](void* var, int32_t v) {
+        lv_obj_t* target = static_cast<lv_obj_t*>(var);
+        lv_obj_set_style_opa(target, static_cast<lv_opa_t>(v), 0);
+        // Rise from 12px below to the final position.
+        lv_obj_set_style_translate_y(target, 12 - v * 12 / 255, 0);
+    });
+    lv_anim_set_time(&a, 260);
+    lv_anim_set_delay(&a, delay_ms);
+    lv_anim_set_values(&a, 0, 255);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
 void EspVocatUi::BuildSettingsScreen(ScreenSlide slide) {
     // Build the object tree once and reuse it for the device lifetime; a later
     // ShowScreen just reloads and refreshes the cached labels.
@@ -507,12 +531,14 @@ void EspVocatUi::BuildSettingsScreen(ScreenSlide slide) {
     lv_label_set_text(back_label, "<");
     lv_obj_add_style(back_label, &g_style_accent_text, 0);
     lv_obj_center(back_label);
+    settings_back_ = back;
 
     // Title 设置, centred above the two gauges.
     lv_obj_t* title = lv_label_create(scr);
     lv_label_set_text(title, "设置");
     lv_obj_add_style(title, &g_style_title, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, kNavTitleY);
+    settings_title_ = title;
 
     // One recessed instrument well holding the brightness and volume gauges.
     lv_obj_t* card = lv_obj_create(scr);
@@ -520,6 +546,7 @@ void EspVocatUi::BuildSettingsScreen(ScreenSlide slide) {
     lv_obj_set_size(card, kCardWidth, 228);
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 92);
     lv_obj_add_style(card, &g_style_card, 0);
+    settings_card_ = card;
 
     BuildSettingsRow(card, "亮度", &brightness_value_label_, true, -72);
     BuildSettingsRow(card, "音量", &volume_value_label_, false, 72);
@@ -528,6 +555,11 @@ void EspVocatUi::BuildSettingsScreen(ScreenSlide slide) {
     lv_screen_load_anim(settings_screen_, ScreenAnimFor(slide), kScreenFadeMs, 0, false);
     RefreshSettingsValueLabel(true);
     RefreshSettingsValueLabel(false);
+    // Staggered entrance: title -> card -> back, so the page composes itself
+    // with a gentle iPhone-style rise instead of appearing all at once.
+    FadeInPageElement(settings_back_, 240);
+    FadeInPageElement(settings_title_, 60);
+    FadeInPageElement(settings_card_, 150);
     ESP_LOGI(TAG, "EspVocatUi: settings screen built");
 }
 
@@ -709,16 +741,19 @@ void EspVocatUi::BuildEmotionLearningScreen(ScreenSlide slide) {
     lv_label_set_text(back_label, "<");
     lv_obj_add_style(back_label, &g_style_accent_text, 0);
     lv_obj_center(back_label);
+    emotion_back_ = back;
 
     lv_obj_t* title = lv_label_create(scr);
     lv_label_set_text(title, "情绪学习");
     lv_obj_add_style(title, &g_style_title, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, kNavTitleY);
+    emotion_title_ = title;
 
     lv_obj_t* dial = lv_obj_create(scr);
     lv_obj_remove_style_all(dial);
     lv_obj_set_size(dial, 236, 236);
     lv_obj_align(dial, LV_ALIGN_CENTER, 0, 10);
+    emotion_dial_ = dial;
 
     lv_obj_t* ring = lv_arc_create(dial);
     lv_obj_remove_style_all(ring);
@@ -776,11 +811,18 @@ void EspVocatUi::BuildEmotionLearningScreen(ScreenSlide slide) {
     lv_label_set_text(start_label, "开始");
     lv_obj_add_style(start_label, &g_style_btn_label, 0);
     lv_obj_center(start_label);
+    emotion_start_ = start;
 
     emotion_screen_ = scr;
     // Apply the cached/initial rotation and highlight once all ticks exist.
     RefreshEmotionDial();
     lv_screen_load_anim(emotion_screen_, ScreenAnimFor(slide), kScreenFadeMs, 0, false);
+    // Staggered entrance: title -> dial -> start -> back, gentle iPhone-style
+    // rise so the learning page composes itself instead of popping in.
+    FadeInPageElement(emotion_title_, 60);
+    FadeInPageElement(emotion_dial_, 150);
+    FadeInPageElement(emotion_start_, 240);
+    FadeInPageElement(emotion_back_, 300);
     ESP_LOGI(TAG, "EspVocatUi: emotion learning screen built");
 }
 

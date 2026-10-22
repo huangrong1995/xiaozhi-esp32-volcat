@@ -228,6 +228,12 @@ private:
 
     // Build (once) and show the settings screen; reused across ShowScreen calls.
     void BuildSettingsScreen(ScreenSlide slide = ScreenSlide::Fade);
+    // Staggered entrance for a page's major elements: fade in + rise from a
+    // slight offset, one after another (iPhone-style page composition).
+    void FadeInPageElement(lv_obj_t* obj, uint32_t delay_ms);
+    lv_obj_t* settings_back_ = nullptr;
+    lv_obj_t* settings_title_ = nullptr;
+    lv_obj_t* settings_card_ = nullptr;
     // Build one circular instrument inside the settings face: a dim arc track, a
     // cyan value arc, a central readout, and − / ＋ hit areas.
     void BuildSettingsRow(lv_obj_t* card, const char* name, lv_obj_t** value_label_out,
@@ -262,6 +268,11 @@ private:
     // Build (once) and show the emotion learning screen; reused across
     // ShowScreen calls. Its back button reuses the shared back_to_home_cb_.
     void BuildEmotionLearningScreen(ScreenSlide slide = ScreenSlide::Fade);
+    // Staggered entrance for a page's major elements (see FadeInPageElement).
+    lv_obj_t* emotion_back_ = nullptr;
+    lv_obj_t* emotion_title_ = nullptr;
+    lv_obj_t* emotion_dial_ = nullptr;
+    lv_obj_t* emotion_start_ = nullptr;
     // Re-position the 8 scale ticks to the current dial rotation and highlight
     // the tick nearest the top (12 o'clock), updating the central label to the
     // emotion under it. Single render path for both explicit sets and drags.
