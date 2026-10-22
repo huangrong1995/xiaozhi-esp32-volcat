@@ -959,8 +959,17 @@ private:
             case Gesture::SwipeLeft:
             case Gesture::SwipeRight:
             case Gesture::SwipeUp:
-            case Gesture::LongPress:
                 ExitToChat();
+                break;
+            case Gesture::LongPress:
+                // A long-press that started on an on-screen control (back
+                // chevron, − / + steppers, 开始) is the control's own long-press
+                // (steppers auto-repeat, buttons re-click) — swallow it so the
+                // page is not exited while the child is holding a control. Only
+                // a long-press on empty page space exits to Home.
+                if (!(ui_ != nullptr && ui_->IsPointOnControl(swipe_start_x_, swipe_start_y_))) {
+                    ExitToChat();
+                }
                 break;
             case Gesture::Tap:
                 // On a page, taps are consumed by the on-screen controls (‹ back,
@@ -1030,9 +1039,16 @@ private:
         // Home and a tap gives light feedback, while stray horizontal swipes do
         // nothing (they must never navigate or exit — rotation is the only
         // selector).
-        if (gesture == Gesture::SwipeUp || gesture == Gesture::SwipeDown ||
-            gesture == Gesture::LongPress) {
+        if (gesture == Gesture::SwipeUp || gesture == Gesture::SwipeDown) {
             ExitEmotionLearningMode();
+            return;
+        }
+        if (gesture == Gesture::LongPress) {
+            // Long-press on the 开始 button is the button's own hold feedback,
+            // not a page-exit. Only a long-press on empty space leaves.
+            if (!(ui_ != nullptr && ui_->IsPointOnControl(swipe_start_x_, swipe_start_y_))) {
+                ExitEmotionLearningMode();
+            }
             return;
         }
         if (gesture == Gesture::SwipeLeft || gesture == Gesture::SwipeRight) {

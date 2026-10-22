@@ -402,6 +402,21 @@ void EspVocatUi::FeedTouch(int x, int y, bool pressed) {
     touch_pressed_.store(pressed);
 }
 
+bool EspVocatUi::IsPointOnControl(int x, int y) {
+    // Only meaningful while LVGL owns the panel (a page is shown); on the
+    // Home emote face the LVGL task is stopped and there are no controls.
+    if (!render_switch_.IsLvglActive()) {
+        return false;
+    }
+    bool on_control = false;
+    lvgl_port_lock(0);
+    lv_point_t pt = {x, y};
+    lv_obj_t* hit = lv_indev_search_obj(lv_screen_active(), &pt);
+    on_control = (hit != nullptr) && lv_obj_has_flag(hit, LV_OBJ_FLAG_CLICKABLE);
+    lvgl_port_unlock();
+    return on_control;
+}
+
 void EspVocatUi::ShowScreen(ScreenId id, ScreenSlide slide) {
     // The page screens always supply a build callback; the conversation is not a
     // page (it stays composited over the pet via SetConversationActive), and Home

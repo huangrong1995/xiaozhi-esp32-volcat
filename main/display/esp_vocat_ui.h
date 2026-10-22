@@ -197,6 +197,13 @@ public:
     // are panel-native and map 1:1 to LVGL pixels (360x360, no swap/mirror).
     void FeedTouch(int x, int y, bool pressed);
 
+    // True when the given panel point sits on a clickable LVGL control of the
+    // currently shown page (back chevron, − / + steppers, 开始). Used by the
+    // board's gesture layer to swallow long-presses that land on a control
+    // (those are the control's own long-press-repeat, not a page-exit).
+    // Safe to call while LVGL owns the panel (it takes the LVGL lock).
+    bool IsPointOnControl(int x, int y);
+
 private:
     RenderSwitch render_switch_;
     ScreenId current_ = ScreenId::Home;
