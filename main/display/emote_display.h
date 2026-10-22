@@ -148,6 +148,17 @@ private:
     // reminder and hidden on restore.
     gfx_obj_t* reminder_hint_ = nullptr;
     std::atomic<bool> reminder_hint_ready_ = false;
+
+    // Home hint: a faint caption under the pet face on the standby Home screen
+    // telling the child the core gestures ("左右滑动 · 单击对话"). Shown while
+    // the idle animation runs, hidden whenever a higher-priority presentation
+    // takes the face (reminder / conversation / lesson), pairing with
+    // StartIdleAnimation/StopIdleAnimation.
+    void EnsureHomeHint();
+    void ShowHomeHint();
+    void HideHomeHint();
+    gfx_obj_t* home_hint_ = nullptr;
+    std::atomic<bool> home_hint_ready_ = false;
 };
 
 }  // namespace emote

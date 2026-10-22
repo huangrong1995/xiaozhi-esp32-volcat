@@ -761,6 +761,49 @@ void EmoteDisplay::RefreshAll() {
     }
 }
 
+// Home hint: a faint caption under the pet face telling the child the core
+// interactions. Built lazily like the other captions; shown while the standby
+// idle animation runs (the Home face) and hidden whenever a higher-priority
+// presentation takes the face.
+void EmoteDisplay::EnsureHomeHint() {
+    if (!emote_handle_ || home_hint_ready_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_t* hint =
+        emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "vocat_home_hint");
+    if (hint) {
+        gfx_label_set_text(hint, "左右滑动 · 单击对话");
+        gfx_label_set_color(hint, GFX_COLOR_HEX(0x8A9AA0));  // soft grey, unobtrusive
+        gfx_label_set_text_align(hint, GFX_TEXT_ALIGN_CENTER);
+        gfx_label_set_long_mode(hint, GFX_LABEL_LONG_CLIP);
+        gfx_label_set_bg_enable(hint, false);  // no backdrop: faint floating caption
+        gfx_obj_set_size(hint, 220, 24);
+        gfx_obj_align(hint, GFX_ALIGN_BOTTOM_MID, 0, -8);
+        gfx_obj_set_visible(hint, false);
+    }
+    home_hint_ = hint;
+    home_hint_ready_ = true;
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::ShowHomeHint() {
+    EnsureHomeHint();
+    if (home_hint_ready_) {
+        emote_lock(emote_handle_);
+        gfx_obj_set_visible(home_hint_, true);
+        emote_unlock(emote_handle_);
+    }
+}
+
+void EmoteDisplay::HideHomeHint() {
+    if (home_hint_ready_) {
+        emote_lock(emote_handle_);
+        gfx_obj_set_visible(home_hint_, false);
+        emote_unlock(emote_handle_);
+    }
+}
+
 void EmoteDisplay::StartIdleAnimation() {
     if (idle_anim_timer_ && !is_idle_) {
         is_idle_ = true;
@@ -771,6 +814,8 @@ void EmoteDisplay::StartIdleAnimation() {
         }
         // Start timer to cycle emotions (every 3 seconds)
         esp_timer_start_periodic(idle_anim_timer_, 3000000);
+        // Home standby: show the gesture hint under the pet.
+        ShowHomeHint();
         ESP_LOGI(TAG, "Idle animation started");
     }
 }
@@ -779,6 +824,8 @@ void EmoteDisplay::StopIdleAnimation() {
     if (idle_anim_timer_ && is_idle_) {
         esp_timer_stop(idle_anim_timer_);
         is_idle_ = false;
+        // A higher-priority presentation is taking the face: hide the hint.
+        HideHomeHint();
         SetEmotion("neutral");
         ESP_LOGI(TAG, "Idle animation stopped");
     }

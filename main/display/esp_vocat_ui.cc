@@ -378,6 +378,11 @@ void EspVocatUi::SetupTouchInput() {
     lv_indev_set_read_cb(touch_indev_, EspVocatUi::TouchInputReadCallback);
     lv_indev_set_user_data(touch_indev_, this);
     lv_indev_set_display(touch_indev_, disp);
+    // Long-press auto-repeat cadence for the steppers: default is 100ms/step
+    // (10 steps/s), which means holding a stepper from 0 to 100 takes ~10s —
+    // slow for a child. 60ms (~16 steps/s) sweeps the full range in ~6s while
+    // staying smooth and legible. The 400ms long-press *start* stays default.
+    lv_indev_set_long_press_repeat_time(touch_indev_, 60);
     ESP_LOGI(TAG, "SetupTouchInput: pointer indev %p bound to display %p", (void*)touch_indev_,
              (void*)disp);
 }
