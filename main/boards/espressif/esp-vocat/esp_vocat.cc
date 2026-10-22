@@ -1431,9 +1431,12 @@ private:
         }
         outer_touch_last_us_ = now;
         OnGesture(Gesture::Pet);
-        // While a reminder is active, it is the highest-priority presentation
-        // (spec §3.4): suppress pet feedback so it does not overwrite it.
-        if (!reminder_active_) {
+        // Petting feedback only on the plain Home face. During a conversation
+        // the pet must keep its listening/speaking look (a temporary happy face
+        // would fight the "正在听/正在说" presentation), and on an LVGL page the
+        // emote face is not even visible. A reminder is also higher-priority
+        // (spec §3.4) and must not be overwritten.
+        if (!reminder_active_ && CurrentScreen() == ScreenId::Home) {
             // Alternate the petting feedback between two affectionate faces so
             // repeated pets read as growing pleasure, not a static smile.
             static const char* kPetEmotions[] = {"happy", "loving"};
