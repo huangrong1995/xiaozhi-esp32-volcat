@@ -2462,11 +2462,12 @@ private:
 
         // The dial settles on a chosen emotion at the end of a rotation drag; keep
         // current_emotion_index_ in sync so the flashcard lesson starts from the
-        // emotion the user left the dial on.
+        // emotion the user left the dial on. A soft pop confirms the selection.
         ui_->SetEmotionDialSettledCallback([this](int index) {
             current_emotion_index_ = static_cast<size_t>(index);
             ESP_LOGI(TAG, "Emotion dial settled -> %s",
                      kEmotionLearningNames_[current_emotion_index_]);
+            Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
         });
 
         // The conversation overlay fires this when it is left/gone
