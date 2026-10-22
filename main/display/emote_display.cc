@@ -428,7 +428,12 @@ void EmoteDisplay::StartConversationFade(bool fade_in) {
         };
         esp_timer_create(&args, &conversation_fade_timer_);
     }
+    // Cancel any fade chain still in flight (e.g. a fade-out mid-run when a new
+    // conversation starts) so the old chain cannot fight this one — each fade
+    // direction is driven by conversation_fade_dir_, not inferred from opa.
+    esp_timer_stop(conversation_fade_timer_);
     // Fade target: full for in, hidden for out.
+    conversation_fade_dir_ = fade_in ? +1 : -1;
     conversation_opa_ = fade_in ? 0 : 255;
     ApplyConversationOpa(static_cast<uint8_t>(conversation_opa_));
     esp_timer_start_once(conversation_fade_timer_, 10000);  // 10ms per step
@@ -439,19 +444,24 @@ void EmoteDisplay::ConversationFadeTimerCallback(void* arg) {
     if (self == nullptr) {
         return;
     }
+    const int dir = self->conversation_fade_dir_;
+    if (dir == 0) {
+        return;  // no fade in progress (shouldn't fire, but be safe)
+    }
     const int step = 26;  // ~255/10 steps, 10ms each -> ~250ms full fade
-    bool fading_in = (self->conversation_opa_ < 255);
-    self->conversation_opa_ = fading_in
-                                  ? (self->conversation_opa_ + step > 255
-                                         ? 255
-                                         : self->conversation_opa_ + step)
-                                  : (self->conversation_opa_ - step < 0
-                                         ? 0
-                                         : self->conversation_opa_ - step);
+    self->conversation_opa_ += dir * step;
+    if (self->conversation_opa_ > 255) {
+        self->conversation_opa_ = 255;
+    }
+    if (self->conversation_opa_ < 0) {
+        self->conversation_opa_ = 0;
+    }
     self->ApplyConversationOpa(static_cast<uint8_t>(self->conversation_opa_));
-    const bool done = fading_in ? (self->conversation_opa_ >= 255) : (self->conversation_opa_ <= 0);
+    const bool done = (dir > 0) ? (self->conversation_opa_ >= 255)
+                                : (self->conversation_opa_ <= 0);
     if (done) {
-        if (!fading_in) {
+        self->conversation_fade_dir_ = 0;
+        if (dir < 0) {
             // Fade-out finished: actually hide the overlay objects.
             if (!self->conversation_ui_ready_) {
                 return;

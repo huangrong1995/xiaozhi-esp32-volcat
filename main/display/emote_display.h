@@ -137,6 +137,7 @@ private:
     std::atomic<bool> conversation_ui_ready_ = false;
     int conversation_opa_ = 0;  // current overlay opacity 0..255 (fade progress)
     float conversation_energy_ = 0.0f;  // smoothed amplitude 0..1 (mode transitions)
+    int conversation_fade_dir_ = 0;  // +1 fading in, -1 fading out, 0 idle
 
     // Emotion-learning lesson: a single caption label over the pet face showing
     // the demonstrated emotion's name + progress ("开心 · 3/8"). Created lazily,
