@@ -581,9 +581,17 @@ void EmoteDisplay::AnimateConversationRipple() {
     const float t = static_cast<float>(conversation_phase_++);
     const bool speaking = conversation_speaking_;
     // Voice energy per mode: speaking = tall, lively travelling waves; listening
-    // = gentle breathing.
-    const float max_h = speaking ? static_cast<float>(kSiriBarHeightMaxSpeaking)
-                                 : static_cast<float>(kSiriBarHeightMaxListen);
+    // = gentle breathing. The amplitude is smoothed (lerp toward the mode's
+    // target) so switching between listening and speaking swells or settles the
+    // wave gently instead of snapping the bar heights in place.
+    const float kListenEnergy = static_cast<float>(kSiriBarHeightMaxListen) /
+                                static_cast<float>(kSiriBarHeightMaxSpeaking);
+    const float energy_target = speaking ? 1.0f : kListenEnergy;
+    conversation_energy_ += (energy_target - conversation_energy_) * 0.12f;
+    if (conversation_energy_ < 0.01f) {
+        conversation_energy_ = 0.01f;
+    }
+    const float max_h = static_cast<float>(kSiriBarHeightMaxSpeaking) * conversation_energy_;
     const float speed = speaking ? 0.45f : 0.25f;
     const float cx = width_ / 2.0f;
     const int half = (kSiriBarCount - 1) / 2;  // 12: index of the centre bar
